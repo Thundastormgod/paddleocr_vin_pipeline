@@ -194,11 +194,13 @@ class TestVINImagePreprocessor:
         result = preprocessor.preprocess(sample_image)
         np.testing.assert_array_equal(result, sample_image)
     
-    def test_mode_fast_returns_grayscale(self, sample_bgr_image):
-        """Test that 'fast' mode returns normalized grayscale."""
+    def test_mode_fast_returns_bgr(self, sample_bgr_image):
+        """Test that 'fast' mode returns BGR for PaddleOCR compatibility."""
         preprocessor = VINImagePreprocessor(mode='fast')
         result = preprocessor.preprocess(sample_bgr_image)
-        assert len(result.shape) == 2  # Should be grayscale
+        # PaddleOCR requires 3-channel input
+        assert len(result.shape) == 3
+        assert result.shape[2] == 3  # BGR channels
     
     def test_mode_balanced_applies_clahe(self, sample_image):
         """Test that 'balanced' mode applies CLAHE."""
@@ -208,10 +210,12 @@ class TestVINImagePreprocessor:
         assert not np.array_equal(result, sample_image)
     
     def test_mode_engraved_applies_bilateral(self, sample_image):
-        """Test that 'engraved' mode applies bilateral filter."""
+        """Test that 'engraved' mode applies bilateral filter and returns BGR."""
         preprocessor = VINImagePreprocessor(mode='engraved')
         result = preprocessor.preprocess(sample_image)
-        assert result.shape == sample_image.shape
+        # Result should be 3-channel BGR for PaddleOCR
+        assert len(result.shape) == 3
+        assert result.shape[2] == 3
     
     def test_invalid_mode_raises(self):
         """Test that invalid mode raises ConfigurationError."""

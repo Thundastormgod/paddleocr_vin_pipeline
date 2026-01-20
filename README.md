@@ -335,3 +335,84 @@ PaddleOCR VIN Recognition Pipeline
 JRL-VIN Project, 2025
 https://github.com/Thundastormgod/paddleocr_vin_pipeline
 ```
+
+
+---
+
+## Evaluation & Validation Tools
+
+### Dataset Validation
+
+Validate ground truth quality before training/evaluation:
+
+```bash
+# Validate dataset
+python validate_dataset.py --data-dir /path/to/paddleocr_sample
+
+# Output report to JSON
+python validate_dataset.py --data-dir /path/to/data --output report.json
+```
+
+**What it checks:**
+- VIN extraction from filenames
+- Filename vs label file consistency
+- VIN format validity (length, characters, checksum)
+- Duplicate detection
+
+### Model Evaluation
+
+Evaluate pipeline performance with train/val/test splits:
+
+```bash
+# Evaluate on all data
+python evaluate.py --data-dir /path/to/images
+
+# Create 70/15/15 splits and evaluate test set
+python evaluate.py --data-dir /path/to/images --create-splits --split test
+
+# Evaluate validation set with existing splits
+python evaluate.py --data-dir /path/to/images --split-dir ./splits --split val
+
+# Export results
+python evaluate.py --data-dir /path/to/images --output results.json --csv predictions.csv
+
+# Quick test with limited samples
+python evaluate.py --data-dir /path/to/images --max-samples 50
+```
+
+### Metrics Calculated
+
+| Metric | Description |
+|--------|-------------|
+| Exact Match Rate | Percentage of perfectly predicted VINs |
+| Character-Level F1 | Harmonic mean of precision and recall |
+| Character Precision | Correct chars / Total predicted chars |
+| Character Recall | Correct chars / Total reference chars |
+| CER | Character Error Rate (lower is better) |
+| NED | Normalized Edit Distance |
+| Per-Position Accuracy | Accuracy at each of 17 VIN positions |
+
+### Dataset Splits
+
+The evaluation tool supports professional ML workflow with train/val/test splits:
+
+| Split | Default Ratio | Purpose |
+|-------|---------------|---------|
+| Train | 70% | Model training |
+| Val | 15% | Hyperparameter tuning |
+| Test | 15% | Final evaluation |
+
+Split files are saved to `splits/` directory:
+- `train_split.txt`
+- `val_split.txt`  
+- `test_split.txt`
+
+### CI/CD Integration
+
+The evaluate script outputs machine-readable metrics:
+
+```
+EXACT_MATCH_RATE=0.2500
+CHARACTER_F1=0.5500
+CER=0.4500
+```

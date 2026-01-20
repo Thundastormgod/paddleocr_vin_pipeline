@@ -322,8 +322,10 @@ class VINPostProcessor:
         """
         corrections = []
         
-        # Step 1: Clean and uppercase
+        # Step 1: Clean and uppercase, remove whitespace and newlines
         text = raw_text.upper().strip()
+        # Remove newlines, tabs, and other whitespace characters
+        text = ''.join(text.split())
         original = text
         
         # Step 2: Remove artifacts

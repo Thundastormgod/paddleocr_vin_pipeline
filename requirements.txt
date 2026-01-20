@@ -1,0 +1,14 @@
+# PaddleOCR VIN Pipeline - Requirements
+# Tested with Python 3.9+
+
+# Core OCR
+paddleocr>=3.0.0
+paddlepaddle>=3.0.0  # Use paddlepaddle-gpu for GPU acceleration
+
+# Image Processing
+opencv-python>=4.5.0
+numpy>=1.19.0
+Pillow>=8.0.0
+
+# Testing (optional - for development)
+pytest>=7.0.0

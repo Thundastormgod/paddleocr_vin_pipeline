@@ -1,0 +1,117 @@
+{
+  "metrics_summary": {
+    "description": "Industry-standard OCR evaluation metrics",
+    "evaluation_date": "2025-01-20",
+    "sample_size": 20
+  },
+  "baseline_metrics": {
+    "description": "Raw PaddleOCR without preprocessing or postprocessing",
+    "exact_match": {
+      "value": 0.05,
+      "description": "Percentage of VINs recognized perfectly (5%)"
+    },
+    "f1_score": {
+      "value": 0.430,
+      "description": "Harmonic mean of precision and recall (43%)"
+    },
+    "precision": {
+      "value": 0.417,
+      "description": "Correct characters / Predicted characters (41.7%)"
+    },
+    "recall": {
+      "value": 0.444,
+      "description": "Correct characters / Ground truth characters (44.4%)"
+    },
+    "character_error_rate": {
+      "value": 0.165,
+      "description": "Edit distance / Ground truth length (16.5%)"
+    },
+    "word_error_rate": {
+      "value": 0.95,
+      "description": "Percentage of VINs with any error (95%)"
+    }
+  },
+  "pipeline_metrics": {
+    "description": "With preprocessing (CLAHE) and postprocessing (corrections)",
+    "exact_match": {
+      "value": 0.25,
+      "description": "Percentage of VINs recognized perfectly (25%)"
+    },
+    "f1_score": {
+      "value": 0.553,
+      "description": "Harmonic mean of precision and recall (55.3%)"
+    },
+    "near_match_90pct": {
+      "value": 0.25,
+      "description": "VINs with ≥90% characters correct (25%)"
+    },
+    "character_error_rate": {
+      "value": 0.241,
+      "description": "Edit distance / Ground truth length (24.1%)"
+    },
+    "avg_processing_time": {
+      "value": 3306,
+      "unit": "milliseconds",
+      "description": "Average time per image including all stages"
+    }
+  },
+  "improvement_analysis": {
+    "exact_match_improvement": {
+      "absolute": "+20 percentage points",
+      "relative": "+400%",
+      "from": 0.05,
+      "to": 0.25
+    },
+    "f1_improvement": {
+      "absolute": "+12.3 percentage points",
+      "relative": "+29%",
+      "from": 0.430,
+      "to": 0.553
+    }
+  },
+  "metric_definitions": {
+    "exact_match_rate": {
+      "formula": "count(predicted == ground_truth) / total_samples",
+      "interpretation": "Strict accuracy - entire VIN must be correct"
+    },
+    "f1_score": {
+      "formula": "2 * (precision * recall) / (precision + recall)",
+      "interpretation": "Balanced measure of precision and recall"
+    },
+    "precision": {
+      "formula": "correct_chars / predicted_chars",
+      "interpretation": "How many predicted characters are correct"
+    },
+    "recall": {
+      "formula": "correct_chars / ground_truth_chars",
+      "interpretation": "How many ground truth characters were found"
+    },
+    "character_error_rate": {
+      "formula": "levenshtein_distance(pred, gt) / len(gt)",
+      "interpretation": "Normalized edit distance (lower is better)"
+    },
+    "word_error_rate": {
+      "formula": "count(any_error) / total_samples",
+      "interpretation": "Percentage of samples with any error"
+    }
+  },
+  "detection_metrics": {
+    "detection_rate": {
+      "value": 0.997,
+      "description": "Images where any text was detected (99.7%)"
+    },
+    "false_positive_rate": {
+      "value": 0.003,
+      "description": "Images with no text but detection occurred (0.3%)"
+    }
+  },
+  "character_level_analysis": {
+    "most_accurate_characters": ["1", "2", "3", "4", "5", "7", "8", "9"],
+    "most_confused_characters": {
+      "0": "Often confused with 6, O, D",
+      "6": "Often confused with 0, G",
+      "A": "Often confused with S, 4",
+      "S": "Often confused with 5, A"
+    }
+  }
+}

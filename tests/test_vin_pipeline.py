@@ -287,6 +287,24 @@ class TestVINPostProcessor:
         result = postprocessor.process("SAL1P9EU2SA6Q6664", 0.9)
         assert 'Q' not in result['vin']
     
+    def test_vin_extraction_from_longer_text(self, postprocessor):
+        """Test that VIN is extracted when OCR returns extra characters."""
+        # Simulates OCR returning "2E*SAL119E90SA606112*" 
+        result = postprocessor.process("2E*SAL119E90SA606112*", 0.9)
+        assert result['vin'] == "SAL119E90SA606112"
+        assert result['is_valid_length'] is True
+    
+    def test_vin_extraction_preserves_exact_17(self, postprocessor):
+        """Test that exact 17-char input is preserved."""
+        result = postprocessor.process("SAL1P9EU2SA606664", 0.9)
+        assert result['vin'] == "SAL1P9EU2SA606664"
+    
+    def test_vin_extraction_prefix_garbage(self, postprocessor):
+        """Test extraction with prefix garbage characters."""
+        result = postprocessor.process("XYZSAL1P9EU2SA606664", 0.9)
+        assert result['vin'] == "SAL1P9EU2SA606664"
+        assert result['is_valid_length'] is True
+    
     def test_position_based_correction_sequential(self, postprocessor):
         """Test that letters in sequential section are converted to digits."""
         # Position 12-17 should prefer digits

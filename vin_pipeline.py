@@ -339,16 +339,22 @@ class VINPostProcessor:
         if text != text_before:
             corrections.append(f"Fixed invalid chars: '{text_before}' → '{text}'")
         
-        # Step 4: Apply position-based corrections
+        # Step 4: Extract VIN substring if text is too long
+        text_before = text
+        text = self._extract_vin_substring(text)
+        if text != text_before:
+            corrections.append(f"Extracted VIN: '{text_before}' → '{text}'")
+        
+        # Step 5: Apply position-based corrections
         text_before = text
         text = self._apply_position_corrections(text)
         if text != text_before:
             corrections.append(f"Position corrections: '{text_before}' → '{text}'")
         
-        # Step 5: Validate length
+        # Step 6: Validate length
         is_valid_length = len(text) == VIN_LENGTH
         
-        # Step 6: Validate checksum (if correct length)
+        # Step 7: Validate checksum (if correct length)
         checksum_valid = False
         if is_valid_length:
             checksum_valid = self._validate_checksum(text)
@@ -375,6 +381,56 @@ class VINPostProcessor:
         text = text.replace('*', '').replace('#', '')
         
         return text
+    
+    def _extract_vin_substring(self, text: str) -> str:
+        """
+        Extract 17-character VIN from longer text.
+        
+        When OCR picks up extra characters before/after the VIN,
+        this method attempts to find the valid VIN substring.
+        
+        Strategy:
+        1. If exactly 17 chars, return as-is
+        2. Look for common WMI prefixes (SAL, WVW, 1G1, etc.)
+        3. Find best 17-char substring with valid VIN characters
+        """
+        if len(text) == VIN_LENGTH:
+            return text
+        
+        if len(text) < VIN_LENGTH:
+            return text  # Too short, can't extract
+        
+        # Common WMI (World Manufacturer Identifier) prefixes
+        # These are the first 3 characters of a VIN
+        common_wmis = ['SAL', 'WVW', 'WBA', 'WDB', '1G1', '1GC', '1GT', 
+                       '2G1', '3G1', 'JN1', 'JT2', 'KM8', 'VF1', 'WF0']
+        
+        # Strategy 1: Look for known WMI at any position
+        for wmi in common_wmis:
+            idx = text.find(wmi)
+            if idx != -1 and idx + VIN_LENGTH <= len(text):
+                candidate = text[idx:idx + VIN_LENGTH]
+                # Verify it has valid VIN characters
+                if all(c in VIN_VALID_CHARS or c in 'IOQ' for c in candidate):
+                    return candidate
+        
+        # Strategy 2: Try all 17-char substrings, find one with most valid chars
+        best_candidate = text[:VIN_LENGTH]  # Default: first 17 chars
+        best_score = 0
+        
+        for i in range(len(text) - VIN_LENGTH + 1):
+            candidate = text[i:i + VIN_LENGTH]
+            # Score: count of valid VIN characters
+            score = sum(1 for c in candidate if c in VIN_VALID_CHARS)
+            # Bonus for having digits in positions 12-17 (sequential number)
+            seq_digits = sum(1 for c in candidate[11:17] if c.isdigit())
+            score += seq_digits * 2
+            
+            if score > best_score:
+                best_score = score
+                best_candidate = candidate
+        
+        return best_candidate
     
     def _fix_invalid_chars(self, text: str) -> str:
         """Replace invalid VIN characters."""

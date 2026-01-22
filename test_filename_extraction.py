@@ -18,37 +18,40 @@ def extract_vin_from_filename(filename: str) -> Optional[str]:
     """
     Extract VIN from filename pattern.
     
-    Expected patterns:
-    - NUMBER-VIN -VINCODE.jpg (e.g., "42-VIN -SAL1A2A40SA606645.jpg")
-    - NUMBER -VIN REST.jpg (legacy)
-    - NUMBER-VIN_-_VINCODE_.jpg (legacy)
+    Primary format:
+    - NUMBER-VIN -VINCODE.jpg (e.g., "1-VIN -SAL1A2A40SA606662.jpg")
+    
+    Legacy formats (still supported):
+    - NUMBER-VIN_-_VINCODE_.jpg
+    - NUMBER -VINCODE rest.jpg
     """
-    # Pattern 1 (NEW): "number-VIN -VINCODE.jpg"
-    match = re.search(r'^\d+-VIN\s+-([A-Z0-9]{17})(?:\s|\.)', filename, re.IGNORECASE)
+    # Primary Pattern: "number-VIN -VINCODE.jpg"
+    # Example: "1-VIN -SAL1A2A40SA606662.jpg"
+    match = re.search(r'^\d+-VIN\s+-([A-Z0-9]{17})\.', filename, re.IGNORECASE)
     if match:
         return match.group(1).upper()
     
-    # Pattern 2: More flexible - "VIN -VINCODE" or "VIN-VINCODE" anywhere
+    # Flexible: "VIN -VINCODE" or "VIN-VINCODE" anywhere in filename
     match = re.search(r'VIN\s*-\s*([A-Z0-9]{17})(?:\s|\.)', filename, re.IGNORECASE)
     if match:
         return match.group(1).upper()
     
-    # Pattern 3: Flexible spacing around dash (previous format)
+    # Legacy: "number -VINCODE rest.jpg" or "number-VINCODE.jpg"
     match = re.search(r'^\d+\s*-\s*([A-Z0-9]{17})(?:\s|\.)', filename, re.IGNORECASE)
     if match:
         return match.group(1).upper()
     
-    # Legacy Pattern: VIN_-_VINCODE_
+    # Legacy: VIN_-_VINCODE_
     match = re.search(r'VIN_-_([A-Z0-9]{17})_', filename, re.IGNORECASE)
     if match:
         return match.group(1).upper()
     
-    # Legacy Pattern: VIN_-_VINCODE (without trailing underscore)
+    # Legacy: VIN_-_VINCODE (without trailing underscore)
     match = re.search(r'VIN_-_([A-Z0-9]{17})[._]', filename, re.IGNORECASE)
     if match:
         return match.group(1).upper()
     
-    # Fallback: Look for 17-char alphanumeric sequence
+    # Fallback: Look for any 17-char valid VIN sequence
     match = re.search(r'\b([A-HJ-NPR-Z0-9]{17})\b', filename, re.IGNORECASE)
     if match:
         vin = match.group(1).upper()
@@ -65,17 +68,18 @@ def test_predefined_patterns():
     print("=" * 60)
     
     test_cases = [
-        # New format: number-VIN -VINCODE.jpg
+        # Primary format: number-VIN -VINCODE.jpg
+        ("1-VIN -SAL1A2A40SA606662.jpg", "SAL1A2A40SA606662"),
         ("42-VIN -SAL1A2A40SA606645.jpg", "SAL1A2A40SA606645"),
         ("1-VIN -WVWZZZ3CZWE123456.jpg", "WVWZZZ3CZWE123456"),
         ("123-VIN -1HGBH41JXMN109186.jpg", "1HGBH41JXMN109186"),
         
-        # Previous formats
+        # Legacy formats
         ("42 -SAL1A2A40SA606645 2.jpg", "SAL1A2A40SA606645"),
         ("42-SAL1A2A40SA606645 2.jpg", "SAL1A2A40SA606645"),
         ("42 - SAL1A2A40SA606645.jpg", "SAL1A2A40SA606645"),
         
-        # Legacy format
+        # Legacy underscore format
         ("1-VIN_-_SAL119E90SA606112_.jpg", "SAL119E90SA606112"),
         ("10-VIN_-_SAL1A2A40SA606645_.jpg", "SAL1A2A40SA606645"),
     ]

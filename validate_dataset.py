@@ -83,13 +83,37 @@ class ValidationReport:
 # =============================================================================
 
 def extract_vin_from_filename(filename: str) -> Optional[str]:
-    """Extract VIN from filename pattern."""
-    # Pattern: VIN_-_VINCODE_
+    """
+    Extract VIN from filename pattern.
+    
+    Expected patterns:
+    - NUMBER -VIN REST.jpg (e.g., "42 -SAL1A2A40SA606645 2.jpg")
+    - NUMBER-VIN_-_VINCODE_.jpg (legacy)
+    - NUMBER-VIN_-_VINCODE_2.jpg (legacy variant)
+    
+    Args:
+        filename: Image filename
+        
+    Returns:
+        Extracted VIN or None
+    """
+    # Pattern 1 (NEW): "number -VIN rest.jpg" (space before dash)
+    # Matches: "42 -SAL1A2A40SA606645 2.jpg"
+    match = re.search(r'^\d+\s+-([A-Z0-9]{17})(?:\s|\.)', filename, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    
+    # Pattern 2 (NEW): More flexible - space-dash-VIN anywhere
+    match = re.search(r'\s+-([A-Z0-9]{17})[\s.]', filename, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    
+    # Legacy Pattern: VIN_-_VINCODE_
     match = re.search(r'VIN_-_([A-Z0-9]{17})_', filename, re.IGNORECASE)
     if match:
         return match.group(1).upper()
     
-    # Pattern: VIN_-_VINCODE (without trailing underscore)
+    # Legacy Pattern: VIN_-_VINCODE (without trailing underscore)
     match = re.search(r'VIN_-_([A-Z0-9]{17})[._]', filename, re.IGNORECASE)
     if match:
         return match.group(1).upper()

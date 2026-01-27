@@ -353,7 +353,7 @@ def render_recognition_page():
         if uploaded_file:
             if PIL_AVAILABLE:
                 image = Image.open(uploaded_file)
-                st.image(image, caption="Uploaded Image", use_container_width=True)
+                st.image(image, caption="Uploaded Image", width="stretch")
             else:
                 st.info("Image preview not available (PIL not installed)")
     
@@ -562,7 +562,7 @@ def display_evaluation_results(results_by_model: Dict[str, List[Dict]]):
     
     # Display summary table
     df_summary = pd.DataFrame(summary_data)
-    st.dataframe(df_summary, use_container_width=True)
+    st.dataframe(df_summary, width="stretch")
     
     # Charts
     if PLOTLY_AVAILABLE and len(summary_data) > 1:
@@ -576,7 +576,7 @@ def display_evaluation_results(results_by_model: Dict[str, List[Dict]]):
                 title='Character Accuracy by Model',
                 color='Model'
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         
         with col2:
             fig = px.bar(
@@ -586,7 +586,7 @@ def display_evaluation_results(results_by_model: Dict[str, List[Dict]]):
                 title='Processing Time by Model',
                 color='Model'
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
     
     # Detailed results expander
     with st.expander("📋 Detailed Results"):
@@ -603,7 +603,7 @@ def display_evaluation_results(results_by_model: Dict[str, List[Dict]]):
                 }
                 for r in results[:50]  # Limit display
             ])
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
     
     # Export option
     if st.button("📥 Export Results as CSV"):
@@ -661,7 +661,7 @@ def process_uploaded_batch(uploaded_files):
         }
         for r in results
     ])
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width="stretch")
 
 
 def render_training_page():
@@ -816,12 +816,12 @@ def render_results_dashboard():
                     st.json(data)
                 else:
                     df = pd.read_csv(file_path)
-                    st.dataframe(df, use_container_width=True)
+                    st.dataframe(df, width="stretch")
                     
                     # Quick charts
                     if PLOTLY_AVAILABLE and 'F1 Micro' in df.columns:
                         fig = px.bar(df, x='Model', y='F1 Micro', title='F1 Micro Score by Model')
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
     
     # Session history
     st.subheader("📊 Session History")
@@ -837,7 +837,7 @@ def render_results_dashboard():
             }
             for r in st.session_state.results_history[-50:]  # Last 50
         ])
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width="stretch")
         
         if st.button("🗑️ Clear History"):
             st.session_state.results_history = []

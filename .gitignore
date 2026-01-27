@@ -1,2 +1,71 @@
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
 venv/
+env/
+.venv/
+
+# Development notes and scratch files (not tracked)
+dev/
+
+# Cloned repositories (not tracked - clone locally)
+PaddleOCR/
+
+# Model outputs and training artifacts (large files)
+output/
+training_output/
+finetune_data/
+*.pdparams
+*.pdopt
+*.pdmodel
+*.pdiparams
+*.onnx
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Data folders (managed by DVC)
+data/
+dagshub_data/
+dataset/
+
+# HuggingFace cache
+.cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Results (keep sample, ignore detailed)
+results/multi_eval/
+results/detailed_metrics.json
+results/experiment_summary.json

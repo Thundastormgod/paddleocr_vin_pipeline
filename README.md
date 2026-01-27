@@ -26,12 +26,15 @@ and postprocessing.
 2. [CLI Testing Results](#cli-testing-results)
 3. [Installation](#installation)
 4. [Quick Start](#quick-start)
-5. [Pipeline Architecture](#pipeline-architecture)
-6. [Configuration](#configuration)
-7. [Character Confusion Handling](#character-confusion-handling)
-8. [VIN Format Reference](#vin-format-reference)
-9. [For the Team](#for-the-team)
-10. [License](#license)
+5. [Web UI](#web-ui)
+6. [Multi-Model Evaluation](#multi-model-evaluation)
+7. [Training & Fine-Tuning](#training--fine-tuning)
+8. [Pipeline Architecture](#pipeline-architecture)
+9. [Configuration](#configuration)
+10. [Character Confusion Handling](#character-confusion-handling)
+11. [VIN Format Reference](#vin-format-reference)
+12. [For the Team](#for-the-team)
+13. [License](#license)
 
 ---
 
@@ -212,6 +215,161 @@ print(result['raw_ocr'])       # "XSAL1P9EU2SA606664*"
 
 ---
 
+## Web UI
+
+A Streamlit-based web interface for easy interaction with all models.
+
+### Launch Web UI
+
+```bash
+# Install web UI dependencies
+pip install -r web_ui/requirements.txt
+
+# Run the web interface
+streamlit run web_ui/app.py
+
+# Or with custom port
+streamlit run web_ui/app.py --server.port 8080
+```
+
+### Features
+
+| Page | Description |
+|------|-------------|
+| 🔍 **Recognition** | Upload single images for VIN extraction |
+| 📊 **Batch Evaluation** | Process folders with metrics comparison |
+| 🎯 **Training** | Configure and monitor model training |
+| 📈 **Dashboard** | View results and export data |
+
+---
+
+## Multi-Model Evaluation
+
+Compare different OCR models on your dataset:
+
+```bash
+# Evaluate all available models on test images
+python multi_model_evaluation.py --max-images 100
+
+# Specify custom image folder
+python multi_model_evaluation.py --image-folder ./my_images --max-images 50
+
+# Output to specific directory
+python multi_model_evaluation.py --output-dir ./results/experiment1
+```
+
+### Available Models
+
+| Model | Type | Description |
+|-------|------|-------------|
+| **VIN Pipeline** | Local | PP-OCRv5 with post-processing |
+| **PaddleOCR v4** | Local | Latest PaddleOCR release |
+| **PaddleOCR v3** | Local | Previous generation |
+| **DeepSeek-OCR** | Local | Vision-language model (requires GPU) |
+
+### Output Metrics
+
+- **F1 Micro/Macro** - Character-level F1 scores
+- **Exact Match Accuracy** - Full VIN match rate
+- **Character Accuracy** - Per-character accuracy
+- **Per-sample results** - CSV with detailed breakdown
+
+---
+
+## Training & Fine-Tuning
+
+### PaddleOCR Fine-Tuning
+
+Fine-tune PP-OCRv4/v5 recognition model on VIN data:
+
+```bash
+# Run with default config
+python finetune_paddleocr.py --config configs/vin_finetune_config.yml
+
+# Resume from checkpoint
+python finetune_paddleocr.py --config configs/vin_finetune_config.yml \
+    --resume output/vin_rec_finetune/latest
+
+# Multi-GPU training
+python -m paddle.distributed.launch --gpus '0,1' finetune_paddleocr.py \
+    --config configs/vin_finetune_config.yml
+```
+
+### DeepSeek-OCR Fine-Tuning
+
+Fine-tune DeepSeek vision-language model with LoRA:
+
+```bash
+# LoRA fine-tuning (recommended, ~16GB VRAM)
+python finetune_deepseek.py --config configs/deepseek_finetune_config.yml --lora
+
+# Full fine-tuning (requires ~48GB VRAM)
+python finetune_deepseek.py --config configs/deepseek_finetune_config.yml --full
+```
+
+### Training Data Format
+
+Place images and labels in the data directory:
+
+```
+dagshub_data/
+├── train/
+│   ├── images/
+│   │   ├── SAL1A2A40SA605902_train_8.jpg
+│   │   └── ...
+│   └── train_labels.txt
+└── test/
+    ├── images/
+    │   └── ...
+    └── test_labels.txt
+```
+
+Label file format (`train_labels.txt`):
+```
+images/SAL1A2A40SA605902_train_8.jpg	SAL1A2A40SA605902
+images/WBY1Z2C55KV304518_train_12.jpg	WBY1Z2C55KV304518
+```
+
+---
+
+## Training, Testing & Evaluation Pipeline
+
+Run complete experiments with industry-standard metrics:
+
+```bash
+# Quick test with current data
+python test_pipeline.py
+
+# Full experiment with train/val/test splits
+python run_experiment.py --data-dir data --output-dir experiments
+
+# Custom split ratios
+python run_experiment.py --data-dir data \
+    --train-ratio 0.8 --val-ratio 0.1 --test-ratio 0.1
+```
+
+### Image Naming Convention
+
+Images must be named as: `NUMBER-VIN -VINCODE.jpg`
+
+Examples:
+- `1-VIN -SAL1A2A40SA606662.jpg`
+- `42-VIN -1HGBH41JXMN109186.jpg`
+
+### Metrics Calculated
+
+| Metric | Description |
+|--------|-------------|
+| **Exact Match** | % of VINs predicted 100% correctly |
+| **F1 Score** | Harmonic mean of precision & recall |
+| **CER** | Character Error Rate |
+| **NED** | Normalized Edit Distance |
+| **Per-position** | Accuracy at each of 17 VIN positions |
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed pipeline documentation.
+
+---
+
 ## Pipeline Architecture
 
 ```
@@ -241,8 +399,19 @@ paddleocr_vin_pipeline/
 ├── ARCHITECTURE.md           # Detailed architecture docs
 ├── LICENSE                   # Apache 2.0 License
 ├── NOTICE                    # Attribution notices
+│
+├── # Training & Evaluation Pipeline
+├── prepare_dataset.py        # Dataset splitting & label generation
+├── train_pipeline.py         # Training configuration & execution
+├── run_experiment.py         # End-to-end experiment runner
+├── test_pipeline.py          # Quick pipeline test
+├── evaluate.py               # Evaluation with metrics
+├── validate_dataset.py       # Dataset validation
+│
 ├── tests/
 │   └── test_vin_pipeline.py  # Test suite (52+ tests)
+├── data/                     # VIN images (add your images here)
+├── experiments/              # Experiment outputs
 └── results/
     ├── experiment_summary.json
     ├── detailed_metrics.json

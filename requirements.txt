@@ -1,14 +1,46 @@
 # PaddleOCR VIN Pipeline - Requirements
+# ======================================
 # Tested with Python 3.9+
+#
+# SECURITY NOTE: Pin versions in production to avoid supply chain attacks
+# Update periodically with: pip-compile requirements.in
 
-# Core OCR
-paddleocr>=3.0.0
-paddlepaddle>=3.0.0  # Use paddlepaddle-gpu for GPU acceleration
+# Core OCR (pinned for reproducibility)
+paddleocr==3.0.0
+paddlepaddle==3.0.0  # Use paddlepaddle-gpu for GPU acceleration
 
 # Image Processing
-opencv-python>=4.5.0
-numpy>=1.19.0
-Pillow>=8.0.0
+opencv-python==4.10.0.84
+numpy==1.26.4
+Pillow==10.4.0
 
-# Testing (optional - for development)
-pytest>=7.0.0
+# Configuration Management
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+# Training Pipeline
+pyyaml==6.0.2
+
+# For TensorBoard logging during fine-tuning (optional)
+# visualdl>=2.5.0
+
+# Testing (development only - install with: pip install -r requirements-dev.txt)
+pytest==8.3.3
+
+# Linting/Formatting (development only)
+# ruff==0.6.9
+# black==24.10.0
+
+# =============================================================================
+# NEURAL NETWORK FINE-TUNING (GPU RECOMMENDED)
+# =============================================================================
+# For full neural network training with 11,000+ images, use GPU version:
+#   pip uninstall paddlepaddle
+#   pip install paddlepaddle-gpu
+#
+# For multi-GPU training:
+#   python -m paddle.distributed.launch --gpus '0,1,2,3' finetune_paddleocr.py
+#
+# For PaddleOCR advanced training features, clone their repo:
+#   git clone https://github.com/PaddlePaddle/PaddleOCR.git
+#   cd PaddleOCR && pip install -r requirements.txt

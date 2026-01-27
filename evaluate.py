@@ -25,7 +25,7 @@ Date: January 2026
 
 import argparse
 import json
-import re
+import logging
 import sys
 import time
 from dataclasses import dataclass, field, asdict
@@ -37,6 +37,17 @@ import random
 sys.path.insert(0, str(Path(__file__).parent))
 
 from vin_pipeline import VINOCRPipeline, validate_vin
+
+# Import from shared utilities (Single Source of Truth)
+from vin_utils import (
+    extract_vin_from_filename,
+    VIN_LENGTH,
+    VIN_VALID_CHARS,
+    levenshtein_distance,
+)
+from config import get_config
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -107,64 +118,8 @@ class DatasetSplit:
 
 
 # =============================================================================
-# GROUND TRUTH EXTRACTION
+# GROUND TRUTH LOADING (uses shared extract_vin_from_filename)
 # =============================================================================
-
-def extract_vin_from_filename(filename: str) -> Optional[str]:
-    """
-    Extract VIN from filename pattern.
-    
-    Primary format:
-    - NUMBER-VIN -VINCODE.jpg (e.g., "1-VIN -SAL1A2A40SA606662.jpg")
-    
-    Legacy formats (still supported):
-    - NUMBER-VIN_-_VINCODE_.jpg
-    - NUMBER -VINCODE rest.jpg
-    
-    Args:
-        filename: Image filename
-        
-    Returns:
-        Extracted VIN (17 characters) or None
-    """
-    # Primary Pattern: "number-VIN -VINCODE.jpg"
-    # Example: "1-VIN -SAL1A2A40SA606662.jpg"
-    match = re.search(r'^\d+-VIN\s+-([A-Z0-9]{17})\.', filename, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    # Flexible: "VIN -VINCODE" or "VIN-VINCODE" anywhere in filename
-    match = re.search(r'VIN\s*-\s*([A-Z0-9]{17})(?:\s|\.)', filename, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    # Legacy: "number -VINCODE rest.jpg" or "number-VINCODE.jpg"
-    match = re.search(r'^\d+\s*-\s*([A-Z0-9]{17})(?:\s|\.)', filename, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    # Legacy: VIN_-_VINCODE_
-    match = re.search(r'VIN_-_([A-Z0-9]{17})_', filename, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    # Legacy: VIN_-_VINCODE (without trailing underscore)
-    match = re.search(r'VIN_-_([A-Z0-9]{17})[._]', filename, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    # Fallback: Look for any 17-char valid VIN sequence
-    match = re.search(r'\b([A-HJ-NPR-Z0-9]{17})\b', filename, re.IGNORECASE)
-    if match:
-        vin = match.group(1).upper()
-        # Validate it looks like a VIN (no I, O, Q)
-        if not any(c in vin for c in 'IOQ'):
-            return vin
-    
-    return None
-    
-    return None
-
 
 def load_ground_truth(data_dir: str) -> Dict[str, str]:
     """
@@ -327,25 +282,7 @@ def load_splits(split_dir: str, data_dir: str) -> Dict[str, DatasetSplit]:
 # METRICS CALCULATION
 # =============================================================================
 
-def levenshtein_distance(s1: str, s2: str) -> int:
-    """Calculate Levenshtein (edit) distance between two strings."""
-    if len(s1) < len(s2):
-        return levenshtein_distance(s2, s1)
-    
-    if len(s2) == 0:
-        return len(s1)
-    
-    previous_row = range(len(s2) + 1)
-    for i, c1 in enumerate(s1):
-        current_row = [i + 1]
-        for j, c2 in enumerate(s2):
-            insertions = previous_row[j + 1] + 1
-            deletions = current_row[j] + 1
-            substitutions = previous_row[j] + (c1 != c2)
-            current_row.append(min(insertions, deletions, substitutions))
-        previous_row = current_row
-    
-    return previous_row[-1]
+# Note: levenshtein_distance is imported from vin_utils (Single Source of Truth)
 
 
 def calculate_cer(predictions: List[str], references: List[str]) -> float:

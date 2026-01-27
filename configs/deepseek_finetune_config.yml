@@ -1,0 +1,66 @@
+# DeepSeek-OCR Fine-Tuning Configuration for VIN Recognition
+# ===========================================================
+#
+# This configuration file controls the DeepSeek-OCR fine-tuning process.
+# Adjust parameters based on your GPU memory and dataset size.
+#
+# GPU Memory Requirements:
+#   - LoRA + 8-bit: ~16GB VRAM
+#   - LoRA + bf16: ~24GB VRAM  
+#   - Full fine-tuning: ~48GB VRAM
+
+# Model Configuration
+model_name: "deepseek-ai/DeepSeek-OCR"
+
+# Output
+output_dir: "./output/deepseek_vin_finetune"
+
+# Training Hyperparameters
+num_epochs: 10
+batch_size: 4
+gradient_accumulation_steps: 8  # Effective batch size = 4 * 8 = 32
+learning_rate: 2.0e-5
+weight_decay: 0.01
+warmup_ratio: 0.1
+max_grad_norm: 1.0
+
+# LoRA Configuration (Memory-Efficient Fine-Tuning)
+use_lora: true
+lora_r: 16              # LoRA rank (higher = more capacity, more memory)
+lora_alpha: 32          # LoRA alpha (scaling factor)
+lora_dropout: 0.05      # Dropout for regularization
+lora_target_modules:    # Modules to apply LoRA
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "o_proj"
+  - "gate_proj"
+  - "up_proj"
+  - "down_proj"
+
+# Quantization (for lower memory usage)
+use_8bit: false         # 8-bit quantization (requires bitsandbytes)
+use_4bit: false         # 4-bit quantization (QLoRA, requires bitsandbytes)
+
+# Data Paths
+train_data_path: "./finetune_data/train_labels.txt"
+val_data_path: "./finetune_data/val_labels.txt"
+data_dir: "./finetune_data/"
+max_length: 32          # Max token length for VIN output
+
+# Precision
+bf16: true              # BFloat16 (recommended for Ampere+ GPUs)
+fp16: false             # Float16 (use if bf16 not supported)
+
+# Logging and Checkpointing
+logging_steps: 10
+eval_steps: 100
+save_steps: 500
+save_total_limit: 3     # Keep only last N checkpoints
+
+# Early Stopping
+early_stopping_patience: 5
+early_stopping_threshold: 0.001
+
+# Reproducibility
+seed: 42

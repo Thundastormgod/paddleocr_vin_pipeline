@@ -20,11 +20,12 @@ from typing import Dict
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from validate_dataset import (
-    extract_vin_from_filename,
     parse_label_file,
-    validate_vin_format,
+    validate_vin_format_detailed,
     ValidationReport,
 )
+# Import extract_vin_from_filename from Single Source of Truth
+from vin_utils import extract_vin_from_filename
 
 
 # =============================================================================
@@ -69,36 +70,36 @@ class TestValidateVINFormat:
     
     def test_valid_vin(self):
         """Test validation of valid VIN."""
-        result = validate_vin_format("SAL1P9EU2SA606664")
+        result = validate_vin_format_detailed("SAL1P9EU2SA606664")
         assert result['is_valid'] is True
         assert len(result['issues']) == 0 or 'checksum' in result['issues'][0].lower()
     
     def test_invalid_length_short(self):
         """Test VIN that is too short."""
-        result = validate_vin_format("SAL1P9")
+        result = validate_vin_format_detailed("SAL1P9")
         assert result['is_valid'] is False
         assert any('length' in issue.lower() for issue in result['issues'])
     
     def test_invalid_length_long(self):
         """Test VIN that is too long."""
-        result = validate_vin_format("SAL1P9EU2SA6066641234")
+        result = validate_vin_format_detailed("SAL1P9EU2SA6066641234")
         assert result['is_valid'] is False
         assert any('length' in issue.lower() for issue in result['issues'])
     
     def test_invalid_char_i(self):
         """Test VIN with invalid character I."""
-        result = validate_vin_format("SAL1P9EI2SA606664")
+        result = validate_vin_format_detailed("SAL1P9EI2SA606664")
         assert result['is_valid'] is False
         assert any('character' in issue.lower() for issue in result['issues'])
     
     def test_invalid_char_o(self):
         """Test VIN with invalid character O."""
-        result = validate_vin_format("SAL1P9EO2SA606664")
+        result = validate_vin_format_detailed("SAL1P9EO2SA606664")
         assert result['is_valid'] is False
     
     def test_invalid_char_q(self):
         """Test VIN with invalid character Q."""
-        result = validate_vin_format("SAL1P9EQ2SA606664")
+        result = validate_vin_format_detailed("SAL1P9EQ2SA606664")
         assert result['is_valid'] is False
 
 

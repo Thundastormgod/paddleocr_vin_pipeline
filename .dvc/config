@@ -1,0 +1,6 @@
+[core]
+    no_scm = True
+    remote = dagshub
+['remote "dagshub"']
+    url = s3://Thundastormgod
+    endpointurl = https://dagshub.com/api/v1/repo-buckets/s3

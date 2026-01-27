@@ -12,8 +12,8 @@ A user-friendly web interface for VIN recognition using multiple OCR models.
 ## Quick Start
 
 ```bash
-# Install dependencies
-pip install -r web_ui/requirements.txt
+# Install dependencies (from project root)
+pip install -r requirements.txt
 
 # Run the web UI
 streamlit run web_ui/app.py

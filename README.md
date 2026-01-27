@@ -33,8 +33,9 @@ and postprocessing.
 9. [Configuration](#configuration)
 10. [Character Confusion Handling](#character-confusion-handling)
 11. [VIN Format Reference](#vin-format-reference)
-12. [For the Team](#for-the-team)
-13. [License](#license)
+12. [Documentation](#documentation)
+13. [For the Team](#for-the-team)
+14. [License](#license)
 
 ---
 
@@ -478,6 +479,24 @@ Position:  1  2  3  | 4  5  6  7  8 | 9 | 10 | 11 | 12 13 14 15 16 17
 
 ---
 
+## Documentation
+
+### Developer Documentation
+All technical documentation is located in the [`dev/`](dev/) directory:
+
+- **[Architecture](dev/ARCHITECTURE.md)** - System design and component overview
+- **[Environment Setup](dev/ENVIRONMENT.md)** - Complete installation guide with multiple methods
+- **[Code Citations](dev/CODE_CITATIONS.md)** - Attribution for third-party code
+- **[Training Guides](dev/docs/)** - Deep dive into training pipeline, techniques, and algorithms
+
+### Quick Links
+- **[Training Guide](dev/docs/TRAINING_GUIDE.md)** - Step-by-step training instructions
+- **[Training Deep Dive](dev/docs/TRAINING_DEEP_DIVE.md)** - Advanced training concepts
+- **[Algorithm Complexity](dev/docs/ALGORITHM_COMPLEXITY.md)** - Performance analysis
+- **[Finetuning Techniques](dev/docs/FINETUNING_TECHNIQUES.md)** - Model adaptation strategies
+
+---
+
 ## For the Team
 
 ### Quick Setup
@@ -504,7 +523,7 @@ Path: `data/paddleocr_sample/`
 
 ## License
 
-**Apache License 2.0** - See LICENSE and NOTICE files
+**Apache License 2.0** - See [LICENSE](LICENSE) and [dev/NOTICE](dev/NOTICE)
 
 | Requires                    | Permits                              |
 |-----------------------------|--------------------------------------|

@@ -1,0 +1,109 @@
+# Conda Environment Configuration for PaddleOCR VIN Pipeline
+# =============================================================
+# This file defines a complete conda environment for the project
+#
+# Create environment:
+#   conda env create -f environment.yml
+#
+# Update existing environment:
+#   conda env update -f environment.yml --prune
+#
+# Activate:
+#   conda activate paddleocr_vin
+
+name: paddleocr_vin
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python version
+  - python=3.11
+
+  # System-level dependencies
+  - pip
+  - git
+
+  # Core scientific computing (conda versions for better compatibility)
+  - numpy=2.4
+  - scipy=1.17
+  - pandas=2.3
+
+  # Image processing
+  - pillow=12.1
+  - scikit-image=0.26
+
+  # Visualization
+  - matplotlib=3.10
+  - plotly=6.5
+
+  # Python packages via pip
+  - pip:
+      # ============================================
+      # Core Deep Learning Frameworks
+      # ============================================
+      # PaddlePaddle (GPU version - comment out for CPU)
+      - paddlepaddle-gpu==3.0.0
+      # For CPU only, use:
+      # - paddlepaddle==3.0.0
+
+      # OCR Engine
+      - paddleocr==3.3.3
+
+      # ============================================
+      # Computer Vision & Image Processing
+      # ============================================
+      - opencv-python==4.13.0.90
+      - opencv-contrib-python==4.10.0.84
+      - imageio==2.37.2
+
+      # Data augmentation
+      - albumentations==2.0.8
+      - albucore==0.0.24
+
+      # ============================================
+      # Configuration & Data Management
+      # ============================================
+      - pyyaml==6.0.2
+      - pydantic==2.12.5
+      - pydantic-settings==2.12.0
+      - pydantic-core==2.41.5
+
+      # ============================================
+      # Data Processing & Analysis
+      # ============================================
+      - rapidfuzz==3.14.3
+
+      # ============================================
+      # Web Interface (Streamlit)
+      # ============================================
+      - streamlit==1.53.1
+      - altair==6.0.0
+
+      # ============================================
+      # Utilities & Tools
+      # ============================================
+      - tqdm==4.67.1
+      - requests==2.32.5
+      - click==8.3.1
+
+      # Text processing
+      - python-bidi==0.6.7
+      - shapely==2.1.2
+      - pyclipper==1.4.0
+
+      # File operations
+      - lmdb==1.7.5
+      - pypdfium2==5.3.0
+
+      # ============================================
+      # Testing & Development
+      # ============================================
+      - pytest==9.0.2
+
+# Notes:
+# - This environment includes everything for training and web UI
+# - For GPU training, ensure CUDA 12.4+ is installed
+# - DeepSeek-OCR dependencies (PyTorch) are excluded by default
+# - Add them manually if needed: pip install torch torchvision transformers

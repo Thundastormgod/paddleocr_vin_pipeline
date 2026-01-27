@@ -28,6 +28,9 @@ import re
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
+# Import shared utilities (Single Source of Truth for VIN extraction)
+from vin_utils import extract_vin_from_filename
+
 import numpy as np
 
 
@@ -259,7 +262,7 @@ class MultiModelEvaluator:
                 for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']:
                     for img_path in custom_path.glob(ext):
                         filename = img_path.stem
-                        vin = self._extract_vin_from_filename(filename)
+                        vin = extract_vin_from_filename(filename)
                         if vin and len(vin) == 17:
                             dataset.append((str(img_path), vin))
                 print(f"  Found {len(dataset)} images in custom folder: {custom_folder}")
@@ -275,7 +278,7 @@ class MultiModelEvaluator:
                 # Extract VIN from filename (format: VIN_...-VIN_-_VIN_.jpg)
                 filename = img_path.stem
                 # Try to extract VIN from filename
-                vin = self._extract_vin_from_filename(filename)
+                vin = extract_vin_from_filename(filename)
                 if vin and len(vin) == 17:
                     dataset.append((str(img_path), vin))
         
@@ -284,7 +287,7 @@ class MultiModelEvaluator:
         if train_dir.exists():
             for img_path in train_dir.glob("*.jpg"):
                 filename = img_path.stem
-                vin = self._extract_vin_from_filename(filename)
+                vin = extract_vin_from_filename(filename)
                 if vin and len(vin) == 17:
                     dataset.append((str(img_path), vin))
         
@@ -293,35 +296,15 @@ class MultiModelEvaluator:
         if orig_test.exists():
             for img_path in orig_test.glob("*.jpg"):
                 filename = img_path.stem
-                vin = self._extract_vin_from_filename(filename)
+                vin = extract_vin_from_filename(filename)
                 if vin and len(vin) == 17:
                     dataset.append((str(img_path), vin))
         
         print(f"  Found {len(dataset)} images with ground truth")
         return dataset
     
-    def _extract_vin_from_filename(self, filename: str) -> Optional[str]:
-        """Extract VIN from filename."""
-        # Pattern: SAL1A2A40SA605902_train_8-VIN_-_SAL1A2A40SA605902_2
-        # The VIN is the first 17 characters that match VIN pattern
-        
-        # Try to find a 17-char alphanumeric sequence
-        matches = re.findall(r'[A-Z0-9]{17}', filename.upper())
-        if matches:
-            # Validate it's a proper VIN (no I, O, Q)
-            for match in matches:
-                if not any(c in match for c in 'IOQ'):
-                    return match
-        
-        # Fallback: extract from pattern like "VIN -SAL1A2A40SA606662"
-        if 'VIN' in filename.upper():
-            parts = filename.upper().replace('-', ' ').replace('_', ' ').split()
-            for part in parts:
-                cleaned = ''.join(c for c in part if c.isalnum())
-                if len(cleaned) == 17 and not any(c in cleaned for c in 'IOQ'):
-                    return cleaned
-        
-        return None
+    # Note: VIN extraction uses vin_utils.extract_vin_from_filename (Single Source of Truth)
+    # Supported formats: "1-VIN -SAL1A2A40SA606662.jpg", "7-VIN_-_SAL109F97TA467227.jpg", etc.
     
     def run_paddleocr(self, engine, image_path: str) -> Tuple[str, float]:
         """Run PaddleOCR on an image using the new predict() API."""

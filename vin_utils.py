@@ -70,14 +70,18 @@ VIN_INVALID_CHARS = VINConstants.INVALID_CHARS
 
 # Pre-compiled regex patterns for performance
 _FILENAME_PATTERNS = [
-    # Primary: "1-VIN -SAL1A2A40SA606662.jpg"
-    re.compile(r'^\d+-VIN\s+-([A-Z0-9]{17})\.', re.IGNORECASE),
-    # Flexible: "VIN -VINCODE" or "VIN-VINCODE" anywhere
-    re.compile(r'VIN\s*-\s*([A-Z0-9]{17})(?:\s|\.)', re.IGNORECASE),
+    # Primary: "1-VIN -SAL1A2A40SA606662.jpg" or "1-VIN - SAL1A2A40SA606662.jpg"
+    re.compile(r'^\d+-VIN\s*-\s*([A-Z0-9]{17})(?:\s|\.|_|$)', re.IGNORECASE),
+    # Flexible: "VIN -VINCODE" or "VIN-VINCODE" or "VIN - VINCODE" anywhere
+    re.compile(r'VIN\s*-\s*([A-Z0-9]{17})(?:\s|\.|_|$)', re.IGNORECASE),
     # Legacy: "42 -SAL1A2A40SA606662 2.jpg"
     re.compile(r'^\d+\s*-\s*([A-Z0-9]{17})(?:\s|\.)', re.IGNORECASE),
-    # Underscore format: "VIN_-_SAL1A2A40SA606662_"
-    re.compile(r'VIN_-_([A-Z0-9]{17})_', re.IGNORECASE),
+    # Underscore format: "VIN_-_SAL1A2A40SA606662_" or "VIN_-_SAL1A2A40SA606662.jpg"
+    re.compile(r'VIN_-_([A-Z0-9]{17})(?:_|\.|$)', re.IGNORECASE),
+    # Full underscore format: "7-VIN_-_SAL109F97TA467227.jpg" (number prefix with underscores)
+    re.compile(r'^\d+-VIN_-_([A-Z0-9]{17})(?:_|\.|$)', re.IGNORECASE),
+    # Mixed format: "VIN_VINCODE" or "VIN _ VINCODE"
+    re.compile(r'VIN[_\s]+([A-Z0-9]{17})(?:\s|\.|_|$)', re.IGNORECASE),
 ]
 
 # Fallback pattern for any 17-char alphanumeric (excluding I, O, Q)
@@ -90,10 +94,13 @@ def extract_vin_from_filename(filename: str) -> Optional[str]:
     
     Supported formats (in priority order):
     1. NUMBER-VIN -VINCODE.ext  (e.g., "1-VIN -SAL1A2A40SA606662.jpg")
-    2. VIN -VINCODE.ext or VIN-VINCODE.ext
-    3. NUMBER -VINCODE rest.ext (legacy)
-    4. VIN_-_VINCODE_ (underscore format)
-    5. Any 17-char valid VIN sequence (fallback)
+    2. NUMBER-VIN - VINCODE.ext (e.g., "7-VIN - SAL109F97TA467227.jpg")
+    3. VIN -VINCODE.ext or VIN-VINCODE.ext or VIN - VINCODE.ext
+    4. NUMBER -VINCODE rest.ext (legacy)
+    5. NUMBER-VIN_-_VINCODE.ext (e.g., "7-VIN_-_SAL109F97TA467227.jpg")
+    6. VIN_-_VINCODE_ or VIN_-_VINCODE.ext (underscore format)
+    7. VIN_VINCODE or VIN _ VINCODE (mixed underscore/space)
+    8. Any 17-char valid VIN sequence (fallback)
     
     Args:
         filename: Image filename (not full path)
@@ -104,6 +111,8 @@ def extract_vin_from_filename(filename: str) -> Optional[str]:
     Examples:
         >>> extract_vin_from_filename("1-VIN -SAL1A2A40SA606662.jpg")
         'SAL1A2A40SA606662'
+        >>> extract_vin_from_filename("7-VIN_-_SAL109F97TA467227.jpg")
+        'SAL109F97TA467227'
         >>> extract_vin_from_filename("random_file.jpg")
         None
     """

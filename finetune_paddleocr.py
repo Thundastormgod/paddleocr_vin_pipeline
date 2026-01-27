@@ -1002,12 +1002,22 @@ class VINFineTuner:
         
         start_time = time.time()
         
+        # Initialize progress tracking
+        self.progress_file = self.output_dir / 'training_progress.json'
+        self._save_progress('starting', 0, epochs, 0.0, 0.0, 0.0, 0.0)
+        
         for epoch in range(self.current_epoch + 1, epochs + 1):
             self.current_epoch = epoch
             epoch_start = time.time()
             
+            # Update progress - training
+            self._save_progress('training', epoch, epochs, 0.0, 0.0, 0.0, time.time() - start_time)
+            
             # Train
             train_loss = self.train_epoch(epoch)
+            
+            # Update progress - validating
+            self._save_progress('validating', epoch, epochs, train_loss, 0.0, 0.0, time.time() - start_time)
             
             # Validate
             val_loss, val_accuracy = self.validate()
@@ -1030,8 +1040,15 @@ class VINFineTuner:
             
             if epoch % save_epoch_step == 0 or is_best:
                 self.save_checkpoint(epoch, is_best)
+            
+            # Update progress - epoch completed
+            self._save_progress('completed_epoch', epoch, epochs, train_loss, val_loss, val_accuracy, time.time() - start_time)
         
         total_time = time.time() - start_time
+        
+        # Update progress - training completed
+        self._save_progress('completed', epochs, epochs, train_loss, val_loss, val_accuracy, total_time)
+        
         print("=" * 60)
         print("Training Complete!")
         print(f"  Total time: {total_time / 3600:.2f} hours")
@@ -1044,6 +1061,29 @@ class VINFineTuner:
         
         # Run final comprehensive evaluation and save metrics
         self._save_final_metrics(total_time, epochs)
+    
+    def _save_progress(self, status: str, current_epoch: int, total_epochs: int, 
+                        train_loss: float, val_loss: float, val_accuracy: float, 
+                        elapsed_time: float):
+        """Save training progress to JSON file for UI monitoring."""
+        progress = {
+            'status': status,
+            'current_epoch': current_epoch,
+            'total_epochs': total_epochs,
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'val_accuracy': val_accuracy,
+            'best_accuracy': self.best_accuracy,
+            'elapsed_time': elapsed_time,
+            'timestamp': datetime.now().isoformat(),
+            'train_losses': self.train_losses[-20:] if self.train_losses else [],
+            'val_accuracies': self.val_accuracies[-20:] if self.val_accuracies else []
+        }
+        try:
+            with open(self.progress_file, 'w') as f:
+                json.dump(progress, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save progress file: {e}")
     
     def _ctc_greedy_decode(self, logits: paddle.Tensor) -> List[str]:
         """CTC greedy decoding for batch of logits."""

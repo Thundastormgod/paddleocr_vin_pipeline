@@ -56,17 +56,22 @@ PEFT_AVAILABLE = False
 try:
     import torch
     import torch.nn as nn
-    from torch.utils.data import Dataset, DataLoader
+    from torch.utils.data import Dataset as TorchDataset, DataLoader
     TORCH_AVAILABLE = True
 except ImportError:
-    pass  # Silent - will print warning only when needed
+    # Provide stub class when torch not available
+    class TorchDataset:
+        """Stub Dataset class when torch is not installed."""
+        pass
+    DataLoader = None
 
 try:
     from transformers import (
         AutoModel, AutoTokenizer, AutoProcessor,
         Trainer, TrainingArguments,
         DataCollatorWithPadding,
-        EarlyStoppingCallback
+        EarlyStoppingCallback,
+        TrainerCallback
     )
     from transformers.modeling_utils import PreTrainedModel
     TRANSFORMERS_AVAILABLE = True
@@ -174,7 +179,7 @@ def load_config(config_path: str) -> DeepSeekFineTuneConfig:
 # DATASET
 # =============================================================================
 
-class VINDeepSeekDataset(Dataset):
+class VINDeepSeekDataset(TorchDataset):
     """Dataset for VIN recognition with DeepSeek-OCR."""
     
     def __init__(
@@ -346,7 +351,7 @@ class DeepSeekVINTrainer:
         logger.info(f"Model loaded successfully")
         return self.model
     
-    def setup_datasets(self) -> Tuple[Dataset, Dataset]:
+    def setup_datasets(self) -> Tuple[Any, Any]:
         """Setup training and validation datasets."""
         train_dataset = VINDeepSeekDataset(
             data_dir=self.config.data_dir,
@@ -473,6 +478,77 @@ class DeepSeekVINTrainer:
         
         # Callbacks
         callbacks = []
+        
+        # Add custom progress callback for UI
+        class ProgressCallback(TrainerCallback):
+            """Callback to write training progress to JSON for UI monitoring."""
+            def __init__(self, output_dir: Path, num_epochs: int):
+                self.output_dir = output_dir
+                self.num_epochs = num_epochs
+                self.progress_file = output_dir / 'training_progress.json'
+                self.best_accuracy = 0.0
+                self.train_losses = []
+                self.val_accuracies = []
+                self.start_time = None
+            
+            def _save_progress(self, status, epoch, train_loss, val_loss, val_accuracy):
+                import time
+                elapsed = time.time() - self.start_time if self.start_time else 0
+                progress = {
+                    'status': status,
+                    'current_epoch': epoch,
+                    'total_epochs': self.num_epochs,
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'val_accuracy': val_accuracy,
+                    'best_accuracy': self.best_accuracy,
+                    'elapsed_time': elapsed,
+                    'timestamp': datetime.now().isoformat(),
+                    'train_losses': self.train_losses[-20:],
+                    'val_accuracies': self.val_accuracies[-20:]
+                }
+                try:
+                    with open(self.progress_file, 'w') as f:
+                        json.dump(progress, f, indent=2)
+                except Exception:
+                    pass
+            
+            def on_train_begin(self, args, state, control, **kwargs):
+                import time
+                self.start_time = time.time()
+                self._save_progress('starting', 0, 0.0, 0.0, 0.0)
+            
+            def on_epoch_begin(self, args, state, control, **kwargs):
+                self._save_progress('training', int(state.epoch) + 1, 0.0, 0.0, 0.0)
+            
+            def on_log(self, args, state, control, logs=None, **kwargs):
+                if logs:
+                    train_loss = logs.get('loss', 0.0)
+                    eval_loss = logs.get('eval_loss', 0.0)
+                    eval_accuracy = logs.get('eval_accuracy', 0.0)
+                    if train_loss:
+                        self.train_losses.append(train_loss)
+                    if eval_accuracy:
+                        self.val_accuracies.append(eval_accuracy)
+                        if eval_accuracy > self.best_accuracy:
+                            self.best_accuracy = eval_accuracy
+                    self._save_progress('training', int(state.epoch) + 1, train_loss, eval_loss, eval_accuracy)
+            
+            def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+                if metrics:
+                    val_accuracy = metrics.get('eval_accuracy', 0.0)
+                    val_loss = metrics.get('eval_loss', 0.0)
+                    if val_accuracy > self.best_accuracy:
+                        self.best_accuracy = val_accuracy
+                    self.val_accuracies.append(val_accuracy)
+                    self._save_progress('validating', int(state.epoch) + 1, 0.0, val_loss, val_accuracy)
+            
+            def on_train_end(self, args, state, control, **kwargs):
+                self._save_progress('completed', self.num_epochs, 0.0, 0.0, self.best_accuracy)
+        
+        # Add progress callback
+        callbacks.append(ProgressCallback(self.output_dir, self.config.num_epochs))
+        
         if self.config.early_stopping_patience > 0:
             callbacks.append(
                 EarlyStoppingCallback(

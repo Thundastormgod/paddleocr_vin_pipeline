@@ -46,6 +46,24 @@ def test_underscore_format():
     assert result == "SAL1A2A40SA606662"
 
 
+def test_underscore_format_no_trailing():
+    """Test underscore format without trailing underscore: 7-VIN_-_SAL109F97TA467227.jpg"""
+    result = extract_vin_from_filename("7-VIN_-_SAL109F97TA467227.jpg")
+    assert result == "SAL109F97TA467227"
+
+
+def test_underscore_format_no_extension():
+    """Test underscore format without file extension."""
+    result = extract_vin_from_filename("7-VIN_-_SAL109F97TA467227")
+    assert result == "SAL109F97TA467227"
+
+
+def test_space_dash_space_format():
+    """Test format with spaces around dash: 7-VIN - SAL109F97TA467227.jpg"""
+    result = extract_vin_from_filename("7-VIN - SAL109F97TA467227.jpg")
+    assert result == "SAL109F97TA467227"
+
+
 def test_lowercase_normalized():
     """Test that lowercase VINs are normalized to uppercase."""
     result = extract_vin_from_filename("1-VIN -sal1a2a40sa606662.jpg")

@@ -194,9 +194,29 @@ Note:    "/" character not yet filtered (seen in test image 1000)
 
 ## Installation
 
+### Basic Installation (Recommended)
+
+For most users (PaddleOCR + Web UI):
+
 ```bash
 pip install -r requirements.txt
 ```
+
+This installs all core dependencies including:
+- PaddleOCR for VIN recognition
+- Streamlit web interface
+- Image processing libraries (OpenCV, Pillow)
+- Data analysis tools (Pandas, Plotly)
+
+### Advanced Options
+
+For detailed installation options including:
+- GPU acceleration setup
+- DeepSeek-OCR support
+- Custom installations
+- Troubleshooting
+
+See [INSTALLATION.md](INSTALLATION.md) for the complete installation guide.
 
 ---
 

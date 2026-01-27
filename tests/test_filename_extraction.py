@@ -2,66 +2,73 @@
 """
 Test script to verify VIN extraction from filenames.
 
-Usage:
-    python test_filename_extraction.py
-    python test_filename_extraction.py --data-dir /path/to/images
-    python test_filename_extraction.py --filename "42-VIN -SAL1A2A40SA606645.jpg"
+This module tests the extract_vin_from_filename function from vin_utils.py.
+
+Usage as pytest:
+    pytest tests/test_filename_extraction.py -v
+
+Usage as CLI (for manual testing):
+    python tests/test_filename_extraction.py
+    python tests/test_filename_extraction.py --data-dir /path/to/images
+    python tests/test_filename_extraction.py --filename "42-VIN -SAL1A2A40SA606645.jpg"
 """
 
 import argparse
-import re
+import sys
 from pathlib import Path
 from typing import Optional
 
+# Add parent directory for imports when run as script
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-def extract_vin_from_filename(filename: str) -> Optional[str]:
-    """
-    Extract VIN from filename pattern.
-    
-    Primary format:
-    - NUMBER-VIN -VINCODE.jpg (e.g., "1-VIN -SAL1A2A40SA606662.jpg")
-    
-    Legacy formats (still supported):
-    - NUMBER-VIN_-_VINCODE_.jpg
-    - NUMBER -VINCODE rest.jpg
-    """
-    # Primary Pattern: "number-VIN -VINCODE.jpg"
-    # Example: "1-VIN -SAL1A2A40SA606662.jpg"
-    match = re.search(r'^\d+-VIN\s+-([A-Z0-9]{17})\.', filename, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    # Flexible: "VIN -VINCODE" or "VIN-VINCODE" anywhere in filename
-    match = re.search(r'VIN\s*-\s*([A-Z0-9]{17})(?:\s|\.)', filename, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    # Legacy: "number -VINCODE rest.jpg" or "number-VINCODE.jpg"
-    match = re.search(r'^\d+\s*-\s*([A-Z0-9]{17})(?:\s|\.)', filename, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    # Legacy: VIN_-_VINCODE_
-    match = re.search(r'VIN_-_([A-Z0-9]{17})_', filename, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    # Legacy: VIN_-_VINCODE (without trailing underscore)
-    match = re.search(r'VIN_-_([A-Z0-9]{17})[._]', filename, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    # Fallback: Look for any 17-char valid VIN sequence
-    match = re.search(r'\b([A-HJ-NPR-Z0-9]{17})\b', filename, re.IGNORECASE)
-    if match:
-        vin = match.group(1).upper()
-        if not any(c in vin for c in 'IOQ'):
-            return vin
-    
-    return None
+from vin_utils import extract_vin_from_filename
 
 
-def test_predefined_patterns():
+# =============================================================================
+# PYTEST COMPATIBLE TESTS
+# =============================================================================
+
+def test_primary_format():
+    """Test primary filename format: NUMBER-VIN -VINCODE.jpg"""
+    result = extract_vin_from_filename("1-VIN -SAL1A2A40SA606662.jpg")
+    assert result == "SAL1A2A40SA606662"
+
+
+def test_with_suffix_number():
+    """Test format with suffix number."""
+    result = extract_vin_from_filename("42-VIN -SAL1A2A40SA606645 2.jpg")
+    assert result == "SAL1A2A40SA606645"
+
+
+def test_underscore_format():
+    """Test legacy underscore format."""
+    result = extract_vin_from_filename("1-VIN_-_SAL1A2A40SA606662_.jpg")
+    assert result == "SAL1A2A40SA606662"
+
+
+def test_lowercase_normalized():
+    """Test that lowercase VINs are normalized to uppercase."""
+    result = extract_vin_from_filename("1-VIN -sal1a2a40sa606662.jpg")
+    assert result == "SAL1A2A40SA606662"
+
+
+def test_no_vin_returns_none():
+    """Test that invalid filenames return None."""
+    result = extract_vin_from_filename("random_image.jpg")
+    assert result is None
+
+
+def test_short_vin_returns_none():
+    """Test that partial VINs are not extracted."""
+    result = extract_vin_from_filename("1-VIN -SAL1A2A40.jpg")
+    assert result is None
+
+
+# =============================================================================
+# CLI FUNCTIONS (for manual testing - prefixed with _ to exclude from pytest)
+# =============================================================================
+
+def _cli_test_predefined_patterns():
     """Test with predefined filename patterns."""
     print("=" * 60)
     print("Testing Predefined Filename Patterns")
@@ -107,7 +114,7 @@ def test_predefined_patterns():
     return failed == 0
 
 
-def test_single_filename(filename: str):
+def _cli_test_single_filename(filename: str):
     """Test extraction on a single filename."""
     print("=" * 60)
     print("Testing Single Filename")
@@ -129,7 +136,7 @@ def test_single_filename(filename: str):
     return result
 
 
-def test_directory(data_dir: str):
+def _cli_test_directory(data_dir: str):
     """Test extraction on all images in a directory."""
     print("=" * 60)
     print(f"Testing Images in: {data_dir}")
@@ -185,12 +192,12 @@ def main():
     args = parser.parse_args()
     
     if args.filename:
-        test_single_filename(args.filename)
+        _cli_test_single_filename(args.filename)
     elif args.data_dir:
-        test_directory(args.data_dir)
+        _cli_test_directory(args.data_dir)
     else:
         # Run predefined tests
-        test_predefined_patterns()
+        _cli_test_predefined_patterns()
 
 
 if __name__ == "__main__":

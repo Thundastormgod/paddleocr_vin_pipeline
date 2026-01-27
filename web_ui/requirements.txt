@@ -1,0 +1,16 @@
+# Web UI Requirements
+# ===================
+# Install these dependencies to run the Streamlit web interface
+
+# Core UI framework
+streamlit>=1.28.0
+
+# Data visualization
+plotly>=5.18.0
+pandas>=2.0.0
+
+# Image handling
+Pillow>=10.0.0
+
+# The main project requirements are still needed:
+# pip install -r requirements.txt

@@ -41,23 +41,64 @@ except ImportError:
 
 
 class PipelineError(Exception):
-    """Base exception for pipeline errors."""
-    pass
+    """
+    Base exception for pipeline errors.
+    
+    Provides structured error information with error codes for programmatic handling.
+    """
+    
+    def __init__(self, message: str, error_code: str = "PIPELINE_ERROR", context: Optional[Dict[str, Any]] = None):
+        self.message = message
+        self.error_code = error_code
+        self.context = context or {}
+        super().__init__(self.message)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert exception to dictionary for JSON serialization."""
+        return {
+            "error_code": self.error_code,
+            "message": self.message,
+            "context": self.context,
+        }
 
 
 class ImageLoadError(PipelineError):
     """Raised when image cannot be loaded."""
-    pass
+    
+    def __init__(self, file_path: str, reason: str = "Unknown error"):
+        super().__init__(
+            message=f"Failed to load image: {file_path}. Reason: {reason}",
+            error_code="IMAGE_LOAD_ERROR",
+            context={"file_path": file_path, "reason": reason}
+        )
+        self.file_path = file_path
+        self.reason = reason
 
 
 class OCREngineError(PipelineError):
     """Raised when OCR engine fails."""
-    pass
+    
+    def __init__(self, message: str, engine: str = "PaddleOCR", details: Optional[str] = None):
+        super().__init__(
+            message=f"OCR engine error ({engine}): {message}",
+            error_code="OCR_ENGINE_ERROR",
+            context={"engine": engine, "details": details}
+        )
+        self.engine = engine
+        self.details = details
 
 
 class ConfigurationError(PipelineError):
     """Raised when pipeline is misconfigured."""
-    pass
+    
+    def __init__(self, message: str, config_key: Optional[str] = None, expected: Optional[str] = None):
+        super().__init__(
+            message=f"Configuration error: {message}",
+            error_code="CONFIG_ERROR",
+            context={"config_key": config_key, "expected": expected}
+        )
+        self.config_key = config_key
+        self.expected = expected
 
 
 # =============================================================================
@@ -289,17 +330,6 @@ class VINPostProcessor:
     Thread Safety: This class is thread-safe for concurrent use.
     """
     
-    # VIN checksum weights by position (NHTSA standard)
-    CHECKSUM_WEIGHTS: Tuple[int, ...] = (8, 7, 6, 5, 4, 3, 2, 10, 0, 9, 8, 7, 6, 5, 4, 3, 2)
-    
-    # Character to value mapping for checksum (ISO 3779)
-    CHAR_VALUES: Dict[str, int] = {
-        'A': 1, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'F': 6, 'G': 7, 'H': 8,
-        'J': 1, 'K': 2, 'L': 3, 'M': 4, 'N': 5, 'P': 7, 'R': 9,
-        'S': 2, 'T': 3, 'U': 4, 'V': 5, 'W': 6, 'X': 7, 'Y': 8, 'Z': 9,
-        '0': 0, '1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9
-    }
-    
     def __init__(self, verbose: bool = False):
         """
         Initialize postprocessor.
@@ -386,51 +416,16 @@ class VINPostProcessor:
         """
         Extract 17-character VIN from longer text.
         
-        When OCR picks up extra characters before/after the VIN,
-        this method attempts to find the valid VIN substring.
+        Delegates to vin_utils.extract_vin_from_text() as Single Source of Truth.
         
-        Strategy:
-        1. If exactly 17 chars, return as-is
-        2. Look for common WMI prefixes (SAL, WVW, 1G1, etc.)
-        3. Find best 17-char substring with valid VIN characters
-        """
-        if len(text) == VIN_LENGTH:
-            return text
-        
-        if len(text) < VIN_LENGTH:
-            return text  # Too short, can't extract
-        
-        # Common WMI (World Manufacturer Identifier) prefixes
-        # These are the first 3 characters of a VIN
-        common_wmis = ['SAL', 'WVW', 'WBA', 'WDB', '1G1', '1GC', '1GT', 
-                       '2G1', '3G1', 'JN1', 'JT2', 'KM8', 'VF1', 'WF0']
-        
-        # Strategy 1: Look for known WMI at any position
-        for wmi in common_wmis:
-            idx = text.find(wmi)
-            if idx != -1 and idx + VIN_LENGTH <= len(text):
-                candidate = text[idx:idx + VIN_LENGTH]
-                # Verify it has valid VIN characters
-                if all(c in VIN_VALID_CHARS or c in 'IOQ' for c in candidate):
-                    return candidate
-        
-        # Strategy 2: Try all 17-char substrings, find one with most valid chars
-        best_candidate = text[:VIN_LENGTH]  # Default: first 17 chars
-        best_score = 0
-        
-        for i in range(len(text) - VIN_LENGTH + 1):
-            candidate = text[i:i + VIN_LENGTH]
-            # Score: count of valid VIN characters
-            score = sum(1 for c in candidate if c in VIN_VALID_CHARS)
-            # Bonus for having digits in positions 12-17 (sequential number)
-            seq_digits = sum(1 for c in candidate[11:17] if c.isdigit())
-            score += seq_digits * 2
+        Args:
+            text: Raw OCR text that may contain extra characters
             
-            if score > best_score:
-                best_score = score
-                best_candidate = candidate
-        
-        return best_candidate
+        Returns:
+            Best 17-character VIN candidate
+        """
+        from vin_utils import extract_vin_from_text
+        return extract_vin_from_text(text)
     
     def _fix_invalid_chars(self, text: str) -> str:
         """Replace invalid VIN characters."""
@@ -463,11 +458,7 @@ class VINPostProcessor:
         """
         Validate VIN checksum (position 9).
         
-        The checksum is calculated by:
-        1. Assigning a value to each character (ISO 3779)
-        2. Multiplying each value by its position weight (NHTSA)
-        3. Summing all products
-        4. Taking mod 11 (result 10 = 'X')
+        Delegates to vin_utils.validate_checksum() as Single Source of Truth.
         
         Args:
             vin: VIN string to validate
@@ -475,35 +466,9 @@ class VINPostProcessor:
         Returns:
             True if checksum is valid, False otherwise
         """
-        if len(vin) != VIN_LENGTH:
-            return False
-            
-        try:
-            total = 0
-            for i, char in enumerate(vin):
-                value = self.CHAR_VALUES.get(char)
-                if value is None:
-                    logger.debug(f"Unknown character '{char}' at position {i+1}")
-                    return False
-                weight = self.CHECKSUM_WEIGHTS[i]
-                total += value * weight
-            
-            remainder = total % 11
-            expected = 'X' if remainder == 10 else str(remainder)
-            
-            is_valid = vin[8] == expected  # Position 9 (0-indexed: 8)
-            
-            if not is_valid:
-                logger.debug(
-                    f"Checksum mismatch: expected '{expected}', got '{vin[8]}' "
-                    f"(sum={total}, mod11={remainder})"
-                )
-            
-            return is_valid
-            
-        except (IndexError, TypeError) as e:
-            logger.warning(f"Checksum validation error: {e}")
-            return False
+        # Import here to avoid circular imports at module level
+        from vin_utils import validate_checksum
+        return validate_checksum(vin)
 
 
 # =============================================================================
@@ -778,12 +743,62 @@ class VINOCRPipeline:
             texts = result.get('rec_texts', [])
             scores = result.get('rec_scores', [])
             
-            if texts:
-                # Combine all detected text
-                full_text = ''.join(texts)
-                avg_score = float(np.mean(scores)) if scores else 0.0
+            # Combine all detected text (texts could be empty list)
+            full_text = ''.join(texts) if texts else ''
+            avg_score = float(np.mean(scores)) if scores else 0.0
+            return full_text, avg_score
+
+        # -----------------------------------------------------------------
+        # Handle PaddleX / Paddle inference OCRResult objects which are
+        # neither plain dicts nor lists but expose rec_texts / rec_scores
+        # either via mapping access (obj['rec_texts']) or attributes
+        # (obj.rec_texts) or via __getitem__ implemented in their BaseCVResult.
+        # -----------------------------------------------------------------
+        try:
+            # Try mapping-like access first (works for BaseCVResult)
+            texts = None
+            scores = None
+            if hasattr(result, '__getitem__'):
+                try:
+                    texts = result['rec_texts']
+                except Exception:
+                    texts = None
+                try:
+                    scores = result['rec_scores']
+                except Exception:
+                    scores = None
+
+            # If not available via __getitem__, try attribute access
+            if texts is None:
+                texts = getattr(result, 'rec_texts', None)
+            if scores is None:
+                scores = getattr(result, 'rec_scores', None)
+
+            # Check if we successfully accessed texts (could be empty list)
+            if texts is not None:
+                # rec_texts may be numpy arrays or lists; coerce to list of str
+                try:
+                    text_list = list(texts)
+                except Exception:
+                    text_list = [str(texts)] if texts else []
+
+                full_text = ''.join([str(t) for t in text_list])
+
+                # rec_scores can be a numpy array, list, or None
+                try:
+                    avg_score = float(np.mean(scores)) if scores is not None and len(scores) > 0 else 0.0
+                except Exception:
+                    try:
+                        avg_score = float(np.mean(list(scores))) if scores is not None and len(list(scores)) > 0 else 0.0
+                    except Exception:
+                        avg_score = 0.0
+
                 return full_text, avg_score
-        
+        except Exception as e:
+            # Log the actual exception for debugging
+            logger.debug(f"Exception extracting OCR result: {e}")
+            pass
+
         logger.warning(f"Unexpected OCR result format: {type(result)}")
         return '', 0.0
 
@@ -937,7 +952,7 @@ def calculate_check_digit(vin_without_check: str) -> str:
     """
     Calculate the correct check digit for a VIN.
     
-    Useful for correcting VINs with invalid check digits.
+    Delegates to vin_utils.calculate_check_digit (Single Source of Truth).
     
     Args:
         vin_without_check: VIN string (position 9 will be ignored)
@@ -946,27 +961,27 @@ def calculate_check_digit(vin_without_check: str) -> str:
         Correct check digit (0-9 or X)
         
     Raises:
-        ValueError: If VIN contains invalid characters
+        ValueError: If VIN contains invalid characters or is too short
     """
+    from vin_utils import calculate_check_digit as _calculate_check_digit
+    
     if len(vin_without_check) < VIN_LENGTH:
         raise ValueError(f"VIN too short: {len(vin_without_check)} characters")
     
     vin = vin_without_check.upper()[:VIN_LENGTH]
+    result = _calculate_check_digit(vin)
     
-    # Use CHAR_VALUES from VINPostProcessor
-    char_values = VINPostProcessor.CHAR_VALUES
-    weights = VINPostProcessor.CHECKSUM_WEIGHTS
+    if result is None:
+        # Find the invalid character for a helpful error message
+        from vin_utils import VINConstants
+        for i, char in enumerate(vin):
+            if i == 8:  # Skip check digit position
+                continue
+            if char not in VINConstants.CHAR_VALUES:
+                raise ValueError(f"Invalid character '{char}' at position {i+1}")
+        raise ValueError("Invalid VIN characters")
     
-    total = 0
-    for i, char in enumerate(vin):
-        if i == 8:  # Skip check digit position
-            continue
-        if char not in char_values:
-            raise ValueError(f"Invalid character '{char}' at position {i+1}")
-        total += char_values[char] * weights[i]
-    
-    remainder = total % 11
-    return 'X' if remainder == 10 else str(remainder)
+    return result
 
 
 # =============================================================================
@@ -980,6 +995,251 @@ def _setup_logging(verbose: bool) -> None:
         level=level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
+
+
+# =============================================================================
+# MULTI-PROVIDER PIPELINE
+# =============================================================================
+
+class MultiProviderVINPipeline:
+    """
+    VIN OCR Pipeline with multi-provider support.
+    
+    Supports:
+    - PaddleOCR (default, local processing)
+    - DeepSeek Vision (API-based)
+    - Ensemble mode (combine multiple providers)
+    - Future: Tesseract, Google Vision, Azure Vision
+    
+    Example:
+        # Use PaddleOCR (default)
+        pipeline = MultiProviderVINPipeline()
+        
+        # Use DeepSeek
+        pipeline = MultiProviderVINPipeline(provider="deepseek", api_key="...")
+        
+        # Use ensemble of multiple providers
+        pipeline = MultiProviderVINPipeline(
+            provider="ensemble",
+            ensemble_providers=["paddleocr", "deepseek"],
+            ensemble_strategy="best"
+        )
+    """
+    
+    def __init__(
+        self,
+        provider: str = "paddleocr",
+        preprocess_mode: Union[str, PreprocessMode] = PreprocessMode.ENGRAVED,
+        enable_postprocess: bool = True,
+        verbose: bool = False,
+        # Provider-specific options
+        api_key: Optional[str] = None,
+        # Ensemble options
+        ensemble_providers: Optional[List[str]] = None,
+        ensemble_strategy: str = "best",
+        **provider_kwargs
+    ):
+        """
+        Initialize multi-provider VIN OCR pipeline.
+        
+        Args:
+            provider: OCR provider ('paddleocr', 'deepseek', 'ensemble')
+            preprocess_mode: Image preprocessing mode
+            enable_postprocess: Apply VIN correction rules
+            verbose: Print processing steps
+            api_key: API key for cloud providers (DeepSeek, etc.)
+            ensemble_providers: List of providers for ensemble mode
+            ensemble_strategy: Ensemble strategy ('best', 'vote', 'cascade')
+            **provider_kwargs: Additional provider-specific options
+        """
+        self.provider_name = provider.lower()
+        self.verbose = verbose
+        self.enable_postprocess = enable_postprocess
+        
+        # Normalize mode
+        if isinstance(preprocess_mode, str):
+            self.preprocess_mode = preprocess_mode.lower()
+        else:
+            self.preprocess_mode = preprocess_mode.value
+        
+        # Initialize preprocessor and postprocessor
+        self.preprocessor = VINImagePreprocessor(mode=self.preprocess_mode)
+        self.postprocessor = VINPostProcessor(verbose=verbose)
+        
+        # Import and create OCR provider
+        self._create_provider(
+            provider=provider,
+            api_key=api_key,
+            ensemble_providers=ensemble_providers,
+            ensemble_strategy=ensemble_strategy,
+            **provider_kwargs
+        )
+        
+        logger.info(f"MultiProviderVINPipeline initialized with {self.ocr_provider.name}")
+        if self.verbose:
+            print(f"Pipeline initialized with {self.ocr_provider.name}")
+    
+    def _create_provider(
+        self,
+        provider: str,
+        api_key: Optional[str],
+        ensemble_providers: Optional[List[str]],
+        ensemble_strategy: str,
+        **kwargs
+    ) -> None:
+        """Create the OCR provider instance."""
+        try:
+            from ocr_providers import (
+                OCRProviderFactory,
+                EnsembleOCRProvider,
+                OCRProviderType,
+            )
+        except ImportError:
+            raise ConfigurationError(
+                "ocr_providers module not found. "
+                "Ensure ocr_providers.py is in the same directory."
+            )
+        
+        provider = provider.lower()
+        
+        if provider == "ensemble":
+            # Create ensemble provider
+            if not ensemble_providers:
+                ensemble_providers = ["paddleocr"]  # Default to single provider
+            
+            providers = []
+            for p in ensemble_providers:
+                p_kwargs = {"api_key": api_key} if p == "deepseek" else {}
+                p_kwargs.update(kwargs)
+                providers.append(
+                    OCRProviderFactory.create(p, auto_initialize=True, **p_kwargs)
+                )
+            
+            self.ocr_provider = EnsembleOCRProvider(
+                providers=providers,
+                strategy=ensemble_strategy
+            )
+        else:
+            # Create single provider
+            p_kwargs = {"api_key": api_key} if provider == "deepseek" else {}
+            p_kwargs.update(kwargs)
+            self.ocr_provider = OCRProviderFactory.create(
+                provider, auto_initialize=True, **p_kwargs
+            )
+    
+    def recognize(self, image_path: Union[str, Path, np.ndarray]) -> Dict[str, Any]:
+        """
+        Recognize VIN from an image.
+        
+        Args:
+            image_path: Path to image file or numpy array
+            
+        Returns:
+            Dict containing:
+                - vin: Corrected VIN string
+                - confidence: OCR confidence score
+                - raw_ocr: Original OCR output
+                - is_valid_length: Whether VIN is 17 characters
+                - checksum_valid: Whether VIN checksum is valid
+                - corrections: List of corrections applied
+                - processing_time_ms: Time taken in milliseconds
+                - provider: Name of OCR provider used
+                - error: Error message if any
+        """
+        with _timer() as elapsed:
+            try:
+                return self._recognize_internal(image_path, elapsed)
+            except Exception as e:
+                logger.exception(f"Recognition failed: {e}")
+                return {
+                    'vin': '',
+                    'confidence': 0.0,
+                    'raw_ocr': '',
+                    'is_valid_length': False,
+                    'checksum_valid': False,
+                    'corrections': [],
+                    'processing_time_ms': elapsed['ms'],
+                    'provider': self.ocr_provider.name,
+                    'error': str(e),
+                }
+    
+    def _recognize_internal(
+        self,
+        image_path: Union[str, Path, np.ndarray],
+        elapsed: Dict[str, float]
+    ) -> Dict[str, Any]:
+        """Internal recognition logic with timing."""
+        # Load image
+        if isinstance(image_path, np.ndarray):
+            image = image_path
+            source = "numpy_array"
+        else:
+            path = Path(image_path)
+            if not path.exists():
+                raise ImageLoadError(f"Image file not found: {path}")
+            
+            try:
+                image = cv2.imread(str(path))
+            except Exception as e:
+                raise ImageLoadError(f"Failed to read image: {e}") from e
+                
+            if image is None:
+                raise ImageLoadError(
+                    f"Could not decode image: {path}. "
+                    "Verify it's a valid image format (jpg, png, etc.)"
+                )
+            source = str(path)
+        
+        logger.debug(f"Loaded image from {source}, shape={image.shape}")
+        
+        # Preprocess
+        if self.verbose:
+            print(f"Preprocessing (mode: {self.preprocess_mode})...")
+        processed = self.preprocessor.preprocess(image)
+        
+        # Run OCR via provider
+        if self.verbose:
+            print(f"Running OCR ({self.ocr_provider.name})...")
+        
+        ocr_result = self.ocr_provider.recognize(processed)
+        
+        raw_text = ocr_result.text
+        confidence = ocr_result.confidence
+        
+        logger.debug(f"Raw OCR: '{raw_text}' (confidence: {confidence:.2f})")
+        if self.verbose:
+            print(f"Raw OCR: '{raw_text}' (conf: {confidence:.2f})")
+        
+        # Postprocess
+        if self.enable_postprocess:
+            if self.verbose:
+                print("Postprocessing...")
+            output = self.postprocessor.process(raw_text, confidence)
+        else:
+            output = {
+                'vin': raw_text,
+                'raw_ocr': raw_text,
+                'confidence': confidence,
+                'is_valid_length': len(raw_text) == VIN_LENGTH,
+                'checksum_valid': False,
+                'corrections': []
+            }
+        
+        # Add timing and provider info
+        output['processing_time_ms'] = elapsed['ms']
+        output['provider'] = self.ocr_provider.name
+        output['error'] = None
+        
+        return output
+    
+    @staticmethod
+    def list_providers() -> List[str]:
+        """List available OCR providers."""
+        try:
+            from ocr_providers import OCRProviderFactory
+            return OCRProviderFactory.list_available()
+        except ImportError:
+            return ["paddleocr"]  # Fallback
 
 
 def main() -> int:
@@ -996,7 +1256,9 @@ Examples:
   python vin_pipeline.py image.jpg
   python vin_pipeline.py image.jpg --mode engraved -v
   python vin_pipeline.py image.jpg --json
+  python vin_pipeline.py image.jpg --provider deepseek --api-key YOUR_KEY
   python vin_pipeline.py --validate "SAL1P9EU2SA606664"
+  python vin_pipeline.py --list-providers
         """
     )
     parser.add_argument('image', nargs='?', help='Path to VIN image')
@@ -1013,12 +1275,34 @@ Examples:
                        help='Validate a VIN string instead of processing an image')
     parser.add_argument('--decode', metavar='VIN',
                        help='Decode a VIN string structure')
-    parser.add_argument('--version', action='version', version='VIN OCR Pipeline 1.0.0')
+    parser.add_argument('--version', action='version', version='VIN OCR Pipeline 2.0.0')
+    
+    # Provider options
+    parser.add_argument('--provider', default='paddleocr',
+                       choices=['paddleocr', 'deepseek', 'ensemble'],
+                       help='OCR provider (default: paddleocr)')
+    parser.add_argument('--api-key', metavar='KEY',
+                       help='API key for cloud providers (DeepSeek, etc.)')
+    parser.add_argument('--ensemble-providers', nargs='+',
+                       help='Providers for ensemble mode (e.g., --ensemble-providers paddleocr deepseek)')
+    parser.add_argument('--ensemble-strategy', default='best',
+                       choices=['best', 'vote', 'cascade'],
+                       help='Ensemble strategy (default: best)')
+    parser.add_argument('--list-providers', action='store_true',
+                       help='List available OCR providers')
     
     args = parser.parse_args()
     
     # Setup logging
     _setup_logging(args.verbose)
+    
+    # Handle --list-providers flag
+    if args.list_providers:
+        providers = MultiProviderVINPipeline.list_providers()
+        print("Available OCR providers:")
+        for p in providers:
+            print(f"  - {p}")
+        return 0
     
     # Handle --validate flag
     if args.validate:
@@ -1054,7 +1338,7 @@ Examples:
     
     # Require image for OCR
     if not args.image:
-        parser.error("Image path required (or use --validate/--decode)")
+        parser.error("Image path required (or use --validate/--decode/--list-providers)")
         return 1
     
     # Check image exists
@@ -1063,15 +1347,31 @@ Examples:
         print(f"Error: Image not found: {image_path}", file=sys.stderr)
         return 1
     
-    # Create pipeline
+    # Create pipeline - use MultiProviderVINPipeline if non-default provider
     try:
-        pipeline = VINOCRPipeline(
-            preprocess_mode=args.mode,
-            enable_postprocess=not args.no_postprocess,
-            verbose=args.verbose
-        )
+        if args.provider != 'paddleocr' or args.api_key:
+            # Use multi-provider pipeline
+            pipeline = MultiProviderVINPipeline(
+                provider=args.provider,
+                preprocess_mode=args.mode,
+                enable_postprocess=not args.no_postprocess,
+                verbose=args.verbose,
+                api_key=args.api_key,
+                ensemble_providers=args.ensemble_providers,
+                ensemble_strategy=args.ensemble_strategy,
+            )
+        else:
+            # Use legacy PaddleOCR-only pipeline (faster initialization)
+            pipeline = VINOCRPipeline(
+                preprocess_mode=args.mode,
+                enable_postprocess=not args.no_postprocess,
+                verbose=args.verbose
+            )
     except ConfigurationError as e:
         print(f"Configuration error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Error initializing pipeline: {e}", file=sys.stderr)
         return 1
     
     # Process image
@@ -1090,6 +1390,8 @@ Examples:
         print(f"Valid Length: {result.get('is_valid_length', 'N/A')}")
         print(f"Checksum Valid: {result.get('checksum_valid', 'N/A')}")
         print(f"Processing Time: {result.get('processing_time_ms', 0):.0f}ms")
+        if result.get('provider'):
+            print(f"Provider: {result['provider']}")
         
         if result.get('corrections'):
             print("\nCorrections applied:")

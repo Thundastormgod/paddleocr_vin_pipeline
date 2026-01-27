@@ -31,6 +31,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from vin_pipeline import validate_vin, VIN_LENGTH
 
+# Import from shared utilities (Single Source of Truth)
+from vin_utils import extract_vin_from_filename
+
 
 # =============================================================================
 # DATA CLASSES
@@ -82,50 +85,7 @@ class ValidationReport:
 # VALIDATION FUNCTIONS
 # =============================================================================
 
-def extract_vin_from_filename(filename: str) -> Optional[str]:
-    """
-    Extract VIN from filename pattern.
-    
-    Primary format:
-    - NUMBER-VIN -VINCODE.jpg (e.g., "1-VIN -SAL1A2A40SA606662.jpg")
-    
-    Legacy formats (still supported):
-    - NUMBER-VIN_-_VINCODE_.jpg
-    - NUMBER -VINCODE rest.jpg
-    
-    Args:
-        filename: Image filename
-        
-    Returns:
-        Extracted VIN (17 characters) or None
-    """
-    # Primary Pattern: "number-VIN -VINCODE.jpg"
-    # Example: "1-VIN -SAL1A2A40SA606662.jpg"
-    match = re.search(r'^\d+-VIN\s+-([A-Z0-9]{17})\.', filename, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    # Flexible: "VIN -VINCODE" or "VIN-VINCODE" anywhere in filename
-    match = re.search(r'VIN\s*-\s*([A-Z0-9]{17})(?:\s|\.)', filename, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    # Legacy: "number -VINCODE rest.jpg" or "number-VINCODE.jpg"
-    match = re.search(r'^\d+\s*-\s*([A-Z0-9]{17})(?:\s|\.)', filename, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    # Legacy: VIN_-_VINCODE_
-    match = re.search(r'VIN_-_([A-Z0-9]{17})_', filename, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    # Legacy: VIN_-_VINCODE (without trailing underscore)
-    match = re.search(r'VIN_-_([A-Z0-9]{17})[._]', filename, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    return None
+# Note: extract_vin_from_filename is imported from vin_utils (Single Source of Truth)
 
 
 def parse_label_file(filepath: str) -> Optional[str]:
@@ -178,8 +138,19 @@ def parse_label_file(filepath: str) -> Optional[str]:
         return None
 
 
-def validate_vin_format(vin: str) -> Dict:
-    """Validate VIN format and structure."""
+def validate_vin_format_detailed(vin: str) -> Dict:
+    """
+    Validate VIN format and structure with detailed reporting.
+    
+    Unlike vin_utils.validate_vin_format() which returns a simple bool,
+    this function returns a detailed dict with specific issues found.
+    
+    Args:
+        vin: VIN string to validate
+        
+    Returns:
+        Dict with 'vin', 'is_valid' (bool), and 'issues' (list of strings)
+    """
     result = {
         'vin': vin,
         'is_valid': True,
@@ -326,7 +297,7 @@ def validate_dataset(
     
     # Validate VIN formats
     for vin in set(all_vins):
-        validation = validate_vin_format(vin)
+        validation = validate_vin_format_detailed(vin)
         if validation['is_valid']:
             report.valid_vins += 1
         else:

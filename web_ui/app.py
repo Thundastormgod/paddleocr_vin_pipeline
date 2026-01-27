@@ -669,64 +669,88 @@ def render_training_page():
     st.markdown('<h1 class="main-header">🎯 Model Training</h1>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">Train or fine-tune models on your VIN dataset</p>', unsafe_allow_html=True)
     
-    tab1, tab2 = st.tabs(["🔧 PaddleOCR Fine-Tuning", "🤖 DeepSeek Fine-Tuning"])
+    # Training mode selection
+    st.info("""
+    **Training Modes:**
+    - **Fine-Tuning**: Adapt a pre-trained model to VIN data (500-5,000 images, hours)
+    - **Train from Scratch**: Build a new model from random weights (50,000+ images, days)
+    """)
+    
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🔧 PaddleOCR Fine-Tuning", 
+        "🏗️ PaddleOCR from Scratch",
+        "🤖 DeepSeek Fine-Tuning",
+        "🆕 DeepSeek from Scratch"
+    ])
     
     with tab1:
-        render_paddleocr_training()
+        render_paddleocr_finetuning()
     
     with tab2:
-        render_deepseek_training()
+        render_paddleocr_scratch()
+    
+    with tab3:
+        render_deepseek_finetuning()
+    
+    with tab4:
+        render_deepseek_scratch()
 
 
-def render_paddleocr_training():
-    """Render PaddleOCR training interface."""
-    st.subheader("PaddleOCR Fine-Tuning")
+def render_paddleocr_finetuning():
+    """Render PaddleOCR fine-tuning interface."""
+    st.subheader("🔧 PaddleOCR Fine-Tuning")
+    st.caption("Adapt a pre-trained model to VIN data (recommended for most users)")
     
     col1, col2 = st.columns(2)
     
     with col1:
         st.markdown("#### Dataset Configuration")
-        train_dir = st.text_input("Training Data Directory", "./dagshub_data/train")
-        test_dir = st.text_input("Test Data Directory", "./dagshub_data/test")
+        train_dir = st.text_input("Training Data Directory", "./dagshub_data/train", key="ft_train_dir")
+        test_dir = st.text_input("Test Data Directory", "./dagshub_data/test", key="ft_test_dir")
         
         st.markdown("#### Training Parameters")
-        epochs = st.slider("Number of Epochs", 1, 50, 10)
-        batch_size = st.selectbox("Batch Size", [4, 8, 16, 32], index=1)
+        epochs = st.slider("Number of Epochs", 1, 50, 10, key="ft_epochs")
+        batch_size = st.selectbox("Batch Size", [4, 8, 16, 32], index=1, key="ft_batch")
         learning_rate = st.select_slider(
             "Learning Rate",
             options=[0.00001, 0.00005, 0.0001, 0.0005, 0.001],
-            value=0.0005
+            value=0.0005,
+            key="ft_lr"
         )
     
     with col2:
         st.markdown("#### Model Configuration")
         base_model = st.selectbox(
             "Base Model",
-            ["PP-OCRv5", "PP-OCRv4", "PP-OCRv3"]
+            ["PP-OCRv5", "PP-OCRv4", "PP-OCRv3"],
+            key="ft_base_model"
         )
         
-        use_gpu = st.checkbox("Use GPU", value=True)
-        use_amp = st.checkbox("Mixed Precision (AMP)", value=True)
+        st.markdown("#### Hardware & Export")
+        use_gpu = st.checkbox("Use GPU", value=True, key="ft_gpu")
+        use_amp = st.checkbox("Mixed Precision (AMP)", value=True, key="ft_amp")
+        export_onnx = st.checkbox("Export to ONNX after training", value=False, key="ft_onnx")
         
         st.markdown("#### Output")
-        output_dir = st.text_input("Output Directory", "./output/vin_rec_finetune")
+        output_dir = st.text_input("Output Directory", "./output/vin_rec_finetune", key="ft_output")
     
     # Training command preview
     st.markdown("#### Training Command")
+    onnx_flag = " --export-onnx" if export_onnx else ""
+    gpu_flag = "" if use_gpu else " --no-gpu"
     cmd = f"""python finetune_paddleocr.py \\
     --config configs/vin_finetune_config.yml \\
     --epochs {epochs} \\
     --batch-size {batch_size} \\
-    --lr {learning_rate}"""
+    --lr {learning_rate}{gpu_flag}{onnx_flag}"""
     
     st.code(cmd, language="bash")
     
     col_a, col_b = st.columns(2)
     with col_a:
-        if st.button("🚀 Start Training", type="primary", key="paddle_train"):
+        if st.button("🚀 Start Fine-Tuning", type="primary", key="paddle_finetune_btn"):
             st.session_state.training_status = "running"
-            st.info("Training started... Check terminal for progress.")
-            # In production, this would start a subprocess
+            st.info("Fine-tuning started... Check terminal for progress.")
             st.warning("Note: Training runs in terminal. Use the command above.")
     
     with col_b:
@@ -739,9 +763,10 @@ def render_paddleocr_training():
                 st.info("No training logs found yet")
 
 
-def render_deepseek_training():
-    """Render DeepSeek training interface."""
-    st.subheader("DeepSeek-OCR Fine-Tuning")
+def render_deepseek_finetuning():
+    """Render DeepSeek fine-tuning interface."""
+    st.subheader("🤖 DeepSeek-OCR Fine-Tuning")
+    st.caption("Adapt the pre-trained DeepSeek-OCR model to VIN data")
     
     st.warning("⚠️ DeepSeek fine-tuning requires significant GPU memory (16GB+ with LoRA)")
     
@@ -749,43 +774,175 @@ def render_deepseek_training():
     
     with col1:
         st.markdown("#### Dataset Configuration")
-        train_data = st.text_input("Training Labels File", "./finetune_data/train_labels.txt")
-        val_data = st.text_input("Validation Labels File", "./finetune_data/val_labels.txt")
+        train_data = st.text_input("Training Labels File", "./finetune_data/train_labels.txt", key="dsft_train")
+        val_data = st.text_input("Validation Labels File", "./finetune_data/val_labels.txt", key="dsft_val")
         
         st.markdown("#### Training Parameters")
-        epochs = st.slider("Number of Epochs", 1, 20, 10, key="ds_epochs")
-        batch_size = st.selectbox("Batch Size", [1, 2, 4, 8], index=1, key="ds_batch")
+        epochs = st.slider("Number of Epochs", 1, 20, 10, key="dsft_epochs")
+        batch_size = st.selectbox("Batch Size", [1, 2, 4, 8], index=1, key="dsft_batch")
         learning_rate = st.select_slider(
             "Learning Rate",
             options=[0.00001, 0.00002, 0.00005, 0.0001],
             value=0.00002,
-            key="ds_lr"
+            key="dsft_lr"
         )
     
     with col2:
         st.markdown("#### LoRA Configuration")
-        use_lora = st.checkbox("Use LoRA (recommended)", value=True)
+        use_lora = st.checkbox("Use LoRA (recommended)", value=True, key="dsft_lora")
         if use_lora:
-            lora_r = st.slider("LoRA Rank", 4, 64, 16)
-            lora_alpha = st.slider("LoRA Alpha", 8, 128, 32)
-            lora_dropout = st.slider("LoRA Dropout", 0.0, 0.2, 0.05)
+            lora_r = st.slider("LoRA Rank", 4, 64, 16, key="dsft_lora_r")
+            lora_alpha = st.slider("LoRA Alpha", 8, 128, 32, key="dsft_lora_alpha")
+            lora_dropout = st.slider("LoRA Dropout", 0.0, 0.2, 0.05, key="dsft_lora_drop")
         
-        st.markdown("#### Quantization")
-        use_8bit = st.checkbox("8-bit Quantization (saves memory)", value=False)
+        st.markdown("#### Hardware & Export")
+        use_8bit = st.checkbox("8-bit Quantization (saves memory)", value=False, key="dsft_8bit")
+        export_onnx = st.checkbox("Export to ONNX after training", value=False, key="dsft_onnx")
         
         st.markdown("#### Output")
-        output_dir = st.text_input("Output Directory", "./output/deepseek_vin_finetune", key="ds_output")
+        output_dir = st.text_input("Output Directory", "./output/deepseek_vin_finetune", key="dsft_output")
     
     # Training command preview
     st.markdown("#### Training Command")
+    onnx_flag = " --export-onnx" if export_onnx else ""
+    quant_flag = " --8bit" if use_8bit else ""
     cmd = f"""python finetune_deepseek.py \\
     --config configs/deepseek_finetune_config.yml \\
-    {'--lora' if use_lora else '--full'}"""
+    {'--lora' if use_lora else '--full'}{quant_flag}{onnx_flag}"""
     
     st.code(cmd, language="bash")
     
-    if st.button("🚀 Start DeepSeek Training", type="primary", key="ds_train"):
+    if st.button("🚀 Start DeepSeek Fine-Tuning", type="primary", key="dsft_train_btn"):
         st.warning("Note: Training runs in terminal. Use the command above.")
+
+
+def render_paddleocr_scratch():
+    """Render PaddleOCR train from scratch interface."""
+    st.subheader("🏗️ PaddleOCR Train from Scratch")
+    st.caption("Build a new model from random weights (requires large dataset)")
+    
+    st.error("""
+    ⚠️ **Training from Scratch Requirements:**
+    - 50,000+ labeled VIN images
+    - 24GB+ GPU memory recommended
+    - Training time: Days to weeks
+    - Use fine-tuning instead if you have < 10,000 images
+    """)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("#### Dataset Configuration")
+        train_dir = st.text_input("Training Data Directory", "./data/train", key="ps_train")
+        train_labels = st.text_input("Training Labels File", "./data/train/labels.txt", key="ps_train_labels")
+        val_dir = st.text_input("Validation Data Directory", "./data/val", key="ps_val")
+        val_labels = st.text_input("Validation Labels File", "./data/val/labels.txt", key="ps_val_labels")
+        
+        st.markdown("#### Training Parameters")
+        epochs = st.slider("Number of Epochs", 10, 200, 100, key="ps_epochs")
+        batch_size = st.selectbox("Batch Size", [16, 32, 64, 128], index=2, key="ps_batch")
+        learning_rate = st.select_slider(
+            "Learning Rate",
+            options=[0.0001, 0.0005, 0.001, 0.005, 0.01],
+            value=0.001,
+            key="ps_lr"
+        )
+    
+    with col2:
+        st.markdown("#### Architecture")
+        architecture = st.selectbox(
+            "Model Architecture",
+            ["SVTR_LCNet", "SVTR_Tiny", "CRNN"],
+            help="SVTR_LCNet: Best accuracy. CRNN: Classic, faster training.",
+            key="ps_arch"
+        )
+        
+        backbone = st.selectbox(
+            "Backbone",
+            ["PPLCNetV3", "MobileNetV3", "ResNet"],
+            key="ps_backbone"
+        )
+        
+        st.markdown("#### Hardware & Export")
+        use_gpu = st.checkbox("Use GPU", value=True, key="ps_gpu")
+        use_amp = st.checkbox("Mixed Precision (AMP)", value=True, key="ps_amp")
+        export_onnx = st.checkbox("Export to ONNX after training", value=False, key="ps_onnx")
+        
+        st.markdown("#### Output")
+        output_dir = st.text_input("Output Directory", "./output/vin_scratch_train", key="ps_output")
+    
+    # Training command preview
+    st.markdown("#### Training Command")
+    onnx_flag = " --export-onnx" if export_onnx else ""
+    cmd = f"""python train_from_scratch.py --model paddleocr \\
+    --epochs {epochs} \\
+    --batch-size {batch_size} \\
+    --lr {learning_rate} \\
+    --output-dir {output_dir}{onnx_flag}"""
+    
+    st.code(cmd, language="bash")
+    
+    if st.button("🏗️ Start Training from Scratch", type="primary", key="ps_train_btn"):
+        st.warning("⚠️ This will take a LONG time. Use the command in terminal for monitoring.")
+
+
+def render_deepseek_scratch():
+    """Render DeepSeek train from scratch interface."""
+    st.subheader("🆕 Vision-Language Model from Scratch")
+    st.caption("Build a custom vision-language model for VIN recognition")
+    
+    st.error("""
+    ⚠️ **Training from Scratch Requirements:**
+    - 100,000+ labeled images recommended
+    - 48GB+ GPU memory (A100 or better)
+    - Training time: Weeks
+    - This creates a SMALLER model than DeepSeek-OCR
+    """)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("#### Dataset Configuration")
+        train_data = st.text_input("Training Labels File", "./data/train/labels.txt", key="dss_train")
+        val_data = st.text_input("Validation Labels File", "./data/val/labels.txt", key="dss_val")
+        data_dir = st.text_input("Data Directory", "./data", key="dss_data_dir")
+        
+        st.markdown("#### Training Parameters")
+        epochs = st.slider("Number of Epochs", 10, 100, 50, key="dss_epochs")
+        batch_size = st.selectbox("Batch Size", [2, 4, 8, 16], index=1, key="dss_batch")
+        grad_accum = st.slider("Gradient Accumulation Steps", 1, 16, 8, key="dss_grad_accum")
+        learning_rate = st.select_slider(
+            "Learning Rate",
+            options=[0.00005, 0.0001, 0.0002, 0.0005],
+            value=0.0001,
+            key="dss_lr"
+        )
+    
+    with col2:
+        st.markdown("#### Model Configuration")
+        image_size = st.selectbox("Image Size", [256, 384, 512], index=1, key="dss_img_size")
+        
+        st.markdown("#### Hardware & Export")
+        use_bf16 = st.checkbox("BFloat16 (recommended for Ampere+ GPUs)", value=True, key="dss_bf16")
+        use_fp16 = st.checkbox("Float16 (for older GPUs)", value=False, key="dss_fp16")
+        export_onnx = st.checkbox("Export to ONNX after training", value=False, key="dss_onnx")
+        
+        st.markdown("#### Output")
+        output_dir = st.text_input("Output Directory", "./output/deepseek_scratch_train", key="dss_output")
+    
+    # Training command preview
+    st.markdown("#### Training Command")
+    onnx_flag = " --export-onnx" if export_onnx else ""
+    cmd = f"""python train_from_scratch.py --model deepseek \\
+    --epochs {epochs} \\
+    --batch-size {batch_size} \\
+    --lr {learning_rate} \\
+    --output-dir {output_dir}{onnx_flag}"""
+    
+    st.code(cmd, language="bash")
+    
+    if st.button("🆕 Start Training from Scratch", type="primary", key="dss_train_btn"):
+        st.warning("⚠️ This will take a VERY LONG time. Use the command in terminal for monitoring.")
 
 
 def render_results_dashboard():

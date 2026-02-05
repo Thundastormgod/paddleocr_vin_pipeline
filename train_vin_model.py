@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 def check_paddleocr_availability() -> bool:
     """Check if PaddleOCR training is available."""
     try:
-        from finetune_paddleocr import PPOCR_TRAIN_AVAILABLE, PADDLE_AVAILABLE
+        from src.vin_ocr.training.finetune_paddleocr import PPOCR_TRAIN_AVAILABLE, PADDLE_AVAILABLE
         return PADDLE_AVAILABLE and PPOCR_TRAIN_AVAILABLE
     except ImportError:
         return False
@@ -50,7 +50,7 @@ def check_paddleocr_availability() -> bool:
 def check_deepseek_availability() -> bool:
     """Check if DeepSeek training is available."""
     try:
-        from finetune_deepseek import TORCH_AVAILABLE, TRANSFORMERS_AVAILABLE
+        from src.vin_ocr.training.finetune_deepseek import TORCH_AVAILABLE, TRANSFORMERS_AVAILABLE
         return TORCH_AVAILABLE and TRANSFORMERS_AVAILABLE
     except ImportError:
         return False
@@ -69,7 +69,7 @@ def train_paddleocr(
     logger.info("Training PaddleOCR Model for VIN Recognition")
     logger.info("=" * 60)
     
-    from finetune_paddleocr import VINFineTuner, load_config
+    from src.vin_ocr.training.finetune_paddleocr import VINFineTuner, load_config
     
     # Load config
     config = load_config(config_path)
@@ -110,7 +110,7 @@ def train_deepseek(
     logger.info("Training DeepSeek-OCR Model for VIN Recognition")
     logger.info("=" * 60)
     
-    from finetune_deepseek import DeepSeekVINTrainer, load_config, DeepSeekFineTuneConfig
+    from src.vin_ocr.training.finetune_deepseek import DeepSeekVINTrainer, load_config, DeepSeekFineTuneConfig
     
     # Load config
     if Path(config_path).exists():

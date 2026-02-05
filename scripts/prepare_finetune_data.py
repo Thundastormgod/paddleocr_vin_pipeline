@@ -36,7 +36,7 @@ import numpy as np
 # Add parent directory for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from vin_utils import extract_vin_from_filename, VIN_LENGTH, VIN_VALID_CHARS
+from src.vin_ocr.core.vin_utils import extract_vin_from_filename, VIN_LENGTH, VIN_VALID_CHARS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -437,7 +437,7 @@ def main():
     print(f"\nNext steps:")
     print(f"  1. Review prepared data in: {args.output_dir}")
     print(f"  2. Run fine-tuning:")
-    print(f"     python finetune_paddleocr.py --config configs/vin_finetune_config.yml")
+    print(f"     python -m src.vin_ocr.training.finetune_paddleocr --config configs/vin_finetune_config.yml")
 
 
 if __name__ == '__main__':

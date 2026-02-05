@@ -17,6 +17,6 @@ cd /d "E:\paddle and deepseek OCR\paddleocr_vin_pipeline"
 
 REM Run Streamlit
 echo Starting Streamlit on port 8501...
-python -m streamlit run web_ui/app.py --server.port 8501
+python -m streamlit run src/vin_ocr/web/app.py --server.port 8501
 
 pause

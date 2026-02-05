@@ -25,7 +25,7 @@ Usage:
     python train_pipeline.py --dataset-dir dataset --method finetune --epochs 100
     
     # Or use dedicated fine-tuning script directly:
-    python finetune_paddleocr.py --config configs/vin_finetune_config.yml
+    python -m src.vin_ocr.training.finetune_paddleocr --config configs/vin_finetune_config.yml
 
 Author: JRL-VIN Project
 Date: January 2026
@@ -44,7 +44,7 @@ from typing import Dict, List, Optional, Tuple
 import warnings
 
 # Import from shared utilities (Single Source of Truth)
-from vin_utils import VIN_LENGTH, VIN_VALID_CHARS
+from src.vin_ocr.core.vin_utils import VIN_LENGTH, VIN_VALID_CHARS
 from config import get_config
 
 warnings.filterwarnings('ignore')
@@ -123,8 +123,7 @@ class VINTrainingPipeline:
     
     def _init_ocr_pipeline(self):
         if self.pipeline is None:
-            sys.path.insert(0, str(Path(__file__).parent))
-            from vin_pipeline import VINOCRPipeline
+            from src.vin_ocr.pipeline.vin_pipeline import VINOCRPipeline
             self.pipeline = VINOCRPipeline()
     
     def load_dataset(self, split: str = "train") -> Tuple[List[str], List[str]]:
@@ -379,7 +378,7 @@ class VINTrainingPipeline:
         
         This method:
         1. Prepares data in PaddleOCR format
-        2. Calls the finetune_paddleocr.py script
+    2. Calls the src/vin_ocr/training/finetune_paddleocr.py script
         3. Trains the recognition model weights
         4. Exports the fine-tuned model for inference
         
@@ -392,11 +391,11 @@ class VINTrainingPipeline:
         print("=" * 60)
         
         # Check if finetune script exists
-        finetune_script = Path(__file__).parent / "finetune_paddleocr.py"
+        finetune_script = Path(__file__).parent / "src" / "vin_ocr" / "training" / "finetune_paddleocr.py"
         if not finetune_script.exists():
             return {
                 "error": "finetune_paddleocr.py not found",
-                "hint": "Ensure finetune_paddleocr.py is in the project root"
+                "hint": "Ensure src/vin_ocr/training/finetune_paddleocr.py exists"
             }
         
         # Prepare fine-tuning data

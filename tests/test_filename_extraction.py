@@ -21,7 +21,7 @@ from typing import Optional
 # Add parent directory for imports when run as script
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from vin_utils import extract_vin_from_filename
+from src.vin_ocr.core.vin_utils import extract_vin_from_filename
 
 
 # =============================================================================

@@ -247,10 +247,10 @@ A Streamlit-based web interface for easy interaction with all models.
 pip install -r web_ui/requirements.txt
 
 # Run the web interface
-streamlit run web_ui/app.py
+streamlit run src/vin_ocr/web/app.py
 
 # Or with custom port
-streamlit run web_ui/app.py --server.port 8080
+streamlit run src/vin_ocr/web/app.py --server.port 8080
 ```
 
 ### Features
@@ -270,13 +270,13 @@ Compare different OCR models on your dataset:
 
 ```bash
 # Evaluate all available models on test images
-python multi_model_evaluation.py --max-images 100
+python -m src.vin_ocr.evaluation.multi_model_evaluation --max-images 100
 
 # Specify custom image folder
-python multi_model_evaluation.py --image-folder ./my_images --max-images 50
+python -m src.vin_ocr.evaluation.multi_model_evaluation --image-folder ./my_images --max-images 50
 
 # Output to specific directory
-python multi_model_evaluation.py --output-dir ./results/experiment1
+python -m src.vin_ocr.evaluation.multi_model_evaluation --output-dir ./results/experiment1
 ```
 
 ### Available Models
@@ -305,28 +305,73 @@ Fine-tune PP-OCRv4/v5 recognition model on VIN data:
 
 ```bash
 # Run with default config
-python finetune_paddleocr.py --config configs/vin_finetune_config.yml
+python -m src.vin_ocr.training.finetune_paddleocr --config configs/vin_finetune_config.yml
 
 # Resume from checkpoint
-python finetune_paddleocr.py --config configs/vin_finetune_config.yml \
+python -m src.vin_ocr.training.finetune_paddleocr --config configs/vin_finetune_config.yml \
     --resume output/vin_rec_finetune/latest
 
 # Multi-GPU training
-python -m paddle.distributed.launch --gpus '0,1' finetune_paddleocr.py \
+python -m paddle.distributed.launch --gpus '0,1' -m src.vin_ocr.training.finetune_paddleocr \
     --config configs/vin_finetune_config.yml
 ```
 
-### DeepSeek-OCR Fine-Tuning
+### DeepSeek-OCR Fine-Tuning (HPC with RTX 3090)
 
-Fine-tune DeepSeek vision-language model with LoRA:
+Fine-tune DeepSeek vision-language model on HPC with NVIDIA RTX 3090 (24GB VRAM):
 
 ```bash
-# LoRA fine-tuning (recommended, ~16GB VRAM)
-python finetune_deepseek.py --config configs/deepseek_finetune_config.yml --lora
+# SSH to HPC cluster
+ssh user@hpc-cluster
 
-# Full fine-tuning (requires ~48GB VRAM)
-python finetune_deepseek.py --config configs/deepseek_finetune_config.yml --full
+# LoRA fine-tuning (optimized for RTX 3090 24GB)
+python -m src.vin_ocr.training.finetune_deepseek \
+    --config configs/deepseek_finetune_config.yml \
+    --lora \
+    --gradient-checkpointing \
+    --bf16
+
+# If running out of memory, use 8-bit quantization
+python -m src.vin_ocr.training.finetune_deepseek \
+    --config configs/deepseek_finetune_config.yml \
+    --lora \
+    --load-in-8bit
+
+# Export to ONNX for portable inference
+python -m src.vin_ocr.training.export_deepseek_onnx \
+    --model-path output/deepseek_vin_finetune/best_model \
+    --output-dir models/deepseek_onnx
 ```
+
+**RTX 3090 (24GB) Memory Guidelines:**
+| Method | VRAM Usage | Recommended Settings |
+|--------|------------|---------------------|
+| LoRA + bf16 | ~20-24GB | `batch_size=4, gradient_accumulation=8` |
+| LoRA + 8-bit | ~14-16GB | Use if bf16 causes OOM |
+| Full fine-tuning | ~48GB+ | Not recommended for RTX 3090 |
+
+### Use Fine-Tuned Models at Inference
+
+Load a full fine-tuned DeepSeek model or LoRA adapters via the provider factory:
+
+```python
+from ocr_providers import OCRProviderFactory
+
+# Full fine-tuned model (local path)
+provider = OCRProviderFactory.create(
+    "deepseek",
+    finetuned_model_path="/path/to/fine_tuned_model"
+)
+
+# PEFT adapter (LoRA/QLoRA)
+provider = OCRProviderFactory.create(
+    "deepseek",
+    adapter_path="/path/to/adapter",
+    merge_adapter=False
+)
+```
+
+If using vLLM, note that PEFT adapters are ignored (vLLM backend does not load adapters).
 
 ### Training Data Format
 
@@ -426,8 +471,8 @@ paddleocr_vin_pipeline/
 ├── train_pipeline.py         # Training configuration & execution
 ├── run_experiment.py         # End-to-end experiment runner
 ├── test_pipeline.py          # Quick pipeline test
-├── evaluate.py               # Evaluation with metrics
-├── validate_dataset.py       # Dataset validation
+├── src/vin_ocr/evaluation/evaluate.py      # Evaluation with metrics
+├── src/vin_ocr/utils/validate_dataset.py   # Dataset validation
 │
 ├── tests/
 │   └── test_vin_pipeline.py  # Test suite (52+ tests)
@@ -555,10 +600,10 @@ Validate ground truth quality before training/evaluation:
 
 ```bash
 # Validate dataset
-python validate_dataset.py --data-dir /path/to/paddleocr_sample
+python -m src.vin_ocr.utils.validate_dataset --data-dir /path/to/paddleocr_sample
 
 # Output report to JSON
-python validate_dataset.py --data-dir /path/to/data --output report.json
+python -m src.vin_ocr.utils.validate_dataset --data-dir /path/to/data --output report.json
 ```
 
 **What it checks:**
@@ -573,19 +618,19 @@ Evaluate pipeline performance with train/val/test splits:
 
 ```bash
 # Evaluate on all data
-python evaluate.py --data-dir /path/to/images
+python -m src.vin_ocr.evaluation.evaluate --data-dir /path/to/images
 
 # Create 70/15/15 splits and evaluate test set
-python evaluate.py --data-dir /path/to/images --create-splits --split test
+python -m src.vin_ocr.evaluation.evaluate --data-dir /path/to/images --create-splits --split test
 
 # Evaluate validation set with existing splits
-python evaluate.py --data-dir /path/to/images --split-dir ./splits --split val
+python -m src.vin_ocr.evaluation.evaluate --data-dir /path/to/images --split-dir ./splits --split val
 
 # Export results
-python evaluate.py --data-dir /path/to/images --output results.json --csv predictions.csv
+python -m src.vin_ocr.evaluation.evaluate --data-dir /path/to/images --output results.json --csv predictions.csv
 
 # Quick test with limited samples
-python evaluate.py --data-dir /path/to/images --max-samples 50
+python -m src.vin_ocr.evaluation.evaluate --data-dir /path/to/images --max-samples 50
 ```
 
 ### Metrics Calculated

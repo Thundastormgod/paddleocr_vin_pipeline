@@ -19,7 +19,7 @@ from typing import Dict
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from evaluate import (
+from src.vin_ocr.evaluation.evaluate import (
     create_splits,
     load_ground_truth,
     extract_vin_from_filename,

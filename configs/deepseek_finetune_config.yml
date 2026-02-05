@@ -2,12 +2,17 @@
 # ===========================================================
 #
 # This configuration file controls the DeepSeek-OCR fine-tuning process.
-# Adjust parameters based on your GPU memory and dataset size.
+# Optimized for NVIDIA RTX 3090 (24GB VRAM) on HPC.
 #
 # GPU Memory Requirements:
 #   - LoRA + 8-bit: ~16GB VRAM
-#   - LoRA + bf16: ~24GB VRAM  
-#   - Full fine-tuning: ~48GB VRAM
+#   - LoRA + bf16: ~24GB VRAM (RTX 3090 optimal)
+#   - Full fine-tuning: ~48GB VRAM (not recommended for RTX 3090)
+#
+# RTX 3090 Recommended Settings:
+#   - Use LoRA with bf16/fp16
+#   - Batch size 4-8 with gradient accumulation
+#   - Enable gradient checkpointing for larger models
 
 # Model Configuration
 model_name: "deepseek-ai/DeepSeek-OCR"
@@ -15,14 +20,17 @@ model_name: "deepseek-ai/DeepSeek-OCR"
 # Output
 output_dir: "./output/deepseek_vin_finetune"
 
-# Training Hyperparameters
+# Training Hyperparameters (optimized for RTX 3090 24GB)
 num_epochs: 10
-batch_size: 4
+batch_size: 4                   # Safe for 24GB VRAM with LoRA
 gradient_accumulation_steps: 8  # Effective batch size = 4 * 8 = 32
 learning_rate: 2.0e-5
 weight_decay: 0.01
 warmup_ratio: 0.1
 max_grad_norm: 1.0
+
+# Memory Optimization for RTX 3090
+gradient_checkpointing: true    # Reduces memory at cost of ~20% speed
 
 # LoRA Configuration (Memory-Efficient Fine-Tuning)
 use_lora: true
@@ -39,8 +47,8 @@ lora_target_modules:    # Modules to apply LoRA
   - "down_proj"
 
 # Quantization (for lower memory usage)
-use_8bit: false         # 8-bit quantization (requires bitsandbytes)
-use_4bit: false         # 4-bit quantization (QLoRA, requires bitsandbytes)
+use_8bit: false         # 8-bit quantization (use if OOM with bf16)
+use_4bit: false         # 4-bit quantization (QLoRA, for very large models)
 
 # Data Paths
 train_data_path: "./finetune_data/train_labels.txt"
@@ -48,9 +56,9 @@ val_data_path: "./finetune_data/val_labels.txt"
 data_dir: "./finetune_data/"
 max_length: 32          # Max token length for VIN output
 
-# Precision
-bf16: true              # BFloat16 (recommended for Ampere+ GPUs)
-fp16: false             # Float16 (use if bf16 not supported)
+# Precision (RTX 3090 supports both bf16 and fp16)
+bf16: true              # BFloat16 (recommended for Ampere GPUs like RTX 3090)
+fp16: false             # Float16 (alternative if bf16 causes issues)
 
 # Logging and Checkpointing
 logging_steps: 10

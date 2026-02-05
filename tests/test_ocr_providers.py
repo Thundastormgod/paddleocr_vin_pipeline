@@ -9,8 +9,9 @@ import pytest
 import numpy as np
 from unittest.mock import Mock, patch, MagicMock
 from pathlib import Path
+from typing import Optional
 
-from ocr_providers import (
+from src.vin_ocr.providers.ocr_providers import (
     OCRProviderType,
     OCRResult,
     ProviderConfig,
@@ -370,6 +371,37 @@ class TestEnsembleOCRProvider:
         winner = ensemble._vote_strategy(results)
         assert winner.text == "VIN1"  # Majority wins
         assert winner.confidence == 0.9  # Highest confidence among winners
+
+    def test_weighted_vote_strategy(self):
+        """Test confidence-weighted voting strategy."""
+        ensemble = EnsembleOCRProvider(
+            providers=[PaddleOCRProvider()],
+            strategy="weighted_vote"
+        )
+
+        results = [
+            OCRResult(text="VIN1", confidence=0.3, provider="A"),
+            OCRResult(text="VIN1", confidence=0.4, provider="B"),
+            OCRResult(text="VIN2", confidence=0.8, provider="C"),
+        ]
+
+        winner = ensemble._weighted_vote_strategy(results)
+        assert winner.text == "VIN2"  # Higher total confidence
+
+    def test_weighted_char_vote_strategy(self):
+        """Test per-character weighted vote strategy."""
+        ensemble = EnsembleOCRProvider(
+            providers=[PaddleOCRProvider()],
+            strategy="weighted_char_vote"
+        )
+
+        results = [
+            OCRResult(text="VIN1", confidence=0.6, provider="A"),
+            OCRResult(text="VXN1", confidence=0.7, provider="B"),
+        ]
+
+        winner = ensemble._weighted_char_vote_strategy(results)
+        assert winner.text == "VXN1"
     
     def test_cascade_strategy_valid_first(self):
         """Test cascade strategy returns first valid."""
@@ -480,6 +512,72 @@ class TestErrorHandling:
         assert error.details == {}
 
 
+class TestRetryBehavior:
+    """Tests for retry/backoff behavior."""
+
+    class FlakyProvider(OCRProvider):
+        """Provider that fails once then succeeds."""
+
+        def __init__(self, config: Optional[ProviderConfig] = None):
+            self.config = config or ProviderConfig(max_retries=2, retry_delay=0)
+            self._initialized = True
+            self._calls = 0
+
+        @property
+        def name(self) -> str:
+            return "FlakyProvider"
+
+        @property
+        def is_available(self) -> bool:
+            return True
+
+        def initialize(self) -> None:
+            self._initialized = True
+
+        def recognize(self, image, **kwargs) -> OCRResult:
+            self._calls += 1
+            if self._calls == 1:
+                raise OCRProviderError("Transient error", provider=self.name)
+            return OCRResult(text="SAL1A2A40SA606662", confidence=0.9, provider=self.name)
+
+    def test_recognize_with_retry_success(self):
+        provider = self.FlakyProvider()
+        img = np.zeros((100, 100, 3), dtype=np.uint8)
+        result = provider.recognize_with_retry(img)
+        assert result.text == "SAL1A2A40SA606662"
+        assert provider._calls == 2
+
+    class NonRetryableProvider(OCRProvider):
+        """Provider that raises a non-retryable error."""
+
+        def __init__(self, config: Optional[ProviderConfig] = None):
+            self.config = config or ProviderConfig(max_retries=3, retry_delay=0)
+            self._initialized = True
+            self._calls = 0
+
+        @property
+        def name(self) -> str:
+            return "NonRetryableProvider"
+
+        @property
+        def is_available(self) -> bool:
+            return True
+
+        def initialize(self) -> None:
+            self._initialized = True
+
+        def recognize(self, image, **kwargs) -> OCRResult:
+            self._calls += 1
+            raise ValueError("Invalid input")
+
+    def test_recognize_with_retry_non_retryable(self):
+        provider = self.NonRetryableProvider()
+        img = np.zeros((100, 100, 3), dtype=np.uint8)
+        with pytest.raises(ValueError, match="Invalid input"):
+            provider.recognize_with_retry(img)
+        assert provider._calls == 1
+
+
 # =============================================================================
 # Integration-style Tests (with mocks)
 # =============================================================================
@@ -511,3 +609,19 @@ class TestProviderIntegration:
         assert result.text == "SAL1A2A40SA606662"
         assert result.confidence == 0.95
         assert result.provider == "PaddleOCR"
+
+
+class TestDeepSeekConfigWiring:
+    """Tests for DeepSeek config passthrough in the factory."""
+
+    def test_deepseek_adapter_config(self):
+        provider = OCRProviderFactory.create(
+            "deepseek",
+            auto_initialize=False,
+            adapter_path="/tmp/adapter",
+            finetuned_model_path="/tmp/full",
+            merge_adapter=True
+        )
+        assert provider.config.adapter_path == "/tmp/adapter"
+        assert provider.config.finetuned_model_path == "/tmp/full"
+        assert provider.config.merge_adapter is True

@@ -1,0 +1,21 @@
+{
+  "model": "\ud83c\udfaf Fine-tuned: vin_rec_finetune/epoch_25",
+  "timestamp": "20260203_140918",
+  "total_images": 1,
+  "images_with_gt": 1,
+  "exact_matches": 0,
+  "exact_accuracy": 0.0,
+  "char_accuracy": 0.0,
+  "avg_confidence": 0.0,
+  "total_time": 0.0067179203033447266,
+  "results": [
+    {
+      "filename": "SAL1A2A45SA605572_train_35-VIN_-_SAL1A2A45SA605572_2.jpg",
+      "predicted": "",
+      "ground_truth": "SAL1A2A45SA605572",
+      "exact_match": false,
+      "confidence": 0.0,
+      "time": 0.0067179203033447266
+    }
+  ]
+}

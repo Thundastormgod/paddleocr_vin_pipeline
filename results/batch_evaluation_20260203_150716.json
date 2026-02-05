@@ -1,0 +1,21 @@
+{
+  "model": "VIN Pipeline (PP-OCRv5)",
+  "timestamp": "20260203_150716",
+  "total_images": 1,
+  "images_with_gt": 1,
+  "exact_matches": 1,
+  "exact_accuracy": 100.0,
+  "char_accuracy": 100.0,
+  "avg_confidence": 0.9741179347038269,
+  "total_time": 0.30117082595825195,
+  "results": [
+    {
+      "filename": "1-VIN -SAL1A2A40SA606662.jpg",
+      "predicted": "SAL1A2A40SA606662",
+      "ground_truth": "SAL1A2A40SA606662",
+      "exact_match": true,
+      "confidence": 0.9741179347038269,
+      "time": 0.30117082595825195
+    }
+  ]
+}

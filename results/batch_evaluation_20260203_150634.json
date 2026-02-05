@@ -1,0 +1,53 @@
+{
+  "model": "VIN Pipeline (PP-OCRv5)",
+  "timestamp": "20260203_150634",
+  "total_images": 5,
+  "images_with_gt": 5,
+  "exact_matches": 0,
+  "exact_accuracy": 0.0,
+  "char_accuracy": 31.76470588235294,
+  "avg_confidence": 0.21471188360977705,
+  "total_time": 6.583820104598999,
+  "results": [
+    {
+      "filename": "SAL1A2AW9SA605771_train_285-VIN_-_SAL1A2AW9SA605771_.jpg",
+      "predicted": "SAL1A2AW9SA60577H",
+      "ground_truth": "SAL1A2AW9SA605771",
+      "exact_match": false,
+      "confidence": 0.1283888526260853,
+      "time": 1.403188943862915
+    },
+    {
+      "filename": "SAL1A2AW9SA605799_train_286-VIN_-_SAL1A2AW9SA605799_.jpg",
+      "predicted": "63SBTH1-1",
+      "ground_truth": "SAL1A2AW9SA605799",
+      "exact_match": false,
+      "confidence": 0.061780231503339916,
+      "time": 1.4331169128417969
+    },
+    {
+      "filename": "SAL1A2AW9SA605852_train_287-VIN_-_SAL1A2AW9SA605852_.jpg",
+      "predicted": "169616158528X6-15",
+      "ground_truth": "SAL1A2AW9SA605852",
+      "exact_match": false,
+      "confidence": 0.12278236977515682,
+      "time": 1.5668821334838867
+    },
+    {
+      "filename": "SAL1A2AW9SA605981_train_288-VIN_-_SAL1A2AW9SA605981_.jpg",
+      "predicted": "SHFA6053-1-A11",
+      "ground_truth": "SAL1A2AW9SA605981",
+      "exact_match": false,
+      "confidence": 0.1129298869233865,
+      "time": 1.4310200214385986
+    },
+    {
+      "filename": "SAL1A2AW9SA606063_train_289-VIN_-_SAL1A2AW9SA606063_.jpg",
+      "predicted": "SALTAZAW9SA60063Y",
+      "ground_truth": "SAL1A2AW9SA606063",
+      "exact_match": false,
+      "confidence": 0.6476780772209167,
+      "time": 0.7496120929718018
+    }
+  ]
+}

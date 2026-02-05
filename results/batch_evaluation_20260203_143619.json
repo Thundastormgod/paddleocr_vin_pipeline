@@ -1,0 +1,61 @@
+{
+  "model": "\ud83c\udfaf Fine-tuned: paddleocr_finetune_20260202_142552 (inference)",
+  "timestamp": "20260203_143619",
+  "total_images": 6,
+  "images_with_gt": 6,
+  "exact_matches": 0,
+  "exact_accuracy": 0.0,
+  "char_accuracy": 0.0,
+  "avg_confidence": 0.0,
+  "total_time": 0.007473468780517578,
+  "results": [
+    {
+      "filename": "SAL1A2A92SA606948_train_83-VIN_-_SAL1A2A92SA606948_.jpg",
+      "predicted": "",
+      "ground_truth": "SAL1A2A92SA606948",
+      "exact_match": false,
+      "confidence": 0.0,
+      "time": 0.0011892318725585938
+    },
+    {
+      "filename": "SAL1A2A93SA606084_train_84-VIN_-_SAL1A2A93SA606084_2.jpg",
+      "predicted": "",
+      "ground_truth": "SAL1A2A93SA606084",
+      "exact_match": false,
+      "confidence": 0.0,
+      "time": 0.0010979175567626953
+    },
+    {
+      "filename": "SAL1A2A93SA606151_train_85-VIN_-_SAL1A2A93SA606151_.jpg",
+      "predicted": "",
+      "ground_truth": "SAL1A2A93SA606151",
+      "exact_match": false,
+      "confidence": 0.0,
+      "time": 0.0011339187622070312
+    },
+    {
+      "filename": "SAL1A2A93SA606702_train_86-VIN_-_SAL1A2A93SA606702_.jpg",
+      "predicted": "",
+      "ground_truth": "SAL1A2A93SA606702",
+      "exact_match": false,
+      "confidence": 0.0,
+      "time": 0.0013103485107421875
+    },
+    {
+      "filename": "SAL1A2A94SA606594_train_87-VIN_-_SAL1A2A94SA606594_.jpg",
+      "predicted": "",
+      "ground_truth": "SAL1A2A94SA606594",
+      "exact_match": false,
+      "confidence": 0.0,
+      "time": 0.0016770362854003906
+    },
+    {
+      "filename": "SAL1A2A94SA606952_train_88-VIN_-_SAL1A2A94SA606952_.jpg",
+      "predicted": "",
+      "ground_truth": "SAL1A2A94SA606952",
+      "exact_match": false,
+      "confidence": 0.0,
+      "time": 0.0010650157928466797
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "model": "\ud83c\udfaf Fine-tuned: final_test (inference)",
+  "timestamp": "20260203_150805",
+  "total_images": 1,
+  "images_with_gt": 1,
+  "exact_matches": 0,
+  "exact_accuracy": 0.0,
+  "char_accuracy": 0.0,
+  "avg_confidence": 0.0,
+  "total_time": 0.5228271484375,
+  "results": [
+    {
+      "filename": "1-VIN -SAL1A2A40SA606662.jpg",
+      "predicted": "",
+      "ground_truth": "SAL1A2A40SA606662",
+      "exact_match": false,
+      "confidence": 0.0,
+      "time": 0.5228271484375
+    }
+  ]
+}

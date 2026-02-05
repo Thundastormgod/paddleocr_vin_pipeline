@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # Import from shared utilities (Single Source of Truth)
-from vin_utils import (
+from src.vin_ocr.core.vin_utils import (
     extract_vin_from_filename,
     VIN_LENGTH,
     VIN_VALID_CHARS,
@@ -177,7 +177,7 @@ def run_ocr_on_split(
     """
     # Import VIN pipeline
     sys.path.insert(0, str(Path(__file__).parent))
-    from vin_pipeline import VINOCRPipeline
+    from src.vin_ocr.pipeline.vin_pipeline import VINOCRPipeline
     
     # Initialize pipeline
     pipeline = VINOCRPipeline()

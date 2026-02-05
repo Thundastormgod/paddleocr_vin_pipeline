@@ -1,5 +1,2 @@
-Model,Exact Match Acc,Char Acc,F1 Micro,F1 Macro,Avg Confidence,Avg Time
-PaddleOCR PP-OCRv4,0.0000,0.0059,0.0091,0.0038,0.1308,2.7008
-PaddleOCR PP-OCRv3,0.0000,0.1118,0.1372,0.1026,0.3145,1.0949
-VIN Pipeline (with post-processing),0.0000,0.0118,0.0184,0.0114,0.0740,3.2148
-DeepSeek-OCR,0.0000,0.0000,0.0000,0.0000,0.0000,3.0731
+Model,Total Images,With Ground Truth,Exact Matches,Exact Match Acc,Char Acc,F1 Micro,F1 Macro,Avg Confidence,Avg Time
+🎯 Fine-tuned: vin_rec_finetune/epoch_25,50,50,0,0.0,0.0,0.0,0.0,0.0,0.005419783592224121

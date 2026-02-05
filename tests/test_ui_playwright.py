@@ -12,7 +12,7 @@ async def test_streamlit_ui():
     
     async with async_playwright() as p:
         print("🚀 Launching browser...")
-        browser = await p.chromium.launch(headless=False, slow_mo=500)
+        browser = await p.chromium.launch(headless=True, slow_mo=200)
         page = await browser.new_page()
         
         try:

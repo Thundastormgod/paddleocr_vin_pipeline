@@ -19,13 +19,13 @@ from typing import Dict
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from validate_dataset import (
+from src.vin_ocr.utils.validate_dataset import (
     parse_label_file,
     validate_vin_format_detailed,
     ValidationReport,
 )
 # Import extract_vin_from_filename from Single Source of Truth
-from vin_utils import extract_vin_from_filename
+from src.vin_ocr.core.vin_utils import extract_vin_from_filename
 
 
 # =============================================================================

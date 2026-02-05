@@ -113,6 +113,9 @@ pytest==9.0.2
 # visualdl>=2.5.0
 # tensorboard>=2.10.0
 
+# Hyperparameter tuning
+optuna>=4.0.0
+
 # ============================================
 # Version Management Notes
 # ============================================
@@ -141,3 +144,34 @@ pytest==9.0.2
 # For PaddleOCR advanced training features, clone their repo:
 #   git clone https://github.com/PaddlePaddle/PaddleOCR.git
 #   cd PaddleOCR && pip install -r requirements.txt
+
+# =============================================================================
+# HPC REQUIREMENTS (RTX 3090 24GB - DeepSeek Fine-Tuning)
+# =============================================================================
+# For DeepSeek-OCR fine-tuning on HPC with NVIDIA RTX 3090:
+#
+# Core requirements:
+#   torch>=2.0.0+cu118  # PyTorch with CUDA 11.8
+#   transformers>=4.36.0
+#   accelerate>=0.25.0
+#   peft>=0.6.0  # For LoRA fine-tuning
+#
+# Memory optimization (optional, for large models):
+#   bitsandbytes>=0.41.0  # 8-bit/4-bit quantization
+#   deepspeed>=0.12.0  # Distributed training
+#
+# ONNX export:
+#   onnx>=1.15.0
+#   onnxruntime-gpu>=1.16.0  # For GPU inference
+#   # Or: onnxruntime>=1.16.0  # For CPU-only inference
+#
+# RTX 3090 (24GB) Recommended Settings:
+#   - Use LoRA with bf16: batch_size=4, gradient_accumulation=8
+#   - Enable gradient_checkpointing for larger models
+#   - Use 8-bit quantization if running out of memory
+#
+# Installation on HPC:
+#   module load cuda/11.8
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#   pip install transformers accelerate peft bitsandbytes
+#   pip install onnx onnxruntime-gpu

@@ -1,0 +1,117 @@
+{
+  "model": "PaddleOCR PP-OCRv3",
+  "timestamp": "20260203_140632",
+  "total_images": 13,
+  "images_with_gt": 13,
+  "exact_matches": 0,
+  "exact_accuracy": 0.0,
+  "char_accuracy": 4.97737556561086,
+  "avg_confidence": 0.3736090931345473,
+  "total_time": 14.914597272872925,
+  "results": [
+    {
+      "filename": "SAL1A2A94SA606952_train_88-VIN_-_SAL1A2A94SA606952_.jpg",
+      "predicted": "TT",
+      "ground_truth": "SAL1A2A94SA606952",
+      "exact_match": false,
+      "confidence": 0.28367311507463455,
+      "time": 1.7690167427062988
+    },
+    {
+      "filename": "SAL1A2A95SA606698_train_89-VIN_-_SAL1A2A95SA606698_.jpg",
+      "predicted": "SA11K2N95SA505598",
+      "ground_truth": "SAL1A2A95SA606698",
+      "exact_match": false,
+      "confidence": 0.4636499881744385,
+      "time": 1.0305521488189697
+    },
+    {
+      "filename": "SAL1A2A95SA606703_train_90-VIN_-_SAL1A2A95SA606703_.jpg",
+      "predicted": "713D11",
+      "ground_truth": "SAL1A2A95SA606703",
+      "exact_match": false,
+      "confidence": 0.29312965646386147,
+      "time": 1.073206901550293
+    },
+    {
+      "filename": "SAL1A2A95SA606703_train_91-VIN_-_SAL1A2A95SA606703_.jpg",
+      "predicted": "M1",
+      "ground_truth": "SAL1A2A95SA606703",
+      "exact_match": false,
+      "confidence": 0.41499175131320953,
+      "time": 1.11260986328125
+    },
+    {
+      "filename": "SAL1A2A96SA606080_train_92-VIN_-_SAL1A2A96SA606080_.jpg",
+      "predicted": "",
+      "ground_truth": "SAL1A2A96SA606080",
+      "exact_match": false,
+      "confidence": 0.4225908989707629,
+      "time": 1.1523232460021973
+    },
+    {
+      "filename": "SAL1A2A96SA606953_train_93-VIN_-_SAL1A2A96SA606953_.jpg",
+      "predicted": "96SA60695AA",
+      "ground_truth": "SAL1A2A96SA606953",
+      "exact_match": false,
+      "confidence": 0.5675766368707021,
+      "time": 1.0431139469146729
+    },
+    {
+      "filename": "SAL1A2A97SA606704_train_94-VIN_-_SAL1A2A97SA606704_.jpg",
+      "predicted": "",
+      "ground_truth": "SAL1A2A97SA606704",
+      "exact_match": false,
+      "confidence": 0.27113262563943863,
+      "time": 1.0808460712432861
+    },
+    {
+      "filename": "SAL1A2A98SA606078_train_95-VIN_-_SAL1A2A98SA606078_.jpg",
+      "predicted": "2K20A606012YSA",
+      "ground_truth": "SAL1A2A98SA606078",
+      "exact_match": false,
+      "confidence": 0.33829816430807114,
+      "time": 1.1006979942321777
+    },
+    {
+      "filename": "SAL1A2A98SA606081_train_96-VIN_-_SAL1A2A98SA606081_.jpg",
+      "predicted": "498SA606081110V",
+      "ground_truth": "SAL1A2A98SA606081",
+      "exact_match": false,
+      "confidence": 0.423488050699234,
+      "time": 1.0868589878082275
+    },
+    {
+      "filename": "SAL1A2A98SA606615_train_97-VIN_-_SAL1A2A98SA606615_.jpg",
+      "predicted": "1",
+      "ground_truth": "SAL1A2A98SA606615",
+      "exact_match": false,
+      "confidence": 0.23754442234834036,
+      "time": 1.0529630184173584
+    },
+    {
+      "filename": "SAL1A2A98SA606713_train_98-VIN_-_SAL1A2A98SA606713_.jpg",
+      "predicted": "TAZA98SAB06713",
+      "ground_truth": "SAL1A2A98SA606713",
+      "exact_match": false,
+      "confidence": 0.6066857755184174,
+      "time": 1.1396090984344482
+    },
+    {
+      "filename": "SAL1A2A98SA606954_train_99-VIN_-_SAL1A2A98SA606954_.jpg",
+      "predicted": "98S466SAAA",
+      "ground_truth": "SAL1A2A98SA606954",
+      "exact_match": false,
+      "confidence": 0.4937178897006171,
+      "time": 1.2098891735076904
+    },
+    {
+      "filename": "SAL1A2AW0SA605416_train_104-VIN_-_SAL1A2AW0SA605416_.jpg",
+      "predicted": "C",
+      "ground_truth": "SAL1A2AW0SA605416",
+      "exact_match": false,
+      "confidence": 0.04043923566738764,
+      "time": 1.0629100799560547
+    }
+  ]
+}

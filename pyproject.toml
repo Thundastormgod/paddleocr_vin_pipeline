@@ -1,0 +1,149 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paddleocr-vin-pipeline"
+version = "1.0.0"
+description = "Professional VIN OCR Pipeline using PaddleOCR with fine-tuning, ONNX export, and web UI"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "VIN OCR Team", email = "team@example.com"}
+]
+maintainers = [
+    {name = "VIN OCR Team", email = "team@example.com"}
+]
+keywords = [
+    "ocr",
+    "vin",
+    "paddleocr",
+    "vehicle-identification",
+    "deep-learning",
+    "computer-vision",
+    "onnx",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "paddlepaddle>=3.0.0",
+    "paddleocr>=2.9.0",
+    "numpy>=1.24.0",
+    "opencv-python>=4.8.0",
+    "Pillow>=10.0.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+web = [
+    "streamlit>=1.30.0",
+    "plotly>=5.18.0",
+    "pandas>=2.0.0",
+]
+training = [
+    "visualdl>=2.5.0",
+    "optuna>=3.5.0",
+]
+onnx = [
+    "onnx>=1.15.0",
+    "onnxruntime>=1.16.0",
+    "paddle2onnx>=1.2.0",
+]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "flake8>=6.1.0",
+    "mypy>=1.7.0",
+    "pre-commit>=3.6.0",
+]
+all = [
+    "paddleocr-vin-pipeline[web,training,onnx,dev]",
+]
+
+[project.urls]
+Homepage = "https://github.com/Thundastormgod/paddleocr_vin_pipeline"
+Documentation = "https://github.com/Thundastormgod/paddleocr_vin_pipeline#readme"
+Repository = "https://github.com/Thundastormgod/paddleocr_vin_pipeline.git"
+Issues = "https://github.com/Thundastormgod/paddleocr_vin_pipeline/issues"
+
+[project.scripts]
+vin-ocr = "src.vin_ocr.cli:main"
+vin-train = "src.vin_ocr.training.cli:main"
+vin-evaluate = "src.vin_ocr.evaluation.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yml", "*.yaml", "*.txt", "*.json"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+    | \.hg
+    | \.mypy_cache
+    | \.tox
+    | \.venv
+    | venv
+    | _build
+    | buck-out
+    | build
+    | dist
+    | PaddleOCR
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip = ["venv", ".venv", "PaddleOCR"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+exclude = ["venv", "PaddleOCR", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]

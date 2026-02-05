@@ -1,0 +1,68 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Documentation
+docs/_build/
+
+# Local development
+*.log
+*.tmp
+.env
+.env.local
+dev/
+
+# Large files - KEEP models for deployment
+*.onnx
+*.pdparams
+*.pdopt
+PaddleOCR/
+
+# Don't ignore these (needed for deployment)
+# *.pdiparams  - inference model params
+# *.pdmodel    - inference model
+# models/      - trained models directory
+
+# Data (mount as volume instead)
+data/
+dataset/
+output/
+finetune_data/
+dagshub_data/
+training_output/
+
+# Notebooks
+*.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

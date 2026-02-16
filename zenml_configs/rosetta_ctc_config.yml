@@ -1,0 +1,119 @@
+Architecture:
+  Backbone:
+    name: ResNet34_vd
+  Head:
+    head_list:
+    - CTCHead:
+        fc_decay: 1.0e-05
+    name: MultiHead
+  Neck:
+    hidden_size: 256
+    name: SequenceEncoder
+  Transform: null
+  algorithm: Rosetta
+  model_type: rec
+Eval:
+  dataset:
+    data_dir: ./finetune_data/
+    label_file_list:
+    - ./finetune_data/val_labels.txt
+    name: SimpleDataSet
+    transforms:
+    - DecodeImage:
+        channel_first: false
+        img_mode: BGR
+    - MultiLabelEncode:
+        max_text_length: 17
+    - RecResizeImg:
+        image_shape: &id001
+        - 3
+        - 48
+        - 320
+    - KeepKeys:
+        keep_keys:
+        - image
+        - label_ctc
+        - label_sar
+        - length
+        - valid_ratio
+  loader:
+    batch_size_per_card: 128
+    drop_last: false
+    num_workers: 0
+    shuffle: false
+    use_shared_memory: false
+Global:
+  cal_metric_during_train: true
+  character_dict_path: ./configs/vin_dict.txt
+  debug: false
+  distributed: false
+  epoch_num: 30
+  eval_batch_step:
+  - 0
+  - 500
+  log_smooth_window: 20
+  max_text_length: 17
+  pretrained_model: null
+  print_batch_step: 10
+  save_epoch_step: 5
+  save_model_dir: ./output/vin_rec_finetune
+  use_amp: false
+  use_gpu: false
+  use_space_char: false
+Loss:
+  name: CTCLoss
+Metric:
+  ignore_space: true
+  main_indicator: acc
+  name: RecMetric
+Optimizer:
+  beta1: 0.9
+  beta2: 0.999
+  lr:
+    learning_rate: 0.001
+    name: Cosine
+    warmup_epoch: 0
+  name: Adam
+  regularizer:
+    factor: 1.0e-05
+    name: L2
+PostProcess:
+  character_dict_path: ./configs/vin_dict.txt
+  name: CTCLabelDecode
+  use_space_char: false
+Train:
+  dataset:
+    data_dir: ./finetune_data/
+    label_file_list:
+    - ./finetune_data/train_labels.txt
+    name: SimpleDataSet
+    transforms:
+    - DecodeImage:
+        channel_first: false
+        img_mode: BGR
+    - RecAug: null
+    - MultiLabelEncode:
+        max_text_length: 17
+    - RecResizeImg:
+        image_shape: *id001
+    - RandomRotate:
+        max_angle: 5
+    - RandomDistort:
+        max_ratio: 0.8
+    - RandomContrast:
+        contrast_range:
+        - 0.8
+        - 1.2
+    - KeepKeys:
+        keep_keys:
+        - image
+        - label_ctc
+        - label_sar
+        - length
+        - valid_ratio
+  loader:
+    batch_size_per_card: 16
+    drop_last: true
+    num_workers: 0
+    shuffle: true
+    use_shared_memory: false

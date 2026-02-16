@@ -550,9 +550,10 @@ class EvaluationMetricsCalculator:
                     position_correct[i + 1] += 1
                     char_tp[true_char] += 1
                 else:
-                    if pred_char:
+                    # Skip empty characters (blank tokens) from F1 calculation
+                    if pred_char and pred_char != '_':  # Only count non-blank predictions
                         char_fp[pred_char] += 1
-                    if true_char:
+                    if true_char and true_char != '_':  # Only count non-blank ground truth
                         char_fn[true_char] += 1
         
         # Calculate metrics

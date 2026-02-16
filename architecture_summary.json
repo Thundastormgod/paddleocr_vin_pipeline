@@ -1,0 +1,21 @@
+{
+  "timestamp": "2026-02-15",
+  "best_architecture": "Rosetta + CTC",
+  "best_accuracy": 0.4651,
+  "architectures_tested": 3,
+  "performance_gap": 39.53,
+  "key_insights": [
+    "CTC Loss outperforms CrossEntropyLoss by 7x for OCR",
+    "Lower learning rate (0.001) provides better stability",
+    "Architecture alignment is critical for performance",
+    "Larger evaluation batch size improves metric stability",
+    "Character accuracy (94%) suggests sequence-level issues"
+  ],
+  "recommendations": [
+    "Use Rosetta + CTC as baseline architecture",
+    "Fine-tune learning rate around 0.001",
+    "Increase epochs beyond 30 for better convergence",
+    "Add VIN-specific data augmentation",
+    "Explore Transformer-based architectures"
+  ]
+}

@@ -175,12 +175,18 @@ class HardwareDetector:
         
         # Check PyTorch
         try:
-            import torch
-            info.torch_available = True
-            info.torch_version = torch.__version__
+            try:
+                import torch
+            except Exception:
+                # Torch may be installed but fail to load CUDA DLLs; treat as unavailable
+                info.torch_available = False
+                torch = None
+            if torch is not None:
+                info.torch_available = True
+                info.torch_version = torch.__version__
             
             # Check CUDA
-            if torch.cuda.is_available():
+            if torch is not None and torch.cuda.is_available():
                 info.cuda_available = True
                 info.cuda_version = torch.version.cuda
                 info.device_type = DeviceType.CUDA
@@ -199,7 +205,7 @@ class HardwareDetector:
                     info.total_gpu_memory_gb += gpu.total_memory_gb
             
             # Check MPS (Apple Silicon)
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            elif torch is not None and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 info.mps_available = True
                 info.device_type = DeviceType.MPS
                 
@@ -229,7 +235,8 @@ class HardwareDetector:
                         total_memory_gb=8.0,  # Conservative estimate
                         device_type=DeviceType.MPS
                     ))
-                    info.total_gpu_memory_gb = 8.0
+        except Exception:
+            info.torch_available = False
         except ImportError:
             pass
         

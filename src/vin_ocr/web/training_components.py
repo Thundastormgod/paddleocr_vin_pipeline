@@ -14,7 +14,16 @@ Author: JRL-VIN Project
 Date: February 2026
 """
 
-import fcntl
+try:
+    import fcntl  # Unix-only
+    _HAS_FCNTL = True
+except ImportError:  # Windows
+    fcntl = None
+    _HAS_FCNTL = False
+    try:
+        import msvcrt  # Windows file locking
+    except ImportError:
+        msvcrt = None
 import json
 import os
 import signal
@@ -304,7 +313,7 @@ class TrainingRunner:
         # Check if user provided a custom name (not a default pattern)
         dir_name = base_path.name
         default_patterns = ['vin_rec_finetune', 'deepseek_finetune', 'hyperparameter_tuning', 
-                           'paddleocr_scratch', 'deepseek_scratch']
+                           'paddleocr_finetune', 'deepseek_scratch']
         
         # If it's a custom name, use it directly
         if dir_name not in default_patterns:
@@ -368,7 +377,7 @@ class TrainingRunner:
     
     def _acquire_lock(self, training_type: str, output_dir: str) -> bool:
         """
-        Acquire exclusive lock using fcntl for atomic file locking.
+        Acquire exclusive lock using OS-specific file locking.
         
         This implementation prevents the TOCTOU race condition by using
         kernel-level file locking instead of check-then-create pattern.
@@ -386,8 +395,15 @@ class TrainingRunner:
         
         try:
             # Try to acquire exclusive lock (non-blocking)
-            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            if _HAS_FCNTL:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            elif msvcrt is not None:
+                # Lock 1 byte at start of file
+                os.lseek(self._lock_fd, 0, os.SEEK_SET)
+                msvcrt.locking(self._lock_fd, msvcrt.LK_NBLCK, 1)
+            else:
+                raise RuntimeError("File locking not supported on this platform")
+        except (BlockingIOError, OSError):
             # Lock held by another process - try to read who has it
             os.close(self._lock_fd)
             self._lock_fd = None
@@ -424,7 +440,11 @@ class TrainingRunner:
         try:
             if hasattr(self, '_lock_fd') and self._lock_fd is not None:
                 # Release lock
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                if _HAS_FCNTL:
+                    fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                elif msvcrt is not None:
+                    os.lseek(self._lock_fd, 0, os.SEEK_SET)
+                    msvcrt.locking(self._lock_fd, msvcrt.LK_UNLCK, 1)
                 os.close(self._lock_fd)
                 self._lock_fd = None
             

@@ -220,7 +220,7 @@ def save_persistent_state():
             'label_files': st.session_state.get('label_files', {}),
             'inference_results': st.session_state.get('inference_results', []),
             'evaluation_results': st.session_state.get('evaluation_results', {}),
-            'use_gpu': st.session_state.get('use_gpu', False),
+            'use_gpu': st.session_state.get('use_gpu', True),
             'last_saved': datetime.now().isoformat(),
         }
         
@@ -940,16 +940,31 @@ def render_data_management_page():
                 with tab1:
                     if st.session_state.train_images:
                         df = pd.DataFrame(st.session_state.train_images[:10])
+                        if not df.empty:
+                            df = df.assign(
+                                filename=df["filename"].astype(str),
+                                vin=df["vin"].astype(str),
+                            )
                         st.dataframe(df[['filename', 'vin']], use_container_width=True)
                 
                 with tab2:
                     if st.session_state.val_images:
                         df = pd.DataFrame(st.session_state.val_images[:10])
+                        if not df.empty:
+                            df = df.assign(
+                                filename=df["filename"].astype(str),
+                                vin=df["vin"].astype(str),
+                            )
                         st.dataframe(df[['filename', 'vin']], use_container_width=True)
                 
                 with tab3:
                     if st.session_state.test_images:
                         df = pd.DataFrame(st.session_state.test_images[:10])
+                        if not df.empty:
+                            df = df.assign(
+                                filename=df["filename"].astype(str),
+                                vin=df["vin"].astype(str),
+                            )
                         st.dataframe(df[['filename', 'vin']], use_container_width=True)
         else:
             st.info("No split configured yet. Use the sliders above and click 'Apply Split'.")
@@ -1996,10 +2011,11 @@ def render_system_health():
             pass
         
         try:
-            import paddleocr
-            deps["PaddleOCR"] = True
-        except ImportError:
-            pass
+            import importlib.util
+            deps["PaddleOCR"] = importlib.util.find_spec("paddleocr") is not None
+        except Exception:
+            # Avoid hard import because PaddleOCR can raise RuntimeError on init
+            deps["PaddleOCR"] = False
         
         try:
             import onnxruntime

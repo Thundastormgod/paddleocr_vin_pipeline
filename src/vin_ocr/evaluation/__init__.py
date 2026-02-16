@@ -21,4 +21,5 @@ Usage:
 __all__ = [
     "evaluate",
     "multi_model_evaluation",
+    "metrics",  # Add metrics module
 ]

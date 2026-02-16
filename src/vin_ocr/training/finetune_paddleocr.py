@@ -48,6 +48,22 @@ Date: February 2026
 
 import os
 import sys
+from pathlib import Path
+
+# Add project root to path for imports
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
+
+# Check for DagsHub streaming support
+try:
+    from src.vin_ocr.data.dagshub_integration import (
+        enable_dagshub_streaming, 
+        get_streaming_config, 
+        is_streaming_active
+    )
+    DAGSHUB_INTEGRATION_AVAILABLE = True
+except ImportError:
+    DAGSHUB_INTEGRATION_AVAILABLE = False
 import yaml
 import json
 import time
@@ -62,11 +78,25 @@ from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import cv2
 
+# Add project root to path for direct execution
+if __name__ == "__main__":
+    project_root = Path(__file__).parent.parent.parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
 # Import unified VIN preprocessing module
-from ..preprocessing import VINPreprocessor, PreprocessConfig, PreprocessStrategy
+try:
+    from ..preprocessing import VINPreprocessor, PreprocessConfig, PreprocessStrategy
+except ImportError:
+    # Fallback for direct execution
+    from src.vin_ocr.preprocessing import VINPreprocessor, PreprocessConfig, PreprocessStrategy
 
 # Import hardware detection
-from ..utils.hardware_utils import HardwareDetector
+try:
+    from ..utils.hardware_utils import HardwareDetector
+except ImportError:
+    # Fallback for direct execution
+    from src.vin_ocr.utils.hardware_utils import HardwareDetector
 
 # PaddlePaddle imports
 try:
@@ -79,6 +109,7 @@ try:
     PADDLE_AVAILABLE = True
 except ImportError:
     PADDLE_AVAILABLE = False
+    Dataset = object  # prevent NameError when Paddle isn't available
     print("ERROR: PaddlePaddle not installed. Install with:")
     print("  pip install paddlepaddle-gpu  # For GPU")
     print("  pip install paddlepaddle      # For CPU")
@@ -132,8 +163,21 @@ if logger.handlers:
 # =============================================================================
 
 def load_config(config_path: str) -> Dict:
-    """Load YAML configuration file."""
-    with open(config_path, 'r') as f:
+    """Load YAML configuration file with path resolution."""
+    # Resolve path relative to project root
+    config_file = Path(config_path)
+    if not config_file.is_absolute():
+        # Try relative to project root first
+        project_root = Path(__file__).parent.parent.parent.parent
+        config_file = project_root / config_path
+        if not config_file.exists():
+            # Try relative to current directory
+            config_file = Path(config_path)
+    
+    if not config_file.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path} (tried: {config_file})")
+    
+    with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
     return config
 
@@ -192,14 +236,27 @@ class VINRecognitionDataset(Dataset):
         logger.info(f"Loaded {len(self.samples)} samples from {label_file}")
     
     def _load_samples(self, label_file: str) -> List[Tuple[str, str]]:
-        """Load image paths and labels from label file.
+        """Load image paths and labels from label file with path resolution.
         
         Supports both absolute and relative paths. If the path in the label file
         is absolute (starts with /), it's used directly. Otherwise, it's joined
         with data_dir.
         """
+        # Resolve label file path
+        label_path = Path(label_file)
+        if not label_path.is_absolute():
+            # Try relative to project root first
+            project_root = Path(__file__).parent.parent.parent.parent
+            label_path = project_root / label_file
+            if not label_path.exists():
+                # Try relative to current directory
+                label_path = Path(label_file)
+        
+        if not label_path.exists():
+            raise FileNotFoundError(f"Label file not found: {label_file} (tried: {label_path})")
+        
         samples = []
-        with open(label_file, 'r') as f:
+        with open(label_path, 'r') as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -224,7 +281,8 @@ class VINRecognitionDataset(Dataset):
         return samples
     
     def _encode_label(self, label: str) -> np.ndarray:
-        """Encode text label to indices."""
+        """Encode text label to indices for CrossEntropyLoss."""
+        # For CrossEntropyLoss, we need fixed-length padded sequences
         encoded = np.zeros(self.max_text_length, dtype=np.int64)
         for i, char in enumerate(label[:self.max_text_length]):
             if char in self.char_dict:
@@ -315,20 +373,33 @@ class VINRecognitionDataset(Dataset):
         label_length = min(len(label), self.max_text_length)
         
         return {
-            'image': image.astype(np.float32),
-            'label': encoded_label,
-            'length': np.array([label_length], dtype=np.int64),
+            'image': image,
+            'label': encoded_label,  # Fixed-length for CrossEntropyLoss
+            'length': np.array([len(encoded_label)], dtype=np.int32),
             'text': label
         }
 
 
 def load_char_dict(dict_path: str) -> Tuple[Dict[str, int], Dict[int, str]]:
-    """Load character dictionary."""
-    char_to_idx = {'<blank>': 0}  # CTC blank token
-    idx_to_char = {0: '<blank>'}
+    """Load character dictionary with path resolution."""
+    # Resolve path relative to project root
+    dict_file = Path(dict_path)
+    if not dict_file.is_absolute():
+        # Try relative to project root first
+        project_root = Path(__file__).parent.parent.parent.parent
+        dict_file = project_root / dict_path
+        if not dict_file.exists():
+            # Try relative to current directory
+            dict_file = Path(dict_path)
     
-    with open(dict_path, 'r') as f:
-        for idx, line in enumerate(f, start=1):
+    if not dict_file.exists():
+        raise FileNotFoundError(f"Character dictionary not found: {dict_path} (tried: {dict_file})")
+    
+    char_to_idx = {}
+    idx_to_char = {}
+    
+    with open(dict_file, 'r') as f:
+        for idx, line in enumerate(f):
             char = line.strip()
             if char:
                 char_to_idx[char] = idx
@@ -916,14 +987,15 @@ class VINFineTuner:
         self.optimizer, self.lr_scheduler = self._build_optimizer()
         
         # Loss function
-        # Note: Using CrossEntropyLoss as workaround for PaddlePaddle 3.0.0 CTCLoss bug
-        # This works well for fixed-length VIN recognition (17 characters)
-        self.use_ctc = False  # Set to True once CTCLoss bug is fixed
+        # Use CrossEntropyLoss to match high-performance model training
+        # CrossEntropyLoss is more stable in current PaddlePaddle and matches the actual training method used for the high-performance model
+        self.use_ctc = False  # Use CrossEntropyLoss (matches high-performance model)
         if self.use_ctc:
             self.criterion = nn.CTCLoss(blank=0, reduction='mean')
+            logger.info("Using CTCLoss (matches CTC model)")
         else:
             self.criterion = nn.CrossEntropyLoss(reduction='mean', ignore_index=0)
-            logger.info("Using CrossEntropyLoss (workaround for PaddlePaddle 3.0.0 CTCLoss bug)")
+            logger.info("Using CrossEntropyLoss (matches high-performance model)")
         
         # Mixed precision
         self.use_amp = config['Global'].get('use_amp', False)
@@ -936,6 +1008,7 @@ class VINFineTuner:
         # Metrics tracking
         self.train_losses = []
         self.val_accuracies = []
+        self.best_accuracy = 0.0
     
     def _setup_signal_handlers(self):
         """Set up signal handlers for graceful shutdown."""
@@ -1039,10 +1112,10 @@ class VINFineTuner:
         # Learning rate scheduler config
         lr_config = opt_config['lr']
         base_lr = lr_config['learning_rate']
-        warmup_epoch = lr_config.get('warmup_epoch', 5)
+        warmup_epoch = lr_config.get('warmup_epoch', 0)  # No warmup for stable training
         epochs = self.config['Global']['epoch_num']
         
-        # Ensure T_max is always positive (at least 1)
+        # Use cosine annealing (matches high-performance model)
         t_max = max(1, epochs - warmup_epoch)
         
         # Calculate warmup steps (using estimated steps per epoch)
@@ -1054,22 +1127,21 @@ class VINFineTuner:
         # Cosine annealing base scheduler
         cosine_scheduler = optim.lr.CosineAnnealingDecay(
             learning_rate=base_lr,
-            T_max=t_max,  # Cosine decay after warmup (minimum 1)
+            T_max=t_max,  # Cosine decay after warmup
         )
         
         # Wrap with linear warmup
         lr_scheduler = optim.lr.LinearWarmup(
             learning_rate=cosine_scheduler,
             warmup_steps=warmup_steps,
-            start_lr=base_lr * 0.01,  # Start at 1% of base LR
-            end_lr=base_lr,
+            start_lr=base_lr * 0.1,  # Start at 10% of base LR
+            end_lr=base_lr
         )
-        
-        logger.info(f"LR Schedule: LinearWarmup ({warmup_epoch} epochs) -> CosineAnnealing")
-        logger.info(f"  Base LR: {base_lr}, Warmup steps: ~{warmup_steps}")
         
         # Optimizer with weight decay
         weight_decay = opt_config.get('regularizer', {}).get('factor', 1e-5)
+        
+        # Create optimizer first
         optimizer = optim.Adam(
             parameters=self.model.parameters(),
             learning_rate=lr_scheduler,
@@ -1143,16 +1215,16 @@ class VINFineTuner:
         """
         if self.use_ctc:
             # CTC-style greedy decoding (collapse blanks and repeats)
-            preds = logits.argmax(axis=-1).numpy()
+            preds = logits.argmax(axis=-1).numpy()  # [B, T, C] -> [B, T]
             decoded = []
             for pred in preds:
                 chars = []
-                prev_char = None
+                prev_idx = None
                 for idx in pred:
-                    if idx != 0 and idx != prev_char:  # Skip blank and repeated
+                    if idx != 0 and idx != prev_idx:  # Skip blank (0) and repeats
                         if idx in self.idx_to_char:
                             chars.append(self.idx_to_char[idx])
-                    prev_char = idx
+                    prev_idx = idx
                 decoded.append(''.join(chars))
             return decoded
         else:
@@ -1171,8 +1243,11 @@ class VINFineTuner:
                     elif idx == 0:
                         # Blank token - model predicts "no character" at this position
                         # For VINs this shouldn't happen, but handle gracefully
-                        chars.append('_')  # Placeholder for blank predictions
-                decoded.append(''.join(chars))
+                        # Skip blank tokens entirely for VIN recognition (no padding characters)
+                        continue  # Don't add anything for blank tokens
+                # ENFORCE 17-character limit for VINs
+                decoded_text = ''.join(chars[:max_len])  # Truncate to exactly 17 chars
+                decoded.append(decoded_text)
             return decoded
         
         return decoded
@@ -1195,14 +1270,13 @@ class VINFineTuner:
                 break
             
             images = paddle.to_tensor(batch['image'])
-            labels = paddle.to_tensor(batch['label'], dtype='int64')
-            
-            # Forward pass
+            labels = paddle.to_tensor(batch['label'], dtype='int64')  # CrossEntropyLoss needs int64
+            targets = batch['text']          # Forward pass
             logits = self.model(images)  # [B, T, C]
             
             if self.use_ctc:
-                # CTC Loss path
-                lengths = paddle.to_tensor(batch['length'], dtype='int32').squeeze(-1)
+                # CTC Loss path - ensure all tensors are int32
+                lengths = paddle.to_tensor([len(label) for label in batch['label']], dtype='int32')
                 log_probs = F.log_softmax(logits, axis=-1)
                 log_probs = log_probs.transpose([1, 0, 2])  # [T, B, C] for CTC
                 input_lengths = paddle.full([logits.shape[0]], logits.shape[1], dtype='int32')
@@ -1260,15 +1334,24 @@ class VINFineTuner:
         
         for batch in self.val_loader:
             images = paddle.to_tensor(batch['image'])
-            labels = paddle.to_tensor(batch['label'], dtype='int64')
+            labels = paddle.to_tensor(batch['label'], dtype='int64')  # CrossEntropyLoss needs int64
             targets = batch['text']
             
             # Forward
             logits = self.model(images)  # [B, T, C]
             
             if self.use_ctc:
-                # CTC Loss path
-                lengths = paddle.to_tensor(batch['length'], dtype='int32').squeeze(-1)
+                # CTC Loss path - handle variable length labels
+                # Pad labels to same length for batch processing
+                max_label_len = max(len(label) for label in batch['label'])
+                padded_labels = []
+                for label in batch['label']:
+                    padded = np.zeros(max_label_len, dtype=np.int32)
+                    padded[:len(label)] = label
+                    padded_labels.append(padded)
+                labels = paddle.to_tensor(padded_labels, dtype='int32')
+                
+                lengths = paddle.to_tensor(batch['length'], dtype='int32')
                 log_probs = F.log_softmax(logits, axis=-1)
                 log_probs_ctc = log_probs.transpose([1, 0, 2])
                 input_lengths = paddle.full([logits.shape[0]], logits.shape[1], dtype='int32')
@@ -1292,8 +1375,38 @@ class VINFineTuner:
         avg_loss = total_loss / max(1, len(self.val_loader))
         
         # Calculate comprehensive metrics
+        print(f"🔍 DEBUG: Validation started - predictions={len(all_predictions)}, targets={len(all_targets)}")
+        if all_predictions and all_targets:
+            print(f"🔍 DEBUG: Sample prediction: '{all_predictions[0]}' (len={len(all_predictions[0])})")
+            print(f"🔍 DEBUG: Sample target: '{all_targets[0]}' (len={len(all_targets[0])})")
+            print(f"🔍 DEBUG: Total predictions: {len(all_predictions)}, Total targets: {len(all_targets)}")
+            
+            # DEBUG: Character-level analysis
+            sample_pred = all_predictions[0]
+            sample_target = all_targets[0]
+            print(f"🔍 DEBUG: Char comparison - pred: '{sample_pred}', target: '{sample_target}'")
+            for i, (p, t) in enumerate(zip(sample_pred, sample_target)):
+                match = "✓" if p == t else "✗"
+                print(f"🔍 DEBUG: Pos {i+1}: '{p}' vs '{t}' = {match}")
+        else:
+            print(f"🔍 DEBUG: No predictions or targets available!")
+        
         metrics = self._calculate_comprehensive_metrics(all_predictions, all_targets)
         accuracy = metrics['image_accuracy']
+        
+        # Debug: Force print validation metrics
+        print(f"🔍 DEBUG: Metrics calculated - accuracy={accuracy}")
+        print(f"🔍 DEBUG: Char metrics - acc={metrics.get('char_accuracy', 0)}, f1_micro={metrics.get('f1_micro', 0)}, f1_macro={metrics.get('f1_macro', 0)}")
+        print(f"🔍 DEBUG: Raw metrics dict keys: {list(metrics.keys())}")
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)):
+                print(f"🔍 DEBUG: {key}: {value}")
+        
+        if len(all_predictions) > 0:
+            print(f"  📊 Image-Level: {metrics.get('correct_images', 0)}/{metrics.get('total_images', 0)} correct ({accuracy:.4f})")
+            print(f"  📝 Char-Level: Acc={metrics.get('char_accuracy', 0):.4f}, F1-micro={metrics.get('f1_micro', 0):.4f}, F1-macro={metrics.get('f1_macro', 0):.4f}")
+        else:
+            print(f"  ⚠️ No predictions generated during validation")
         
         # Store metrics for reporting
         self._last_val_metrics = metrics
@@ -1359,6 +1472,12 @@ class VINFineTuner:
         """Get the most recent validation metrics."""
         return getattr(self, '_last_val_metrics', {})
     
+    def _save_best_model(self):
+        """Save the best model."""
+        best_path = self.output_dir / 'best_accuracy'
+        paddle.save(self.model.state_dict(), str(best_path) + '.pdparams')
+        logger.info(f"Saved best model with accuracy: {self.best_accuracy:.4f}")
+    
     def save_checkpoint(self, epoch: int, is_best: bool = False):
         """Save training checkpoint."""
         checkpoint = {
@@ -1391,10 +1510,16 @@ class VINFineTuner:
         """Load checkpoint to resume training."""
         logger.info(f"Loading checkpoint from {checkpoint_path}")
         
-        model_state = paddle.load(checkpoint_path + '.pdparams')
+        # Handle paths that may or may not already have the extension
+        if not checkpoint_path.endswith('.pdparams'):
+            model_path = checkpoint_path + '.pdparams'
+        else:
+            model_path = checkpoint_path
+            
+        model_state = paddle.load(model_path)
         self.model.set_state_dict(model_state)
         
-        opt_path = checkpoint_path + '.pdopt'
+        opt_path = model_path.replace('.pdparams', '.pdopt')
         if Path(opt_path).exists():
             opt_state = paddle.load(opt_path)
             self.optimizer.set_state_dict(opt_state)
@@ -1492,6 +1617,12 @@ class VINFineTuner:
             # Validate
             val_loss, val_accuracy = self.validate()
             
+            # Track best accuracy
+            if val_accuracy > self.best_accuracy:
+                self.best_accuracy = val_accuracy
+                self._save_best_model()
+                print(f"  🎉 New best accuracy: {val_accuracy:.4f}")
+            
             epoch_time = time.time() - epoch_start
             
             # Logging - flush immediately for real-time visibility during GPU training
@@ -1500,6 +1631,7 @@ class VINFineTuner:
                 f"Train Loss: {train_loss:.4f} "
                 f"Val Loss: {val_loss:.4f} "
                 f"Val Acc: {val_accuracy:.4f} "
+                f"Best: {self.best_accuracy:.4f} "
                 f"Time: {epoch_time:.1f}s",
                 flush=True
             )
@@ -2211,6 +2343,24 @@ def main():
         help='Export model to ONNX format after training'
     )
     
+    # DagsHub streaming arguments
+    if DAGSHUB_INTEGRATION_AVAILABLE:
+        parser.add_argument(
+            '--stream',
+            action='store_true',
+            help='Use DagsHub data streaming (no local download)'
+        )
+        parser.add_argument(
+            '--dagshub-user',
+            default=None,
+            help='DagsHub username for streaming authentication'
+        )
+        parser.add_argument(
+            '--dagshub-token',
+            default=None,
+            help='DagsHub access token for streaming authentication'
+        )
+    
     args = parser.parse_args()
     
     # Check dependencies
@@ -2218,6 +2368,18 @@ def main():
         print("ERROR: PaddlePaddle is required for training.")
         print("Install with: pip install paddlepaddle-gpu")
         sys.exit(1)
+    
+    # Initialize DagsHub streaming if requested
+    if DAGSHUB_INTEGRATION_AVAILABLE and getattr(args, 'stream', False):
+        print("🌐 Initializing DagsHub streaming...")
+        if enable_dagshub_streaming(args.dagshub_user, args.dagshub_token):
+            print("✅ DagsHub streaming enabled")
+            # Update config path for streaming
+            args.config = get_streaming_config(args.config)
+            print(f"📄 Using streaming config: {args.config}")
+        else:
+            print("❌ Failed to enable DagsHub streaming")
+            sys.exit(1)
     
     # Load config
     config = load_config(args.config)

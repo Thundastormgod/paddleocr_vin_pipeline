@@ -22,6 +22,7 @@ import logging
 import os
 import random
 import shutil
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -68,30 +69,81 @@ def create_splits(
     test_ratio: float = 0.15,
     seed: int = 42
 ) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
-    """Split images into train/val/test sets."""
-    
+    """
+    Split images into train/val/test sets, GROUPED BY VIN.
+
+    Data-leakage note: a single physical VIN plate frequently appears in more
+    than one image (multiple shots, crops, augmented copies). Splitting on
+    image path would scatter those copies across train and test, letting the
+    model memorise a plate it is then scored on and inflating every metric.
+
+    So the split is performed over unique VINs, and all images of a given VIN
+    land in exactly one split. The result is verified by assert_no_vin_leakage()
+    before being returned.
+    """
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 0.01, \
         "Ratios must sum to 1.0"
-    
-    # Shuffle paths
-    paths = list(images.keys())
+
+    # Group image paths by their VIN label
+    vin_to_paths: Dict[str, List[str]] = defaultdict(list)
+    for path, vin in images.items():
+        vin_to_paths[vin].append(path)
+
+    # Shuffle and split the VINs (not the images)
+    vins = sorted(vin_to_paths.keys())   # sorted first for determinism
     random.seed(seed)
-    random.shuffle(paths)
-    
-    # Calculate split indices
-    n = len(paths)
+    random.shuffle(vins)
+
+    n = len(vins)
     n_train = int(n * train_ratio)
     n_val = int(n * val_ratio)
-    
-    train_paths = paths[:n_train]
-    val_paths = paths[n_train:n_train + n_val]
-    test_paths = paths[n_train + n_val:]
-    
-    train = {p: images[p] for p in train_paths}
-    val = {p: images[p] for p in val_paths}
-    test = {p: images[p] for p in test_paths}
-    
+
+    train_vins = set(vins[:n_train])
+    val_vins = set(vins[n_train:n_train + n_val])
+    test_vins = set(vins[n_train + n_val:])
+
+    train = {p: images[p] for v in train_vins for p in vin_to_paths[v]}
+    val = {p: images[p] for v in val_vins for p in vin_to_paths[v]}
+    test = {p: images[p] for v in test_vins for p in vin_to_paths[v]}
+
+    n_dupe_vins = sum(1 for paths in vin_to_paths.values() if len(paths) > 1)
+    print(f"  Grouped {len(images)} images into {n} unique VINs "
+          f"({n_dupe_vins} VIN(s) with multiple images)")
+
+    assert_no_vin_leakage(train, val, test)
+
     return train, val, test
+
+
+def assert_no_vin_leakage(
+    train: Dict[str, str],
+    val: Dict[str, str],
+    test: Dict[str, str],
+) -> None:
+    """
+    Verify no VIN appears in more than one split.
+
+    Raises ValueError on leakage rather than printing a warning: a silently
+    leaking split produces metrics that look good and mean nothing.
+    """
+    tr, va, te = set(train.values()), set(val.values()), set(test.values())
+
+    overlaps = {
+        "train/val": tr & va,
+        "train/test": tr & te,
+        "val/test": va & te,
+    }
+    leaked = {k: v for k, v in overlaps.items() if v}
+
+    if leaked:
+        detail = "; ".join(
+            f"{pair}: {len(vins)} VIN(s) e.g. {sorted(vins)[:3]}"
+            for pair, vins in leaked.items()
+        )
+        raise ValueError(f"Data leakage between splits -> {detail}")
+
+    print(f"  Leakage check passed: {len(tr)}/{len(va)}/{len(te)} disjoint VINs "
+          f"(train/val/test)")
 
 
 def create_paddleocr_labels(

@@ -29,6 +29,7 @@ import logging
 import sys
 import time
 from dataclasses import dataclass, field, asdict
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import random
@@ -303,34 +304,57 @@ def calculate_cer(predictions: List[str], references: List[str]) -> float:
 
 
 def calculate_character_metrics(
-    predictions: List[str], 
+    predictions: List[str],
     references: List[str]
 ) -> Tuple[float, float, float]:
     """
-    Calculate character-level precision, recall, and F1.
-    
+    Calculate character-level precision, recall, and F1 using sequence ALIGNMENT.
+
+    Counts are derived from the edit alignment between prediction and
+    reference, not from a positional zip:
+
+        equal   -> TP for each character in the block
+        replace -> FP for predicted chars, FN for reference chars
+        insert  -> FP (predicted characters with no reference counterpart)
+        delete  -> FN (reference characters the prediction missed)
+
+    Why this matters: the previous implementation compared pred[i] to ref[i]
+    positionally, so a SINGLE inserted character at the front shifted every
+    subsequent position and drove F1 to ~0.12 for a string that is 88%
+    correct by edit distance — while a substitution of the same edit distance
+    scored 0.94. That is ~8x more punitive for insertions than substitutions.
+
+    Leading-artifact insertions ("*", "2E", "X" prefixes) are the documented
+    dominant failure mode for these engraved plates, so the old metric
+    systematically understated character-level accuracy and disagreed with
+    calculate_cer() computed over the same data.
+
     Returns:
         Tuple of (precision, recall, f1)
     """
-    total_tp = 0  # True positives (matching chars)
-    total_fp = 0  # False positives (extra predicted chars)
-    total_fn = 0  # False negatives (missed reference chars)
-    
+    total_tp = 0  # True positives  (aligned, equal characters)
+    total_fp = 0  # False positives (predicted chars with no reference match)
+    total_fn = 0  # False negatives (reference chars the prediction missed)
+
     for pred, ref in zip(predictions, references):
-        # Align sequences and count matches
-        min_len = min(len(pred), len(ref))
-        
-        # Count matching characters at same positions
-        matches = sum(1 for i in range(min_len) if pred[i] == ref[i])
-        
-        total_tp += matches
-        total_fp += len(pred) - matches  # Predicted but wrong
-        total_fn += len(ref) - matches   # Reference but missed
-    
+        matcher = SequenceMatcher(None, pred, ref, autojunk=False)
+        for tag, p_start, p_end, r_start, r_end in matcher.get_opcodes():
+            n_pred = p_end - p_start
+            n_ref = r_end - r_start
+            if tag == 'equal':
+                total_tp += n_ref
+            elif tag == 'replace':
+                total_fp += n_pred
+                total_fn += n_ref
+            elif tag == 'insert':      # present in ref, absent from pred
+                total_fn += n_ref
+            elif tag == 'delete':      # present in pred, absent from ref
+                total_fp += n_pred
+
     precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
     recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    
+
     return precision, recall, f1
 
 

@@ -47,6 +47,7 @@ Date: January 2026
 import json
 import time
 from dataclasses import dataclass, field, asdict
+from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple, Any, Set
 from collections import defaultdict
 from pathlib import Path
@@ -535,36 +536,61 @@ class EvaluationMetricsCalculator:
             # Edit distance
             edit_dist = self._levenshtein(pred, true)
             total_edit_dist += edit_dist
-            
-            # Character-by-character comparison (aligned)
+
+            # --- Positional comparison -------------------------------------
+            # Used ONLY for per-position accuracy and char_accuracy, which are
+            # inherently positional quantities. It is deliberately NOT used for
+            # F1: a single insertion shifts every later position and would
+            # collapse the score (see _compute_f1_scores docstring).
             max_len = max(len(pred), len(true))
             for i in range(max_len):
                 position_total[i + 1] += 1
                 total_chars += 1
-                
+
                 pred_char = pred[i] if i < len(pred) else ''
                 true_char = true[i] if i < len(true) else ''
-                
+
                 if pred_char == true_char:
                     correct_chars += 1
                     position_correct[i + 1] += 1
-                    char_tp[true_char] += 1
-                else:
-                    # Skip empty characters (blank tokens) from F1 calculation
-                    if pred_char and pred_char != '_':  # Only count non-blank predictions
-                        char_fp[pred_char] += 1
-                    if true_char and true_char != '_':  # Only count non-blank ground truth
-                        char_fn[true_char] += 1
-        
+
+            # --- Alignment-based TP/FP/FN for F1 ---------------------------
+            matcher = SequenceMatcher(None, pred, true, autojunk=False)
+            for tag, p0, p1, t0, t1 in matcher.get_opcodes():
+                if tag == 'equal':
+                    for ch in true[t0:t1]:
+                        char_tp[ch] += 1
+                elif tag == 'replace':
+                    for ch in pred[p0:p1]:
+                        if ch and ch != '_':
+                            char_fp[ch] += 1
+                    for ch in true[t0:t1]:
+                        if ch and ch != '_':
+                            char_fn[ch] += 1
+                elif tag == 'insert':   # in reference, missing from prediction
+                    for ch in true[t0:t1]:
+                        if ch and ch != '_':
+                            char_fn[ch] += 1
+                elif tag == 'delete':   # in prediction, absent from reference
+                    for ch in pred[p0:p1]:
+                        if ch and ch != '_':
+                            char_fp[ch] += 1
+
         # Calculate metrics
         char_accuracy = correct_chars / total_chars if total_chars > 0 else 0.0
-        char_error_rate = 1.0 - char_accuracy
-        
-        # DEBUG: Print character calculation details
-        print(f"🔍 DEBUG CHAR METRICS: correct_chars={correct_chars}, total_chars={total_chars}, char_accuracy={char_accuracy}")
-        if self.predictions and self.ground_truth:
-            print(f"🔍 DEBUG CHAR SAMPLE: pred='{self.predictions[0][:10]}...', true='{self.ground_truth[0][:10]}...'")
-        
+
+        # Character Error Rate is an EDIT-distance quantity: (S+D+I)/N.
+        # It was previously defined as 1 - positional_accuracy, which is a
+        # different measure entirely: for a single leading insertion that
+        # formula reported CER=0.882 while the correct value (and the NED
+        # computed a few lines below, from the same edit distance) was 0.118.
+        # The object therefore reported two contradictory error rates.
+        total_true_len_for_cer = sum(len(t) for t in self.ground_truth)
+        char_error_rate = (
+            total_edit_dist / total_true_len_for_cer
+            if total_true_len_for_cer > 0 else 0.0
+        )
+
         # Position accuracy
         position_accuracy = {
             pos: position_correct[pos] / position_total[pos]

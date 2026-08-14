@@ -32,6 +32,7 @@ import logging
 import numpy as np
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
@@ -1789,53 +1790,125 @@ class EnsembleOCRProvider(OCRProvider):
         return winner
 
     def _weighted_char_vote_strategy(self, results: List[OCRResult]) -> OCRResult:
-        """Return per-character weighted vote across provider outputs."""
+        """
+        Per-character weighted vote, using sequence ALIGNMENT.
+
+        Candidates are aligned to the highest-confidence result before voting,
+        rather than compared by raw index.
+
+        Why: with naive positional voting, a candidate carrying a single
+        leading artifact ("*SAL1..." vs "SAL1...") has every one of its
+        characters shifted by one, so it votes the wrong character into every
+        position. Given inputs
+
+            A conf=0.80  SAL1A2A40SA606662   <- exactly correct
+            B conf=0.75  *SAL1A2A40SA60666
+            C conf=0.70  XSAL1A2A40SA60666
+
+        positional voting returned "SSAL1A2A40SA60666" (edit distance 2) even
+        though one input was perfect. An ensemble that can score worse than its
+        best member is worse than useless, and leading artifacts are the
+        documented dominant failure mode for these plates.
+
+        Confidence is the weighted agreement FRACTION at each position
+        (winning weight / total weight), averaged. The previous version summed
+        raw confidences, so any three providers with confidence >= ~0.34
+        saturated the clamp and reported 1.0 regardless of actual agreement.
+        """
         from collections import defaultdict
 
         if not results:
             raise OCRProviderError("No results for weighted char vote", provider=self.name)
 
-        target_length = VINConstants.LENGTH if any(
-            len(r.text) == VINConstants.LENGTH for r in results
-        ) else max((len(r.text) for r in results), default=0)
-
-        if target_length == 0:
+        usable = [r for r in results if r.text]
+        if not usable:
             return self._best_strategy(results)
 
         best_result = self._best_strategy(results)
-        char_weights: List[Dict[str, float]] = [defaultdict(float) for _ in range(target_length)]
 
-        for result in results:
-            if not result.text:
-                continue
+        # Anchor on the most confident candidate; prefer one of correct VIN
+        # length if available, since that is the expected output shape.
+        correct_len = [r for r in usable if len(r.text) == VINConstants.LENGTH]
+        anchor = max(correct_len or usable, key=lambda r: r.confidence or 0.0)
+        target_length = len(anchor.text)
+        if target_length == 0:
+            return self._best_strategy(results)
+
+        char_weights: List[Dict[str, float]] = [defaultdict(float) for _ in range(target_length)]
+        total_weights: List[float] = [0.0] * target_length
+
+        for result in usable:
             weight = float(result.confidence or 0.0)
-            for idx, char in enumerate(result.text[:target_length]):
-                char_weights[idx][char] += weight
+            if weight <= 0.0:
+                continue
+
+            if result is anchor:
+                votes = {i: ch for i, ch in enumerate(result.text)}
+            else:
+                # Map anchor position -> this candidate's aligned character.
+                votes = {}
+                matcher = SequenceMatcher(None, anchor.text, result.text, autojunk=False)
+                for tag, a0, a1, r0, r1 in matcher.get_opcodes():
+                    if tag == 'equal':
+                        for offset in range(a1 - a0):
+                            votes[a0 + offset] = result.text[r0 + offset]
+                    elif tag == 'replace':
+                        # Align the overlapping prefix of the replaced spans
+                        for offset in range(min(a1 - a0, r1 - r0)):
+                            votes[a0 + offset] = result.text[r0 + offset]
+                    # 'delete' -> candidate has no character for these anchor
+                    # positions; 'insert' -> extra characters with no anchor
+                    # position. Both correctly contribute no vote.
+
+            for idx, ch in votes.items():
+                if 0 <= idx < target_length:
+                    char_weights[idx][ch] += weight
+                    total_weights[idx] += weight
 
         chosen_chars: List[str] = []
-        per_char_best_weights: List[float] = []
+        agreement_fractions: List[float] = []
         for idx, weights in enumerate(char_weights):
             if not weights:
-                fallback_char = best_result.text[idx] if idx < len(best_result.text) else ""
-                chosen_chars.append(fallback_char)
-                per_char_best_weights.append(0.0)
+                chosen_chars.append(anchor.text[idx] if idx < len(anchor.text) else "")
+                agreement_fractions.append(0.0)
                 continue
 
             best_char, best_weight = max(weights.items(), key=lambda item: item[1])
             chosen_chars.append(best_char)
-            per_char_best_weights.append(best_weight)
+            total = total_weights[idx]
+            agreement_fractions.append(best_weight / total if total > 0 else 0.0)
 
         merged_text = ''.join(chosen_chars)
-        avg_weight = (sum(per_char_best_weights) / target_length) if target_length else best_result.confidence
-        avg_weight = max(0.0, min(1.0, avg_weight))
+
+        # Two independent signals, deliberately kept separable:
+        #   agreement       - how strongly the providers concur, 0..1
+        #   provider_conf   - how confident the providers were to begin with
+        #
+        # Reporting agreement alone saturates: three providers that are each
+        # only 34% sure but happen to concur would report 1.0. Reporting raw
+        # confidence alone ignores consensus. The product is a documented
+        # HEURISTIC, not a calibrated probability - calibrating it properly
+        # needs labelled data, which is not available here. Both components are
+        # exposed in metadata so downstream code can apply its own policy.
+        agreement = (
+            sum(agreement_fractions) / target_length if target_length else 0.0
+        )
+        contributing = [float(r.confidence or 0.0) for r in usable if (r.confidence or 0.0) > 0.0]
+        provider_conf = sum(contributing) / len(contributing) if contributing else 0.0
+
+        confidence = max(0.0, min(1.0, agreement * provider_conf))
 
         return OCRResult(
             text=merged_text,
-            confidence=avg_weight,
+            confidence=confidence,
             provider=self.name,
             metadata={
                 "strategy": "weighted_char_vote",
+                "confidence_model": "agreement * mean_provider_confidence (heuristic, uncalibrated)",
+                "agreement": agreement,
+                "mean_provider_confidence": provider_conf,
                 "char_weights": [dict(w) for w in char_weights],
+                "anchor": anchor.text,
                 "fallback": best_result.text,
             },
         )

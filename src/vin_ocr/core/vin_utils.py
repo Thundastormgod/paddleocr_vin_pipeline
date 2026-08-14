@@ -334,10 +334,23 @@ def extract_vin_from_text(text: str) -> str:
     this function attempts to find the valid VIN substring.
     
     Strategy:
-    1. If exactly 17 chars, return as-is
-    2. Look for common WMI prefixes (SAL, WVW, 1G1, etc.)
-    3. Find best 17-char substring with valid VIN characters
-    
+    Score EVERY 17-character window and return the highest scoring one.
+    The scorer already rewards a known WMI prefix and, decisively, a valid
+    ISO 3779 check digit (see _score_vin_candidate).
+
+    This replaces an earlier two-stage approach whose first stage returned the
+    first window starting with any known WMI, guarded by `score > 10`. Two
+    defects made that unsafe:
+
+      * The guard was a no-op - 17 arbitrary letters already score 34, so it
+        admitted essentially anything.
+      * Returning the FIRST match meant a spurious WMI earlier in the string
+        won outright. For input "SAL99SAL1A2A40SA606662" it returned
+        "SAL99SAL1A2A40SA6" (checksum invalid) even though the genuine,
+        checksum-valid "SAL1A2A40SA606662" was present later in the same text.
+        Which WMI won also depended on the order of the COMMON_WMIS tuple
+        rather than on the text.
+
     Args:
         text: Raw text that may contain a VIN plus extra characters
         
@@ -351,27 +364,19 @@ def extract_vin_from_text(text: str) -> str:
     
     if len(text) < VIN_LENGTH:
         return text  # Too short, can't extract
-    
-    # Strategy 1: Look for known WMI at any position
-    for wmi in VINConstants.COMMON_WMIS:
-        idx = text.find(wmi)
-        if idx != -1 and idx + VIN_LENGTH <= len(text):
-            candidate = text[idx:idx + VIN_LENGTH]
-            # Verify it has mostly valid VIN characters
-            if _score_vin_candidate(candidate) > 10:
-                return candidate
-    
-    # Strategy 2: Try all 17-char substrings, find one with best score
-    best_candidate = text[:VIN_LENGTH]  # Default: first 17 chars
+
+    # Score every window; first-best wins ties, preserving left-to-right
+    # preference for otherwise equally plausible candidates.
+    best_candidate = text[:VIN_LENGTH]
     best_score = _score_vin_candidate(best_candidate)
-    
+
     for i in range(1, len(text) - VIN_LENGTH + 1):
         candidate = text[i:i + VIN_LENGTH]
         score = _score_vin_candidate(candidate)
         if score > best_score:
             best_score = score
             best_candidate = candidate
-    
+
     return best_candidate
 
 
@@ -380,11 +385,27 @@ def _score_vin_candidate(candidate: str) -> int:
     Score a VIN candidate (higher = more likely valid).
     
     Scoring:
+    - +100 for a valid ISO 3779 check digit  (decisive)
     - +2 for each valid VIN character
     - +3 for each digit in sequential positions (12-17)
     - +10 for known WMI prefix
     - -5 for each invalid character (I, O, Q)
-    
+
+    The check-digit bonus dominates deliberately. A random 17-character string
+    satisfies the check digit roughly 1 time in 11, so it is by far the
+    strongest evidence available that a window is a real VIN - much stronger
+    than the WMI heuristic, which only covers the 43 manufacturers hardcoded in
+    VINConstants.COMMON_WMIS and is biased toward this dataset.
+
+    It was previously unused: a checksum-valid and a checksum-invalid candidate
+    scored identically (62 vs 62), so extraction could return a window that
+    failed its own check digit while a valid one existed in the same text.
+
+    The bonus (100) exceeds the maximum achievable from all other terms
+    (34 valid chars + 18 digits + 10 WMI = 62), so a checksum-valid candidate
+    always outranks a checksum-invalid one, while the other terms still break
+    ties among candidates of equal checksum status.
+
     Args:
         candidate: 17-character string to score
         
@@ -406,7 +427,11 @@ def _score_vin_candidate(candidate: str) -> int:
     
     # Penalty for invalid chars
     score -= sum(5 for c in candidate if c in VIN_INVALID_CHARS)
-    
+
+    # Valid check digit - decisive evidence this really is a VIN
+    if len(candidate) == VIN_LENGTH and validate_checksum(candidate):
+        score += 100
+
     return score
 
 

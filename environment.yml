@@ -54,8 +54,8 @@ dependencies:
       # ============================================
       # Computer Vision & Image Processing
       # ============================================
+      # Exactly ONE opencv distribution - see requirements.txt for rationale.
       - opencv-python==4.13.0.90
-      - opencv-contrib-python==4.10.0.84
       - imageio==2.37.2
 
       # Data augmentation

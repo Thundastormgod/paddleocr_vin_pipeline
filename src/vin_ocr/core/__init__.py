@@ -6,6 +6,13 @@ Core VIN utilities, constants, and validation logic.
 Single Source of Truth for all VIN-related functionality.
 """
 
+from .charset import (
+    BLANK_INDEX,
+    BLANK_TOKEN,
+    VIN_CHARSET,
+    load_char_dict,
+    num_classes,
+)
 from .vin_utils import (
     # Constants
     VINConstants,
@@ -32,6 +39,12 @@ from .vin_utils import (
 )
 
 __all__ = [
+    # Charset (single source of truth for char<->index mapping)
+    "BLANK_INDEX",
+    "BLANK_TOKEN",
+    "VIN_CHARSET",
+    "load_char_dict",
+    "num_classes",
     # Constants
     "VINConstants",
     "VIN_LENGTH",

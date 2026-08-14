@@ -8,6 +8,8 @@ and postprocessing.
 
 ## Key Metrics (Current Performance)
 
+Rule-based pipeline (PaddleOCR + preprocessing + postprocessing), 382 images:
+
 | Metric                   | Value | Baseline | Improvement |
 |--------------------------|-------|----------|-------------|
 | **Character-Level F1**   | 55%   | 43%      | +29%        |
@@ -15,8 +17,34 @@ and postprocessing.
 | **Precision**            | 57%   | 45%      | +27%        |
 | **Recall**               | 54%   | 42%      | +29%        |
 
-> **Note:** Industry target is 95%+ exact match and 98%+ F1.  
+> **Note:** Industry target is 95%+ exact match and 98%+ F1.
 > This pipeline establishes a baseline for further development.
+
+### ⚠️ Status of the fine-tuned model numbers
+
+Three different figures for the *fine-tuned* model circulate in this repo and
+they do not agree. Read this before quoting any of them:
+
+| Source | Exact match | Provenance |
+|--------|-------------|------------|
+| `VIN_OCR_Architecture_Performance.md` | 46.51% | Labelled "~0.5 hours (**simulated**)" — not measured |
+| `optuna_results/trial_0_results.json` | 2.3% | Real Optuna trial |
+| `results/multi_model_evaluation.json` | **0.0%** | Real evaluation, 50 images |
+| `results/batch_evaluation_*.json` | **0.0%** | Real evaluation, empty prediction strings |
+
+The recorded 0.0% runs are explained by a **character-index off-by-one between
+training and inference** (training mapped `<blank>`→0, inference mapped
+`<blank>`→1 and shifted every character up by one). A correctly-trained model
+decoded `SAL1A2A40SA606662` as `R9K09193…`, and low indices were dropped
+entirely — producing the empty strings.
+
+That bug is fixed (see `src/vin_ocr/core/charset.py`, now the single source of
+truth for the mapping), **but the model has not been retrained and re-evaluated
+since**. Treat all fine-tuned numbers above as unverified until a fresh
+training + evaluation run is recorded.
+
+The 25% / 55% rule-based figures at the top are unaffected by this bug — they
+come from the PaddleOCR pipeline, which does not use that char map.
 
 ---
 
@@ -209,22 +237,37 @@ This installs all core dependencies including:
 - Image processing libraries (OpenCV, Pillow)
 - Data analysis tools (Pandas, Plotly)
 
-### Advanced Options
+### Development Install
 
-For detailed installation options including:
-- GPU acceleration setup
-- DeepSeek-OCR support
-- Custom installations
-- Troubleshooting
+```bash
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"      # or ".[all]" for web + training + onnx
+pytest                        # 167 tests, no GPU or model weights required
+```
 
-See [INSTALLATION.md](INSTALLATION.md) for the complete installation guide.
+Copy `.env.example` to `.env` and fill in credentials (DagsHub tokens, device
+and threshold overrides). `.env` is gitignored and must never be committed.
+
+### Optional Extras
+
+| Extra      | Installs                                  |
+|------------|-------------------------------------------|
+| `web`      | Streamlit, Plotly, Pandas                 |
+| `training` | VisualDL, Optuna                          |
+| `onnx`     | onnx, onnxruntime, paddle2onnx            |
+| `dev`      | pytest, black, isort, flake8, mypy        |
+| `all`      | everything above                          |
+
+> **OpenCV:** install exactly one of `opencv-python`, `opencv-contrib-python`
+> or `opencv-python-headless`. They all provide `cv2`; installing more than one
+> leaves whichever pip unpacked last, at an unpredictable version.
 
 ---
 
 ## Quick Start
 
 ```python
-from vin_pipeline import VINOCRPipeline
+from src.vin_ocr.pipeline.vin_pipeline import VINOCRPipeline
 
 pipeline = VINOCRPipeline()
 result = pipeline.recognize('path/to/vin_image.jpg')
@@ -232,6 +275,25 @@ result = pipeline.recognize('path/to/vin_image.jpg')
 print(result['vin'])           # "SAL1P9EU2SA606664"
 print(result['confidence'])    # 0.91
 print(result['raw_ocr'])       # "XSAL1P9EU2SA606664*"
+```
+
+Validation helpers are importable without the heavy OCR backends:
+
+```python
+from src.vin_ocr.core import validate_vin, extract_vin_from_filename
+
+validate_vin("SAL1A2A40SA606662").is_fully_valid   # True
+extract_vin_from_filename("1-VIN -SAL1A2A40SA606662.jpg")
+```
+
+CLI equivalents:
+
+```bash
+vin-ocr recognize image.jpg          # single image
+vin-ocr batch ./images -o out.json   # folder
+vin-ocr serve                        # Streamlit UI on :8501
+vin-train finetune --help            # training commands
+vin-evaluate single --help           # evaluation commands
 ```
 
 ---
@@ -244,10 +306,10 @@ A Streamlit-based web interface for easy interaction with all models.
 
 ```bash
 # Install web UI dependencies
-pip install -r web_ui/requirements.txt
+pip install -e ".[web]"        # or: pip install -r src/vin_ocr/web/requirements.txt
 
 # Run the web interface
-streamlit run src/vin_ocr/web/app.py
+streamlit run src/vin_ocr/web/app.py     # or: make run  /  vin-ocr serve
 
 # Or with custom port
 streamlit run src/vin_ocr/web/app.py --server.port 8080
@@ -355,7 +417,7 @@ python -m src.vin_ocr.training.export_deepseek_onnx \
 Load a full fine-tuned DeepSeek model or LoRA adapters via the provider factory:
 
 ```python
-from ocr_providers import OCRProviderFactory
+from src.vin_ocr.providers.ocr_providers import OCRProviderFactory
 
 # Full fine-tuned model (local path)
 provider = OCRProviderFactory.create(
@@ -403,8 +465,8 @@ images/WBY1Z2C55KV304518_train_12.jpg	WBY1Z2C55KV304518
 Run complete experiments with industry-standard metrics:
 
 ```bash
-# Quick test with current data
-python test_pipeline.py
+# Quick sanity check (unit tests, no GPU or weights required)
+pytest
 
 # Full experiment with train/val/test splits
 python run_experiment.py --data-dir data --output-dir experiments
@@ -432,7 +494,8 @@ Examples:
 | **NED** | Normalized Edit Distance |
 | **Per-position** | Accuracy at each of 17 VIN positions |
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed pipeline documentation.
+See [Pipeline Architecture](#pipeline-architecture) below and
+[docs/MODELS.md](docs/MODELS.md) for detailed pipeline documentation.
 
 ---
 
@@ -458,30 +521,36 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed pipeline documentation.
 
 ```
 paddleocr_vin_pipeline/
-├── README.md                 # This file
-├── requirements.txt          # Dependencies
-├── vin_pipeline.py           # Complete pipeline (single-file)
-├── example_usage.py          # Usage examples
-├── ARCHITECTURE.md           # Detailed architecture docs
-├── LICENSE                   # Apache 2.0 License
-├── NOTICE                    # Attribution notices
+├── src/vin_ocr/              # Installable package
+│   ├── core/                 # VIN spec, validation, checksum, charset
+│   │   ├── vin_utils.py      #   validation, correction, extraction
+│   │   └── charset.py        #   char<->index map (training + inference)
+│   ├── preprocessing/        # CLAHE / engraved-plate strategies
+│   ├── providers/            # PaddleOCR + DeepSeek backends, ensemble
+│   ├── pipeline/             # VINOCRPipeline, MultiProviderVINPipeline
+│   ├── inference/            # ONNX and Paddle inference backends
+│   ├── training/             # Fine-tune, scratch, ONNX export, Optuna
+│   │   └── cli.py            #   `vin-train`
+│   ├── evaluation/           # Metrics, single- and multi-model evaluation
+│   │   └── cli.py            #   `vin-evaluate`
+│   ├── utils/                # Dataset prep/validation, hardware detection
+│   ├── web/app.py            # Streamlit UI
+│   └── cli.py                # `vin-ocr`
 │
-├── # Training & Evaluation Pipeline
-├── prepare_dataset.py        # Dataset splitting & label generation
-├── train_pipeline.py         # Training configuration & execution
+├── configs/                  # Training configs + vin_dict.txt charset
+├── scripts/                  # Standalone ONNX / data utilities
+├── tests/                    # 167 tests (no GPU or weights needed)
+├── docker/                   # CPU + GPU images, compose, entrypoint
+├── .github/workflows/ci.yml  # Tests, lint, secrets scan, build
+│
 ├── run_experiment.py         # End-to-end experiment runner
-├── test_pipeline.py          # Quick pipeline test
-├── src/vin_ocr/evaluation/evaluate.py      # Evaluation with metrics
-├── src/vin_ocr/utils/validate_dataset.py   # Dataset validation
+├── train_pipeline.py         # Training configuration & execution
+├── config.py                 # Env-var-driven settings singleton
+├── .env.example              # Credential + tuning template
 │
-├── tests/
-│   └── test_vin_pipeline.py  # Test suite (52+ tests)
-├── data/                     # VIN images (add your images here)
-├── experiments/              # Experiment outputs
-└── results/
-    ├── experiment_summary.json
-    ├── detailed_metrics.json
-    └── sample_results.csv
+├── data/                     # VIN images (DVC-managed, gitignored)
+├── output/                   # Checkpoints (gitignored)
+└── results/                  # Evaluation artifacts
 ```
 
 ---
@@ -526,19 +595,20 @@ Position:  1  2  3  | 4  5  6  7  8 | 9 | 10 | 11 | 12 13 14 15 16 17
 
 ## Documentation
 
-### Developer Documentation
-All technical documentation is located in the [`dev/`](dev/) directory:
+| Document | Contents |
+|----------|----------|
+| [docs/MODELS.md](docs/MODELS.md) | Model zoo, checkpoints, ONNX export |
+| [dev-docs/fine-tuning-techniques.md](dev-docs/fine-tuning-techniques.md) | Fine-tuning strategies and adaptation |
+| [TRAINING_IMPROVEMENTS.md](TRAINING_IMPROVEMENTS.md) | Training changes and rationale |
+| [VIN_OCR_Architecture_Performance.md](VIN_OCR_Architecture_Performance.md) | Architecture comparison results |
+| [DAGSHUB_SETUP.md](DAGSHUB_SETUP.md) | DagsHub + DVC data setup |
+| [docker/README.md](docker/README.md) | Container build and deployment |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution workflow |
+| [CHANGELOG.md](CHANGELOG.md) | Release history |
 
-- **[Architecture](dev/ARCHITECTURE.md)** - System design and component overview
-- **[Environment Setup](dev/ENVIRONMENT.md)** - Complete installation guide with multiple methods
-- **[Code Citations](dev/CODE_CITATIONS.md)** - Attribution for third-party code
-- **[Training Guides](dev/docs/)** - Deep dive into training pipeline, techniques, and algorithms
-
-### Quick Links
-- **[Training Guide](dev/docs/TRAINING_GUIDE.md)** - Step-by-step training instructions
-- **[Training Deep Dive](dev/docs/TRAINING_DEEP_DIVE.md)** - Advanced training concepts
-- **[Algorithm Complexity](dev/docs/ALGORITHM_COMPLEXITY.md)** - Performance analysis
-- **[Finetuning Techniques](dev/docs/FINETUNING_TECHNIQUES.md)** - Model adaptation strategies
+> Earlier revisions of this README linked to a `dev/` documentation tree and to
+> `INSTALLATION.md` / `ARCHITECTURE.md`. Those files are not present in this
+> repository; the table above lists what actually exists.
 
 ---
 
@@ -568,14 +638,22 @@ Path: `data/paddleocr_sample/`
 
 ## License
 
-**Apache License 2.0** - See [LICENSE](LICENSE) and [dev/NOTICE](dev/NOTICE)
-
-| Requires                    | Permits                              |
-|-----------------------------|--------------------------------------|
-| Attribution                 | Commercial use                       |
-| State changes               | Modification                         |
-| Include license             | Distribution                         |
-|                             | Patent use                           |
+> **⚠️ UNRESOLVED — do not rely on this section yet.**
+>
+> The licensing of this project is currently self-contradictory:
+>
+> - `LICENSE` is a **corrupted file**: Apache-2.0 text with MIT License text
+>   spliced into it mid-sentence (it literally begins
+>   `Apache LicenseMIT License`, and the MIT grant is pasted into the middle of
+>   the Apache "TERMS AND CONDITIONS" heading).
+> - `pyproject.toml` declares `license = {text = "MIT"}`.
+> - This README previously asserted Apache-2.0.
+> - The referenced `NOTICE` file does not exist.
+>
+> Apache-2.0 and MIT impose different obligations (notably attribution/NOTICE
+> and patent grants), so this must be settled by the copyright holder before
+> distribution. Once decided, replace `LICENSE` with the clean upstream text,
+> align `pyproject.toml`, and add a `NOTICE` file if Apache-2.0 is chosen.
 
 ---
 

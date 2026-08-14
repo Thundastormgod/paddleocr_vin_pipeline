@@ -1,0 +1,170 @@
+Architecture:
+  Backbone:
+    name: ResNet34_vd
+  Head:
+    dropout: 0.1
+    head_list:
+    - SARHead:
+        fc_decay: 2.0e-05
+    name: MultiHead
+    out_channels_list:
+      CTCLabelDecode: 34
+      NRTRLabelDecode: 37
+      SARLabelDecode: 36
+  Neck:
+    Transformer:
+      dropout: 0.1
+      num_heads: 8
+      num_layers: 2
+    hidden_dim: 256
+    name: SequenceEncoder
+  Transform: null
+  algorithm: Rosetta
+  model_type: rec
+Eval:
+  dataset:
+    data_dir: ./finetune_data/
+    label_file_list:
+    - ./finetune_data/val_labels.txt
+    name: SimpleDataSet
+    transforms:
+    - DecodeImage:
+        channel_first: false
+        img_mode: BGR
+    - MultiLabelEncode:
+        max_text_length: 17
+    - RecResizeImg:
+        image_shape:
+        - 3
+        - 48
+        - 320
+    - KeepKeys:
+        keep_keys:
+        - image
+        - label
+        - length
+        - valid_ratio
+  loader:
+    batch_size_per_card: 32
+    drop_last: false
+    num_workers: 0
+    shuffle: false
+    use_shared_memory: false
+Global:
+  cal_metric_during_train: true
+  character_dict_path: ./configs/vin_dict.txt
+  checkpoints: null
+  debug: false
+  distributed: false
+  early_stopping: true
+  early_stopping_min_delta: 0.0018841476921545091
+  early_stopping_patience: 13
+  epoch_num: 30
+  eval_batch_step:
+  - 0
+  - 500
+  infer_img: null
+  infer_mode: false
+  log_smooth_window: 20
+  max_text_length: 17
+  pretrained_model: null
+  print_batch_step: 10
+  save_epoch_step: 5
+  save_inference_dir: ./inference/vin_rec
+  save_model_dir: ./output/vin_rec_finetune
+  save_res_path: ./output/rec_results.txt
+  use_amp: false
+  use_gpu: false
+  use_space_char: false
+  use_visualdl: true
+  visualdl_log_dir: ./output/vdl_logs
+Loss:
+  name: CrossEntropyLoss
+Metric:
+  ignore_space: true
+  main_indicator: acc
+  name: RecMetric
+Optimizer:
+  beta1: 0.9363103425875593
+  beta2: 0.995609683141448
+  lr:
+    T_max: 20
+    learning_rate: 0.002679027504615933
+    name: CosineAnnealingDecay
+    warmup_epoch: 0
+    warmup_start_lr: 5e-06
+  name: Adam
+  regularizer:
+    factor: 4.589824181495651e-06
+    name: L2
+PostProcess:
+  character_dict_path: ./configs/vin_dict.txt
+  name: SARLabelDecode
+  use_space_char: false
+Test:
+  dataset:
+    data_dir: ./finetune_data/
+    label_file_list:
+    - ./finetune_data/test_labels.txt
+    name: SimpleDataSet
+    transforms:
+    - DecodeImage:
+        channel_first: false
+        img_mode: BGR
+    - MultiLabelEncode:
+        max_text_length: 17
+    - RecResizeImg:
+        image_shape:
+        - 3
+        - 48
+        - 320
+    - KeepKeys:
+        keep_keys:
+        - image
+        - label
+        - length
+        - valid_ratio
+  loader:
+    batch_size_per_card: 16
+    drop_last: false
+    num_workers: 0
+    shuffle: false
+    use_shared_memory: false
+Train:
+  dataset:
+    data_dir: ./finetune_data/
+    label_file_list:
+    - ./finetune_data/train_labels.txt
+    name: SimpleDataSet
+    transforms:
+    - DecodeImage:
+        channel_first: false
+        img_mode: BGR
+    - RecAug: null
+    - MultiLabelEncode:
+        max_text_length: 17
+    - RecResizeImg:
+        image_shape:
+        - 3
+        - 48
+        - 320
+    - RandomRotate:
+        max_angle: 5
+    - RandomDistort:
+        max_ratio: 0.8
+    - RandomContrast:
+        contrast_range:
+        - 0.8
+        - 1.2
+    - KeepKeys:
+        keep_keys:
+        - image
+        - label
+        - length
+        - valid_ratio
+  loader:
+    batch_size_per_card: 32
+    drop_last: true
+    num_workers: 0
+    shuffle: true
+    use_shared_memory: false

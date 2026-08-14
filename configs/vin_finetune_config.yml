@@ -1,19 +1,42 @@
+# =============================================================================
+# VIN Recognition Fine-Tuning Config
+# =============================================================================
+# Consumed by: src/vin_ocr/training/finetune_paddleocr.py
+#
+# IMPORTANT - scope of this file:
+#   This trainer builds its own paddle.nn networks (see VINRecognitionModel /
+#   PPOCRv5RecognitionModel). It does NOT drive PaddleOCR's tools/train.py and
+#   does NOT load PaddleOCR's model zoo. Only the keys documented below are
+#   read; anything else is ignored.
+#
+#   In particular there is no `transforms:` pipeline here — image
+#   preprocessing and augmentation are implemented in code, in
+#   VINRecognitionDataset._preprocess_image() and ._augment().
+#
+# Architecture / Loss / PostProcess must stay mutually consistent. The trainer
+# validates this at startup and raises if they disagree.
+# =============================================================================
+
 Global:
   debug: false
+  # Requested device. Actual device is confirmed by HardwareDetector at runtime;
+  # if no CUDA GPU is present this silently falls back to CPU.
   use_gpu: false
-  epoch_num: 10
+  epoch_num: 30
   log_smooth_window: 20
   print_batch_step: 10
   save_model_dir: ./output/vin_rec_finetune
   save_epoch_step: 5
   eval_batch_step: [0, 500]
   cal_metric_during_train: true
+  # Path prefix WITHOUT the .pdparams suffix, e.g. ./output/vin_rec_finetune/best_accuracy
   pretrained_model: null
   checkpoints: null
   save_inference_dir: ./inference/vin_rec
   use_visualdl: true
   visualdl_log_dir: ./output/vdl_logs
   infer_img: null
+  # 34 entries: '<blank>' at index 0 (CTC blank) + 33 valid VIN characters.
   character_dict_path: ./configs/vin_dict.txt
   max_text_length: 17
   infer_mode: false
@@ -21,38 +44,61 @@ Global:
   distributed: false
   save_res_path: ./output/rec_results.txt
   use_amp: false
+  # Early stopping (evaluated per epoch on validation exact-match accuracy)
+  early_stopping: true
+  early_stopping_patience: 25
+  early_stopping_min_delta: 0.001
 
 Optimizer:
+  # Supported: Adam | AdamW | Momentum (alias SGD)
   name: Adam
   beta1: 0.9
   beta2: 0.999
   lr:
+    # Supported: Cosine | Step | Piecewise | Const
     name: Cosine
-    learning_rate: 0.0015  # Reduced learning rate for better convergence
-    warmup_epoch: 0  # Disable warmup causing low LR
+    learning_rate: 0.001
+    T_max: 30                 # cosine period, in epochs
+    eta_min: 0.0
+    # Linear warmup ramps warmup_start_lr -> learning_rate over warmup_epoch
+    # epochs. warmup_start_lr is absolute, NOT a fraction of learning_rate.
+    warmup_epoch: 5
+    warmup_start_lr: 1.0e-06
   regularizer:
     name: L2
     factor: 0.00001
 
 Architecture:
+  # PaddleOCR task type. Informational only for this trainer.
   model_type: rec
-  algorithm: Rosetta  # CNN+RNN compatible with CrossEntropyLoss
-  Transform: null
+  # THE selector. Supported: PP-OCRv4 | PP-OCRv5
+  #   PP-OCRv4 -> PPLCNetV3 backbone + SVTR encoder + CTC head
+  #   PP-OCRv5 -> PPHGNetV2 backbone + SVTR encoder + CTC head
+  algorithm: PP-OCRv4
   Backbone:
-    name: ResNet34_vd
+    name: PPLCNetV3
   Neck:
-    name: SequenceEncoder
-    hidden_size: 256
+    name: SVTREncoder
+    hidden_dim: 256
+    # Read by SVTREncoder via Architecture.Neck.Transformer.*
+    Transformer:
+      num_heads: 8
+      num_layers: 2
+      dropout: 0.1
   Head:
-    name: MultiHead
-    head_list:
-      - SARHead:
-          fc_decay: 0.00001
+    name: CTCHead
+    dropout: 0.1
+
 Loss:
-  name: CrossEntropyLoss  # Matches high-performance model training
+  # Supported: CTCLoss | CrossEntropyLoss
+  # CTCLoss is the default: it handles sequence alignment natively and is the
+  # better performer on this dataset. Must pair with PostProcess CTCLabelDecode.
+  name: CTCLoss
 
 PostProcess:
-  name: SARLabelDecode  # For CrossEntropyLoss
+  # CTCLabelDecode  <-> Loss: CTCLoss
+  # SARLabelDecode  <-> Loss: CrossEntropyLoss
+  name: CTCLabelDecode
   character_dict_path: ./configs/vin_dict.txt
   use_space_char: false
 
@@ -67,27 +113,6 @@ Train:
     data_dir: ./finetune_data/
     label_file_list:
       - ./finetune_data/train_labels.txt
-    transforms:
-      - DecodeImage:
-          img_mode: BGR
-          channel_first: false
-      - RecAug:
-      - MultiLabelEncode:
-          max_text_length: 17
-      - RecResizeImg:
-          image_shape: [3, 48, 320]
-      - RandomRotate:
-          max_angle: 5  # More rotation
-      - RandomDistort:
-          max_ratio: 0.8  # More distortion
-      - RandomContrast:
-          contrast_range: [0.8, 1.2]  # Add contrast variation
-      - KeepKeys:
-          keep_keys:
-            - image
-            - label      # CTC uses single label
-            - length
-            - valid_ratio
   loader:
     shuffle: true
     batch_size_per_card: 16
@@ -101,20 +126,6 @@ Eval:
     data_dir: ./finetune_data/
     label_file_list:
       - ./finetune_data/val_labels.txt
-    transforms:
-      - DecodeImage:
-          img_mode: BGR
-          channel_first: false
-      - MultiLabelEncode:
-          max_text_length: 17
-      - RecResizeImg:
-          image_shape: [3, 48, 320]
-      - KeepKeys:
-          keep_keys:
-            - image
-            - label      # CTC uses single label
-            - length
-            - valid_ratio
   loader:
     shuffle: false
     drop_last: false
@@ -128,20 +139,6 @@ Test:
     data_dir: ./finetune_data/
     label_file_list:
       - ./finetune_data/test_labels.txt
-    transforms:
-      - DecodeImage:
-          img_mode: BGR
-          channel_first: false
-      - MultiLabelEncode:
-          max_text_length: 17
-      - RecResizeImg:
-          image_shape: [3, 48, 320]
-      - KeepKeys:
-          keep_keys:
-            - image
-            - label      # CTC uses single label
-            - length
-            - valid_ratio
   loader:
     shuffle: false
     drop_last: false

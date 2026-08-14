@@ -112,10 +112,19 @@ class ProviderConfig:
 
 @dataclass
 class PaddleOCRConfig(ProviderConfig):
-    """PaddleOCR-specific configuration."""
+    """
+    PaddleOCR-specific configuration.
+
+    Field names map onto the PaddleOCR 3.x constructor except where noted.
+    """
     lang: str = "en"
     use_gpu: bool = True
     det_db_box_thresh: float = 0.3
+    # DEPRECATED / INERT: PaddleOCR 3.x removed `rec_thresh` (passing it raises
+    # "ValueError: Unknown argument"). It is retained only so existing configs
+    # and callers keep working, and is deliberately NOT forwarded to
+    # PaddleOCR() in initialize(). Filter low-confidence results downstream
+    # instead. Scheduled for removal in 2.0.
     rec_thresh: float = 0.3
     use_doc_orientation_classify: bool = False
     use_doc_unwarping: bool = False

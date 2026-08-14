@@ -56,13 +56,10 @@ clean:
 
 # Running
 run:
-	streamlit run src/vin_ocr/web/app_simple.py --server.port 8501
-
-run-full:
 	streamlit run src/vin_ocr/web/app.py --server.port 8501
 
 run-debug:
-	streamlit run src/vin_ocr/web/app_simple.py --server.port 8501 --logger.level=debug
+	streamlit run src/vin_ocr/web/app.py --server.port 8501 --logger.level=debug
 
 # Training
 train:
@@ -88,8 +85,8 @@ docker-run:
 
 # Data preparation
 prepare-data:
-	python scripts/prepare_dataset.py
-	python scripts/prepare_finetune_data.py
+	python -m src.vin_ocr.utils.prepare_dataset
+	python -m src.vin_ocr.utils.prepare_finetune_data
 
 # Quick validation
 validate:

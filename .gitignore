@@ -1,3 +1,36 @@
+# =============================================================================
+# SECRETS - never commit these
+# =============================================================================
+# Environment files
+.env
+.env.*
+!.env.example
+
+# DVC / DagsHub credentials (config.local holds access keys)
+.dvc/config.local
+.dvc/tmp/
+.dvc/cache/
+
+# SSH / signing keys
+keyjson
+keyjson.pub
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*_ed25519
+*_ed25519.pub
+
+# Cloud provider credentials
+.aws/
+credentials.json
+service-account*.json
+gcp-*.json
+
+# Streamlit persisted session state (contains absolute local paths)
+.streamlit_state.json
+.streamlit/secrets.toml
+
 # Python
 __pycache__/
 *.py[cod]
@@ -20,17 +53,14 @@ dev/
 # Cloned repositories (not tracked - clone locally)
 PaddleOCR/
 
-# Model outputs and training artifacts (large files)
+# Model outputs and training artifacts (large files - use LFS for weights)
 output/
 training_output/
 finetune_data/
-*.pdparams
-*.pdopt
 *.pdmodel
 *.pdiparams
 *.onnx
 *.pt
-*.pth
 *.bin
 *.safetensors
 

@@ -63,33 +63,22 @@ class VINInference:
         self.predictor = self._load_model()
         
     def _load_char_dict(self, dict_path: Optional[str] = None) -> Dict[str, int]:
-        """Load character dictionary."""
-        char_dict = {'<blank>': 0}
-        
-        # Try to find dict in model directory
-        if dict_path is None:
-            possible_dicts = [
-                self.model_dir / "vin_dict.txt",
-                self.model_dir.parent / "vin_dict.txt",
-                Path("configs/vin_dict.txt"),
-            ]
-            for p in possible_dicts:
-                if p.exists():
-                    dict_path = str(p)
-                    break
-        
-        if dict_path and Path(dict_path).exists():
-            with open(dict_path, 'r') as f:
-                for idx, line in enumerate(f, start=1):
-                    char = line.strip()
-                    if char:
-                        char_dict[char] = idx
-        else:
-            # Use default VIN charset
-            for idx, char in enumerate(VIN_CHARSET, start=1):
-                char_dict[char] = idx
-                
-        return char_dict
+        """
+        Load character dictionary.
+
+        Delegates to the shared loader so inference indices match training
+        exactly. The previous local implementation seeded {'<blank>': 0} and
+        then enumerated the file from 1, which re-mapped '<blank>' to 1 and
+        shifted every character up by one — decoding correct logits into
+        garbage (and dropping low indices entirely, yielding empty strings).
+        """
+        from src.vin_ocr.core.charset import load_char_dict
+
+        char_to_idx, _ = load_char_dict(
+            dict_path,
+            search_dirs=[self.model_dir, self.model_dir.parent],
+        )
+        return char_to_idx
     
     def _load_model(self):
         """Load the Paddle inference model."""

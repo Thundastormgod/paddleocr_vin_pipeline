@@ -133,7 +133,21 @@ class CLAHEConfig:
 
 @dataclass
 class OCRConfig:
-    """PaddleOCR configuration."""
+    """
+    Constructor arguments for the PaddleOCR engine.
+
+    NOTE: distinct from ``config.OCRConfig``, despite the shared name.
+
+        config.OCRConfig               Global, env-var-driven settings
+                                       (VIN_DET_BOX_THRESH, VIN_USE_GPU, ...).
+                                       Part of the PipelineConfig singleton.
+
+        vin_pipeline.OCRConfig (this)  The exact kwargs handed to PaddleOCR().
+                                       Populated *from* config.OCRConfig in
+                                       VINOCRPipeline.__init__.
+
+    Field names here must track the PaddleOCR 3.x constructor signature.
+    """
     lang: str = 'en'
     ocr_version: str = 'PP-OCRv3'  # Use v3 for better VIN recognition
     text_det_box_thresh: float = 0.3
@@ -157,22 +171,37 @@ INVALID_CHAR_FIXES: Dict[str, str] = {
     'Q': '0',
 }
 
-# Common artifact characters to remove - compiled patterns for performance
-ARTIFACT_PATTERNS: List[re.Pattern] = [
-    re.compile(r'^[*#XYT]+'),     # Artifacts at start
-    re.compile(r'[*#]+$'),         # Artifacts at end
-    re.compile(r'^[IYTFA][*#]*'),  # Common prefix artifacts
-]
+# Artifact characters to remove.
+#
+# An "artifact" is any character that cannot appear in a VIN at all — plate
+# borders, stamps, scratches and reflections produce these. Deliberately does
+# NOT include letters like X, Y, T, F or A: those are valid VIN characters and
+# stripping them corrupts legitimate VINs.
+#
+# (The previous patterns `^[*#XYT]+` and `^[IYTFA][*#]*` did exactly that; the
+# second matched with zero trailing artifacts, so any VIN beginning with
+# I/Y/T/F/A silently lost its first character.)
+ARTIFACT_CHARS: frozenset = frozenset('*#@$%^&()[]{}<>/\\|!?,;:"\'`~+=_ .-')
 
-# Position-based character confusion (for ambiguous cases)
-# Positions 12-17 (sequential number) should be digits
+# Matches any run of non-alphanumeric characters. I/O/Q are deliberately
+# allowed through so _fix_invalid_chars can map them to 1/0/0.
+_NON_VIN_RUN: re.Pattern = re.compile(r'[^0-9A-Z]+')
+
+# Position-based character confusion (for ambiguous cases).
+# Positions 12-17 hold the sequential production number, which is *usually*
+# numeric but is NOT required to be — manufacturers building fewer than 500
+# vehicles/year legitimately use letters here. Corrections below are therefore
+# applied only when they repair a failing check digit (see
+# _apply_position_corrections), never unconditionally.
 DIGIT_POSITIONS: frozenset = frozenset({12, 13, 14, 15, 16, 17})  # 1-indexed
 
-# Letter to digit mappings for sequential number section
+# Letter -> digit mappings for the sequential number section.
+# 'O', 'I' and 'Q' are absent: they are already handled by INVALID_CHAR_FIXES
+# before this stage, so listing them here would be dead entries.
 LETTER_TO_DIGIT_MAP: Dict[str, str] = {
     'S': '5', 'G': '6', 'B': '8', 'A': '4',
-    'L': '1', 'Z': '2', 'E': '3', 'O': '0',
-    'I': '1', 'D': '0', 'C': '6', 'T': '7',
+    'L': '1', 'Z': '2', 'E': '3', 'D': '0',
+    'C': '6', 'T': '7',
 }
 
 
@@ -430,14 +459,17 @@ class VINPostProcessor:
         }
     
     def _remove_artifacts(self, text: str) -> str:
-        """Remove common artifact characters."""
-        for pattern in ARTIFACT_PATTERNS:
-            text = pattern.sub('', text)
-        
-        # Remove any remaining artifact chars throughout
-        text = text.replace('*', '').replace('#', '')
-        
-        return text
+        """
+        Strip characters that cannot occur in a VIN.
+
+        Removes only non-alphanumeric noise (plate borders, stamps, scratches:
+        ``* # / | \\ - . space`` etc). Letters are never removed, so a VIN
+        legitimately starting with X, Y, T, F or A survives intact.
+
+        I/O/Q are intentionally preserved here — they are plausible OCR output
+        that the next step (_fix_invalid_chars) maps to 1/0/0.
+        """
+        return _NON_VIN_RUN.sub('', text)
     
     def _extract_vin_substring(self, text: str) -> str:
         """
@@ -465,21 +497,46 @@ class VINPostProcessor:
         return ''.join(result)
     
     def _apply_position_corrections(self, text: str) -> str:
-        """Apply position-based character corrections."""
+        """
+        Apply position-based letter->digit corrections to positions 12-17.
+
+        These corrections are a heuristic, not a VIN rule: the sequential
+        production number is only guaranteed numeric for manufacturers building
+        500+ vehicles/year. Applying them unconditionally corrupts otherwise
+        correct alphanumeric VINs.
+
+        So they are applied only when they *repair* the check digit:
+
+        1. If the VIN already passes its check digit, return it unchanged.
+        2. Otherwise try the corrected form; keep it only if it now passes.
+        3. If neither passes, return the original (no evidence either way).
+        """
         if len(text) != VIN_LENGTH:
             return text
-            
+
+        from src.vin_ocr.core.vin_utils import validate_checksum
+
+        # 1. Never touch a VIN that already validates.
+        if validate_checksum(text):
+            return text
+
         result = list(text)
-        
-        # Positions 12-17 should be digits (sequential number)
         for pos in DIGIT_POSITIONS:
             idx = pos - 1  # Convert to 0-indexed
-            if idx < len(result):
-                char = result[idx]
-                if char in LETTER_TO_DIGIT_MAP:
-                    result[idx] = LETTER_TO_DIGIT_MAP[char]
-        
-        return ''.join(result)
+            char = result[idx]
+            if char in LETTER_TO_DIGIT_MAP:
+                result[idx] = LETTER_TO_DIGIT_MAP[char]
+
+        corrected = ''.join(result)
+        if corrected == text:
+            return text
+
+        # 2/3. Accept the correction only if it makes the check digit valid.
+        if validate_checksum(corrected):
+            logger.debug(f"Position correction repaired check digit: {text} -> {corrected}")
+            return corrected
+
+        return text
     
     def _validate_checksum(self, vin: str) -> bool:
         """

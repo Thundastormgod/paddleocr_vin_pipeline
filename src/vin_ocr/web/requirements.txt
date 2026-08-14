@@ -146,8 +146,11 @@ onnx==1.17.0
 onnx_graphsurgeon==0.5.8
 onnxoptimizer==0.3.13
 onnxruntime==1.24.1
-opencv-contrib-python==4.10.0.84
-opencv-python==4.13.0.90
+# Exactly ONE opencv distribution. All three of opencv-python,
+# opencv-contrib-python and opencv-python-headless ship the same `cv2` module;
+# installing more than one leaves whichever pip unpacked last.
+# headless is correct for a server-side Streamlit app: this codebase makes no
+# cv2 GUI calls (imshow/waitKey/...), and it avoids pulling GUI libs into images.
 opencv-python-headless==4.13.0.92
 opentelemetry-api==1.38.0
 opentelemetry-proto==1.39.1

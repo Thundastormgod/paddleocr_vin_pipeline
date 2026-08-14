@@ -11,7 +11,8 @@ A streamlined web interface for VIN recognition with clear workflow:
 5. 🔧 System Health - Monitor system status
 
 Usage:
-    streamlit run src/vin_ocr/web/app_simple.py --server.port 8501
+    streamlit run src/vin_ocr/web/app.py --server.port 8501
+    # or:  make run      # or:  vin-ocr serve
 
 Author: VIN OCR Pipeline
 Date: February 2026

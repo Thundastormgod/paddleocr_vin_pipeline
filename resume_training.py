@@ -21,45 +21,96 @@ def main():
     print("🚀 Resuming VIN OCR Training with Fixed Configuration")
     print("=" * 60)
     
-    # Configuration - make these configurable via command line args
+    # Only essential arguments - no config overrides
     import argparse
     parser = argparse.ArgumentParser(description="Resume VIN OCR Training")
     parser.add_argument("--config", default="configs/vin_finetune_config.yml", 
                        help="Configuration file path (relative to project root)")
-    parser.add_argument("--checkpoint", default="src/vin_ocr/training/output/vin_rec_finetune/best_accuracy.pdparams",
-                       help="Checkpoint file path (relative to project root)")
-    parser.add_argument("--epochs", type=int, default=30,
-                       help="Total epochs (including previous)")
-    parser.add_argument("--batch-size", type=int, default=16,
-                       help="Batch size")
-    parser.add_argument("--lr", type=float, default=0.0015,
-                       help="Learning rate")
-    parser.add_argument("--device", default="cpu", choices=["cpu", "gpu"],
-                       help="Device to use (cpu/gpu)")
+    parser.add_argument("--checkpoint", 
+                       help="Specific checkpoint file path (relative to project root)")
+    parser.add_argument("--force-resume", action="store_true",
+                       help="Force resume from best checkpoint even if not found")
     
     args = parser.parse_args()
     
     print(f"📋 Configuration:")
     print(f"   Config: {args.config}")
-    print(f"   Resume from: {args.checkpoint}")
-    print(f"   Total epochs: {args.epochs}")
-    print(f"   Batch size: {args.batch_size}")
-    print(f"   Learning rate: {args.lr}")
-    print(f"   Device: {args.device.upper()}")
+    print(f"   Force resume: {args.force_resume}")
+    print(f"   All other settings from config file")
     
-    # Build command
+    # Build command - only config and resume, no CLI overrides
     cmd = [
         "python", "src/vin_ocr/training/finetune_paddleocr.py",
-        "--config", args.config,
-        "--resume", args.checkpoint,
-        "--epochs", str(args.epochs),
-        "--batch-size", str(args.batch_size),
-        "--lr", str(args.lr),
-        f"--{args.device}"
+        "--config", args.config
     ]
     
-    print(f"\n🎯 Command to run:")
+    # ENFORCED: Always try to use best checkpoint first
+    best_checkpoint = project_root / "output/vin_rec_finetune/best_accuracy.pdparams"
+    checkpoint_to_use = None
+    
+    # Priority 1: Force resume from best checkpoint
+    if args.force_resume:
+        if best_checkpoint.exists():
+            checkpoint_to_use = str(best_checkpoint.relative_to(project_root))
+            print(f"🎯 FORCE RESUME: Using best checkpoint: {checkpoint_to_use}")
+            print(f"📊 This checkpoint achieved 44.19% exact match accuracy")
+        else:
+            print(f"❌ Best checkpoint not found: {best_checkpoint}")
+            if args.checkpoint:
+                print("💡 Falling back to specified checkpoint...")
+            else:
+                print("💡 No fallback checkpoint available")
+    
+    # Priority 2: Use specified checkpoint
+    elif args.checkpoint:
+        checkpoint_file = project_root / args.checkpoint
+        if checkpoint_file.exists():
+            checkpoint_to_use = args.checkpoint
+            print(f"✅ Using specified checkpoint: {checkpoint_to_use}")
+        else:
+            print(f"❌ Specified checkpoint not found: {checkpoint_file}")
+            print("💡 Falling back to best checkpoint...")
+            if best_checkpoint.exists():
+                checkpoint_to_use = str(best_checkpoint.relative_to(project_root))
+                print(f"🎯 Using best checkpoint: {checkpoint_to_use}")
+    
+    # Priority 3: Auto-detect best checkpoint
+    else:
+        if best_checkpoint.exists():
+            checkpoint_to_use = str(best_checkpoint.relative_to(project_root))
+            print(f"✅ Auto-detected best checkpoint: {checkpoint_to_use}")
+            print(f"📊 This checkpoint achieved 44.19% exact match accuracy")
+        else:
+            print("❌ No best checkpoint found")
+            print("💡 Starting fresh training...")
+    
+    # ENFORCEMENT: Add resume flag if we have a checkpoint
+    if checkpoint_to_use:
+        cmd.extend(["--resume", checkpoint_to_use])
+        print(f"🔄 RESUME ENFORCED: Will resume from {checkpoint_to_use}")
+    else:
+        print("⚠️  NO CHECKPOINT: Starting fresh training")
+    
+    # ENFORCEMENT: Validate checkpoint exists before proceeding
+    if checkpoint_to_use:
+        checkpoint_path = project_root / checkpoint_to_use
+        if not checkpoint_path.exists():
+            print(f"❌ CRITICAL: Checkpoint validation failed: {checkpoint_path}")
+            print("💡 This should not happen - checkpoint was detected but not found!")
+            print("🔄 Falling back to fresh training...")
+            # Remove resume from command to prevent errors
+            if "--resume" in cmd:
+                resume_index = cmd.index("--resume")
+                cmd.pop(resume_index)  # Remove --resume
+                cmd.pop(resume_index)  # Remove checkpoint path
+            checkpoint_to_use = None
+        else:
+            print(f"✅ Checkpoint validation passed: {checkpoint_path}")
+            print(f"📁 File size: {checkpoint_path.stat().st_size:,} bytes")
+    
+    print(f"\n🎯 Final Command:")
     print(f"   {' '.join(cmd)}")
+    print(f"🎯 Resume Status: {'✅ Will resume' if checkpoint_to_use else '⚠️ Fresh start'}")
     
     # Check if config file exists
     config_file = project_root / args.config
@@ -75,17 +126,19 @@ def main():
         return 1
     
     # Check if checkpoint exists
-    checkpoint_file = project_root / args.checkpoint
-    if checkpoint_file.exists():
-        print(f"✅ Checkpoint found: {checkpoint_file}")
-    else:
-        print(f"❌ Checkpoint not found: {checkpoint_file}")
-        print("   💡 Suggestion: Make sure the path is relative to project root")
-        print(f"💡 Current project root: {project_root}")
-        print(f"💡 Looking for: {args.checkpoint}")
-        print("   Starting fresh training instead...")
-        cmd.remove("--resume")
-        cmd.remove(args.checkpoint)
+    if args.checkpoint:
+        checkpoint_file = project_root / args.checkpoint
+        if checkpoint_file.exists():
+            print(f"✅ Checkpoint found: {checkpoint_file}")
+        else:
+            print(f"❌ Checkpoint not found: {checkpoint_file}")
+            print("   💡 Suggestion: Make sure the path is relative to project root")
+            print(f"💡 Current project root: {project_root}")
+            print(f"💡 Looking for: {args.checkpoint}")
+            print("   Starting fresh training instead...")
+            # Remove resume arguments
+            cmd.remove("--resume")
+            cmd.remove(args.checkpoint)
     
     print(f"\n🏃 Starting training...")
     

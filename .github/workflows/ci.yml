@@ -1,0 +1,165 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Unit tests. Deliberately does NOT install paddlepaddle/paddleocr: the core
+  # package (VIN validation, charset, metrics, evaluation, postprocessing) is
+  # pure Python, and tests needing the heavy backends skip themselves.
+  # ---------------------------------------------------------------------------
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            pytest pytest-cov \
+            numpy "opencv-python-headless<5" Pillow \
+            pyyaml rapidfuzz tqdm
+
+      - name: Run tests
+        run: pytest -v --cov=src --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Static checks. Non-blocking for now: the existing codebase is not yet
+  # black/isort clean, so failing the build on style would block every PR.
+  # Remove continue-on-error once `make format` has been run across the tree.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: lint (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install linters
+        run: pip install black isort flake8
+
+      - name: black --check
+        continue-on-error: true
+        run: black --check src/ tests/
+
+      - name: isort --check-only
+        continue-on-error: true
+        run: isort --check-only src/ tests/
+
+      - name: flake8
+        continue-on-error: true
+        run: flake8 src/ tests/ --count --max-line-length=100 --statistics
+
+  # ---------------------------------------------------------------------------
+  # Guard against re-committing the credentials that previously leaked
+  # (an OpenSSH private key and DagsHub S3 keys in .dvc/config.local).
+  # ---------------------------------------------------------------------------
+  secrets-scan:
+    name: secrets scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail if credential files are tracked
+        run: |
+          set -e
+          bad=0
+          for pattern in \
+            'keyjson' \
+            '.dvc/config.local' \
+            '*.pem' \
+            'id_rsa*' \
+            'id_ed25519*' \
+            '.env'
+          do
+            matches=$(git ls-files "$pattern" || true)
+            if [ -n "$matches" ]; then
+              echo "::error::Credential file is tracked in git: $matches"
+              bad=1
+            fi
+          done
+          exit $bad
+
+      - name: Fail on private key material in tracked files
+        run: |
+          if git grep -I -l -E 'BEGIN (OPENSSH|RSA|EC|PGP) PRIVATE KEY' -- . ; then
+            echo "::error::Private key material found in tracked files"
+            exit 1
+          fi
+          echo "No private key material found."
+
+  # ---------------------------------------------------------------------------
+  # Verify the package builds and console scripts resolve.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build distribution
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Verify declared console scripts resolve to real modules
+        run: |
+          python - <<'PY'
+          import pathlib, sys, tomllib
+          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          scripts = data["project"]["scripts"]
+          failed = []
+          for name, target in scripts.items():
+              module = target.split(":")[0]
+              path = pathlib.Path(module.replace(".", "/") + ".py")
+              if not path.is_file():
+                  failed.append(f"{name} -> {target} (missing {path})")
+          if failed:
+              print("Broken console script entry points:")
+              for f in failed:
+                  print("  " + f)
+              sys.exit(1)
+          print(f"All {len(scripts)} console scripts resolve.")
+          PY

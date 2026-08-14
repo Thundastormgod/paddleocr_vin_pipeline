@@ -130,7 +130,12 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short"
+# -m "not e2e" keeps the default run hermetic; e2e tests need a live Streamlit
+# server plus a browser. Run them explicitly with:  pytest -m e2e
+addopts = "-v --tb=short -m 'not e2e'"
+markers = [
+    "e2e: end-to-end browser tests requiring a running Streamlit server on :8501",
+]
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::UserWarning",

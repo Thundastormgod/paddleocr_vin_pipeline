@@ -305,12 +305,41 @@ class TestVINPostProcessor:
         assert result['vin'] == "SAL1P9EU2SA606664"
         assert result['is_valid_length'] is True
     
-    def test_position_based_correction_sequential(self, postprocessor):
-        """Test that letters in sequential section are converted to digits."""
-        # Position 12-17 should prefer digits
-        result = postprocessor.process("SAL1P9EU2SA60S664", 0.9)
-        # S in position 14 should become 5
+    def test_position_correction_repairs_check_digit(self, postprocessor):
+        """
+        Letters in the sequential section are converted to digits when doing so
+        repairs the check digit.
+
+        SAL1P9EU8SA605664 is checksum-valid. Corrupting the '5' at position 14
+        to 'S' (a common engraved-plate confusion) breaks the checksum; the
+        corrector must restore it.
+        """
+        result = postprocessor.process("SAL1P9EU8SA60S664", 0.9)
+        assert result['vin'] == "SAL1P9EU8SA605664"
         assert result['vin'][13] == '5'  # 0-indexed position 13
+        assert result['checksum_valid'] is True
+
+    def test_position_correction_preserves_valid_vin(self, postprocessor):
+        """
+        A VIN that already passes its check digit must never be altered.
+
+        Positions 12-17 are only numeric for high-volume manufacturers, so
+        blindly forcing digits corrupts legitimate VINs.
+        """
+        valid_vin = "SAL1A2A40SA606662"
+        result = postprocessor.process(valid_vin, 0.9)
+        assert result['vin'] == valid_vin
+        assert result['checksum_valid'] is True
+
+    def test_position_correction_skipped_without_evidence(self, postprocessor):
+        """
+        When the correction does not repair the check digit there is no
+        evidence it is right, so the original is kept rather than guessed at.
+        """
+        # Neither the original nor the S->5 form is checksum-valid here.
+        result = postprocessor.process("SAL1P9EU2SA60S664", 0.9)
+        assert result['vin'] == "SAL1P9EU2SA60S664"
+        assert result['checksum_valid'] is False
     
     def test_lowercase_normalized(self, postprocessor):
         """Test that lowercase is normalized to uppercase."""

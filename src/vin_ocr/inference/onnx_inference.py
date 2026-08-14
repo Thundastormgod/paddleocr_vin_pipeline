@@ -114,21 +114,17 @@ class ONNXVINRecognizer:
         self._load_model()
         
     def _load_char_dict(self, dict_path: Optional[str] = None) -> Dict[str, int]:
-        """Load character dictionary."""
-        char_dict = {'<blank>': 0}  # CTC blank token
-        
-        if dict_path and Path(dict_path).exists():
-            with open(dict_path, 'r') as f:
-                for idx, line in enumerate(f, start=1):
-                    char = line.strip()
-                    if char:
-                        char_dict[char] = idx
-        else:
-            # Use default VIN charset
-            for idx, char in enumerate(self.config.charset, start=1):
-                char_dict[char] = idx
-                
-        return char_dict
+        """
+        Load character dictionary.
+
+        Delegates to the shared loader so inference indices match training
+        exactly. See src/vin_ocr/core/charset.py for why this must not be
+        reimplemented locally.
+        """
+        from src.vin_ocr.core.charset import load_char_dict
+
+        char_to_idx, _ = load_char_dict(dict_path)
+        return char_to_idx
     
     def _load_model(self):
         """Load ONNX model with appropriate execution provider."""

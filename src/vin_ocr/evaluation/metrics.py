@@ -545,7 +545,7 @@ class EvaluationMetricsCalculator:
                 pred_char = pred[i] if i < len(pred) else ''
                 true_char = true[i] if i < len(true) else ''
                 
-                if pred_char == true_char and pred_char != '':
+                if pred_char == true_char:
                     correct_chars += 1
                     position_correct[i + 1] += 1
                     char_tp[true_char] += 1
@@ -559,6 +559,11 @@ class EvaluationMetricsCalculator:
         # Calculate metrics
         char_accuracy = correct_chars / total_chars if total_chars > 0 else 0.0
         char_error_rate = 1.0 - char_accuracy
+        
+        # DEBUG: Print character calculation details
+        print(f"🔍 DEBUG CHAR METRICS: correct_chars={correct_chars}, total_chars={total_chars}, char_accuracy={char_accuracy}")
+        if self.predictions and self.ground_truth:
+            print(f"🔍 DEBUG CHAR SAMPLE: pred='{self.predictions[0][:10]}...', true='{self.ground_truth[0][:10]}...'")
         
         # Position accuracy
         position_accuracy = {

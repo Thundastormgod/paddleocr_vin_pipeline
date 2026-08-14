@@ -116,21 +116,37 @@ def cmd_serve(args):
 
 def cmd_export(args):
     """Export model to ONNX format."""
-    from scripts.reexport_and_convert_onnx import export_model_to_onnx
-    
+    # Use the in-package exporter. The previous import target
+    # (scripts.reexport_and_convert_onnx) is not an importable package —
+    # scripts/ has no __init__.py and is not installed with the wheel.
+    try:
+        from src.vin_ocr.training.export_onnx import export_paddle_to_onnx
+    except ImportError as exc:
+        print(f"Error: ONNX export requires the 'onnx' extra: {exc}")
+        print("Install with: pip install -e '.[onnx]'")
+        return 1
+
     model_path = args.model
     output_path = args.output
-    
+
     print(f"Exporting {model_path} to {output_path}...")
-    
-    result = export_model_to_onnx(model_path, output_path)
-    
+
+    try:
+        result = export_paddle_to_onnx(
+            model_path=model_path,
+            output_dir=output_path,
+            opset_version=args.opset,
+        )
+    except Exception as exc:
+        print(f"Export failed: {exc}")
+        return 1
+
     if result:
         print(f"Successfully exported to: {result}")
         return 0
-    else:
-        print("Export failed")
-        return 1
+
+    print("Export failed")
+    return 1
 
 
 def main():
@@ -165,6 +181,8 @@ def main():
     export_parser = subparsers.add_parser('export', help='Export model to ONNX')
     export_parser.add_argument('model', help='Path to Paddle model (.pdparams)')
     export_parser.add_argument('output', help='Output directory for ONNX')
+    export_parser.add_argument('--opset', type=int, default=11,
+                               help='ONNX opset version (default: 11)')
     
     args = parser.parse_args()
     

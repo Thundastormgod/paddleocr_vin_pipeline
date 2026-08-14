@@ -1,0 +1,20 @@
+{
+  "trial_number": 12,
+  "params": {
+    "learning_rate": 0.0005090807130444007,
+    "scheduler_type": "CosineAnnealingDecay",
+    "T_max": 26,
+    "warmup_epoch": 5,
+    "beta1": 0.9176818058095615,
+    "beta2": 0.9916440711171302,
+    "regularizer_factor": 3.736378917620724e-05,
+    "batch_size": 8,
+    "patience": 10,
+    "min_delta": 0.0028670694393643907
+  },
+  "accuracy": 0.0,
+  "character_accuracy": 0.5923392612859097,
+  "f1_micro": 0.5923392612859097,
+  "training_time": 330.7965450286865,
+  "final_epoch": 30
+}

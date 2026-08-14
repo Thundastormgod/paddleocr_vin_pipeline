@@ -6,12 +6,26 @@ Tests for VIN OCR Inference Module
 Tests for both ONNX and Paddle inference backends.
 """
 
+import importlib.util
+
 import pytest
 import numpy as np
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
 import tempfile
 import os
+
+# paddle and onnxruntime are optional heavy backends. Tests that exercise real
+# loader behaviour must skip when they are absent rather than fail with
+# ModuleNotFoundError.
+requires_paddle = pytest.mark.skipif(
+    importlib.util.find_spec("paddle") is None,
+    reason="paddlepaddle not installed (optional backend)",
+)
+requires_onnxruntime = pytest.mark.skipif(
+    importlib.util.find_spec("onnxruntime") is None,
+    reason="onnxruntime not installed (optional backend)",
+)
 
 
 class TestVINInference:
@@ -22,6 +36,7 @@ class TestVINInference:
         from src.vin_ocr.inference import VINInference
         assert VINInference is not None
     
+    @requires_paddle
     def test_vin_inference_init_missing_model(self):
         """Test that VINInference raises error for missing model."""
         from src.vin_ocr.inference.paddle_inference import VINInference
@@ -124,6 +139,7 @@ class TestONNXInference:
         
         assert VIN_CHARSET == PADDLE_CHARSET
     
+    @requires_onnxruntime
     def test_load_onnx_model_missing_file(self):
         """Test that load_onnx_model raises error for missing file."""
         from src.vin_ocr.inference import load_onnx_model

@@ -5,11 +5,22 @@ Tests for OCR Providers Module
 Unit tests for the multi-provider OCR abstraction layer.
 """
 
+import importlib.util
+
 import pytest
 import numpy as np
 from unittest.mock import Mock, patch, MagicMock
 from pathlib import Path
 from typing import Optional
+
+# PaddleOCR is an optional heavy backend. Tests that assert a *live* provider is
+# usable must skip when it is absent rather than fail — the rest of the suite is
+# pure-Python and must stay runnable without it.
+PADDLEOCR_INSTALLED = importlib.util.find_spec("paddleocr") is not None
+requires_paddleocr = pytest.mark.skipif(
+    not PADDLEOCR_INSTALLED,
+    reason="paddleocr not installed (optional backend); install with pip install paddleocr",
+)
 
 from src.vin_ocr.providers.ocr_providers import (
     OCRProviderType,
@@ -173,10 +184,15 @@ class TestPaddleOCRProvider:
         provider = PaddleOCRProvider()
         assert provider.name == "PaddleOCR"
     
-    def test_is_available(self):
-        """Test availability check."""
+    def test_is_available_returns_bool(self):
+        """is_available must always answer, regardless of backend presence."""
         provider = PaddleOCRProvider()
-        # Should be True since PaddleOCR is installed in the environment
+        assert isinstance(provider.is_available, bool)
+
+    @requires_paddleocr
+    def test_is_available(self):
+        """Test availability check when the backend is actually installed."""
+        provider = PaddleOCRProvider()
         assert provider.is_available == True
     
     def test_load_image_from_array(self):
@@ -435,11 +451,19 @@ class TestEnsembleOCRProvider:
         winner = ensemble._cascade_strategy(results)
         assert winner.confidence == 0.9  # Falls back to best
     
+    @requires_paddleocr
     def test_is_available_any_provider(self):
-        """Test availability check."""
+        """Ensemble is available when at least one member provider is."""
         p1 = PaddleOCRProvider()
         ensemble = EnsembleOCRProvider(providers=[p1])
         assert ensemble.is_available == True
+
+    def test_is_available_false_when_no_provider_available(self):
+        """Ensemble reports unavailable when no member provider is usable."""
+        unavailable = Mock(spec=OCRProvider)
+        unavailable.is_available = False
+        ensemble = EnsembleOCRProvider(providers=[unavailable])
+        assert ensemble.is_available == False
 
 
 # =============================================================================
@@ -585,6 +609,7 @@ class TestRetryBehavior:
 class TestProviderIntegration:
     """Integration tests with mocking."""
     
+    @requires_paddleocr
     @patch('paddleocr.PaddleOCR')
     def test_paddleocr_full_flow(self, mock_paddleocr_class):
         """Test full PaddleOCR flow with mock."""

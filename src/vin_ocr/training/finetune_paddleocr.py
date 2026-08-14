@@ -370,41 +370,32 @@ class VINRecognitionDataset(Dataset):
         
         # Encode label
         encoded_label = self._encode_label(label)
+        # True (unpadded) target length. CTCLoss needs this to know where the
+        # real target ends; using len(encoded_label) would always report the
+        # padded width (max_text_length) and corrupt the loss for short labels.
         label_length = min(len(label), self.max_text_length)
-        
+
         return {
             'image': image,
-            'label': encoded_label,  # Fixed-length for CrossEntropyLoss
-            'length': np.array([len(encoded_label)], dtype=np.int32),
+            'label': encoded_label,  # Fixed-length, zero-padded
+            'length': np.array([label_length], dtype=np.int32),
             'text': label
         }
 
 
 def load_char_dict(dict_path: str) -> Tuple[Dict[str, int], Dict[int, str]]:
-    """Load character dictionary with path resolution."""
-    # Resolve path relative to project root
-    dict_file = Path(dict_path)
-    if not dict_file.is_absolute():
-        # Try relative to project root first
-        project_root = Path(__file__).parent.parent.parent.parent
-        dict_file = project_root / dict_path
-        if not dict_file.exists():
-            # Try relative to current directory
-            dict_file = Path(dict_path)
-    
-    if not dict_file.exists():
-        raise FileNotFoundError(f"Character dictionary not found: {dict_path} (tried: {dict_file})")
-    
-    char_to_idx = {}
-    idx_to_char = {}
-    
-    with open(dict_file, 'r') as f:
-        for idx, line in enumerate(f):
-            char = line.strip()
-            if char:
-                char_to_idx[char] = idx
-                idx_to_char[idx] = char
-    
+    """
+    Load the character dictionary.
+
+    Delegates to src.vin_ocr.core.charset.load_char_dict so that training and
+    both inference backends share one mapping. Divergence here silently
+    corrupts every prediction.
+    """
+    from src.vin_ocr.core.charset import load_char_dict as _load
+
+    char_to_idx, idx_to_char = _load(dict_path)
+    if not char_to_idx:
+        raise FileNotFoundError(f"Character dictionary not found or empty: {dict_path}")
     return char_to_idx, idx_to_char
 
 
@@ -531,9 +522,9 @@ class SVTREncoder(nn.Layer):
         self,
         in_channels: int = 512,
         hidden_dim: int = 256,
-        num_heads: int = 8,
-        num_layers: int = 2,
-        dropout: float = 0.1
+        num_heads: int = None,  # From config
+        num_layers: int = None,  # From config
+        dropout: float = None    # From config
     ):
         super().__init__()
         
@@ -616,19 +607,24 @@ class VINRecognitionModel(nn.Layer):
         self.backbone = PPLCNetV3Backbone(in_channels=3)
         
         # SVTR transformer neck for sequence modeling
+        # Get transformer config from Architecture section
+        neck_config = config.get('Architecture', {}).get('Neck', {})
+        transformer_config = neck_config.get('Transformer', {})
+        
         self.neck = SVTREncoder(
             in_channels=self.backbone.out_channels,
             hidden_dim=hidden_dim,
-            num_heads=8,
-            num_layers=2,
-            dropout=0.1
+            num_heads=transformer_config.get('num_heads', 8),
+            num_layers=transformer_config.get('num_layers', 2),
+            dropout=transformer_config.get('dropout', 0.1)
         )
         
         # CTC head
+        head_config = config.get('Architecture', {}).get('Head', {})
         self.head = CTCHead(
             in_channels=self.neck.out_channels,
             num_classes=num_classes,
-            dropout=0.1
+            dropout=head_config.get('dropout', 0.1)
         )
         
         # Initialize weights (skip in Paddle 3.x as it's handled automatically)
@@ -942,6 +938,7 @@ class VINFineTuner:
         self.global_step = 0
         self.current_epoch = 0
         self.best_accuracy = 0.0
+        self.epochs_without_improvement = 0
         
         # Graceful shutdown support
         self._setup_signal_handlers()
@@ -969,33 +966,59 @@ class VINFineTuner:
         self.num_classes = len(self.char_to_idx)
         logger.info(f"Character dictionary: {self.num_classes} classes")
         
-        # Configure out_channels_list for MultiHead (required by PaddleOCR)
-        # This maps decoder types to their output channel requirements
-        if 'Head' in config['Architecture'] and config['Architecture']['Head'].get('name') == 'MultiHead':
-            out_channels_list = {
-                'CTCLabelDecode': self.num_classes,
-                'SARLabelDecode': self.num_classes + 2,  # +2 for start/end tokens
-                'NRTRLabelDecode': self.num_classes + 3,  # +3 for start/end/padding
-            }
-            config['Architecture']['Head']['out_channels_list'] = out_channels_list
-            logger.info(f"Configured out_channels_list: {out_channels_list}")
-        
         # Build model
         self.model = self._build_model()
         
         # Build optimizer
         self.optimizer, self.lr_scheduler = self._build_optimizer()
         
-        # Loss function
-        # Use CrossEntropyLoss to match high-performance model training
-        # CrossEntropyLoss is more stable in current PaddlePaddle and matches the actual training method used for the high-performance model
-        self.use_ctc = False  # Use CrossEntropyLoss (matches high-performance model)
+        # Loss function - driven by config['Loss']['name'], NOT hardcoded.
+        #
+        # Supported values:
+        #   CTCLoss          -> nn.CTCLoss   (blank=0, matches vin_dict.txt <blank> at index 0)
+        #   CrossEntropyLoss -> nn.CrossEntropyLoss (fixed-length positional decode)
+        #
+        # The decode path (_decode_predictions) and the training/validation loss
+        # paths all branch on self.use_ctc, so this single switch keeps the
+        # architecture, loss and decoder aligned.
+        loss_name = str(config.get('Loss', {}).get('name', 'CTCLoss'))
+        loss_key = loss_name.replace('_', '').replace('-', '').lower()
+
+        if loss_key in ('ctcloss', 'ctc'):
+            self.use_ctc = True
+        elif loss_key in ('crossentropyloss', 'crossentropy', 'ce'):
+            self.use_ctc = False
+        else:
+            raise ValueError(
+                f"Unsupported Loss.name={loss_name!r}. "
+                "Expected one of: CTCLoss, CrossEntropyLoss."
+            )
+
+        # Fail fast if the PostProcess decoder contradicts the loss, otherwise
+        # training silently optimises one objective and decodes with another.
+        postprocess_name = str(config.get('PostProcess', {}).get('name', ''))
+        if postprocess_name:
+            pp_key = postprocess_name.lower()
+            if self.use_ctc and 'ctc' not in pp_key:
+                raise ValueError(
+                    f"Architecture mismatch: Loss.name={loss_name!r} requires a CTC "
+                    f"decoder but PostProcess.name={postprocess_name!r}. "
+                    "Use PostProcess.name: CTCLabelDecode."
+                )
+            if not self.use_ctc and 'ctc' in pp_key:
+                raise ValueError(
+                    f"Architecture mismatch: Loss.name={loss_name!r} requires a "
+                    f"non-CTC decoder but PostProcess.name={postprocess_name!r}. "
+                    "Use PostProcess.name: SARLabelDecode."
+                )
+
         if self.use_ctc:
+            # blank index 0 matches the '<blank>' entry at line 1 of vin_dict.txt
             self.criterion = nn.CTCLoss(blank=0, reduction='mean')
-            logger.info("Using CTCLoss (matches CTC model)")
+            logger.info("Loss: CTCLoss (blank=0) — CTC greedy decoding enabled")
         else:
             self.criterion = nn.CrossEntropyLoss(reduction='mean', ignore_index=0)
-            logger.info("Using CrossEntropyLoss (matches high-performance model)")
+            logger.info("Loss: CrossEntropyLoss (ignore_index=0) — positional decoding enabled")
         
         # Mixed precision
         self.use_amp = config['Global'].get('use_amp', False)
@@ -1054,24 +1077,53 @@ class VINFineTuner:
         """Reset shutdown flag (useful for testing)."""
         cls._shutdown_requested = False
     
+    # Architectures actually implemented in this module. Selected via
+    # config['Architecture']['algorithm'].
+    SUPPORTED_ARCHITECTURES = {
+        'pp-ocrv4': 'PPLCNetV3 backbone + SVTR encoder + CTC head',
+        'pp-ocrv5': 'PPHGNetV2 backbone + SVTR encoder + CTC head',
+    }
+
     def _build_model(self) -> nn.Layer:
         """
         Build and optionally load pretrained model.
-        
-        Supports architectures:
-        - PP-OCRv5: State-of-the-art (2024) with PPHGNetV2 backbone
-        - PP-OCRv4/SVTR_LCNet: Production-ready with PPLCNetV3 backbone
-        - CRNN: Classic architecture
+
+        The architecture is selected by `Architecture.algorithm`. Only the
+        architectures in SUPPORTED_ARCHITECTURES are implemented here; anything
+        else raises rather than silently constructing a different network
+        (which previously made the YAML's declared architecture a no-op).
         """
-        # Get architecture from config (default to PP-OCRv4)
-        architecture = self.config.get('Architecture', {}).get('model_type', 'PP-OCRv4')
-        
-        if architecture in ['PP-OCRv5', 'PP_OCRv5']:
-            logger.info("Building PP-OCRv5 model (state-of-the-art 2024)...")
+        arch_config = self.config.get('Architecture', {})
+
+        # `algorithm` is the real selector. `model_type` in PaddleOCR configs
+        # means the task ("rec"/"det"/"cls"), not the network, so it is only
+        # used as a fallback when it names a known architecture.
+        architecture = arch_config.get('algorithm')
+        if not architecture:
+            fallback = str(arch_config.get('model_type', ''))
+            architecture = fallback if fallback.lower() in self.SUPPORTED_ARCHITECTURES else 'PP-OCRv4'
+
+        arch_key = str(architecture).replace('_', '-').lower()
+
+        if arch_key not in self.SUPPORTED_ARCHITECTURES:
+            supported = '\n'.join(
+                f"    {name:<12} {desc}" for name, desc in self.SUPPORTED_ARCHITECTURES.items()
+            )
+            raise ValueError(
+                f"Architecture.algorithm={architecture!r} is not implemented by "
+                f"finetune_paddleocr.py.\n"
+                f"This trainer builds its own paddle.nn networks; it does not load "
+                f"PaddleOCR's model zoo (Rosetta, CRNN, SVTR, ABINet, ...).\n"
+                f"Supported values:\n{supported}\n"
+                f"To train a PaddleOCR model-zoo architecture, use PaddleOCR's own "
+                f"tools/train.py with that config instead."
+            )
+
+        if arch_key == 'pp-ocrv5':
+            logger.info("Architecture: PP-OCRv5 (PPHGNetV2 + SVTR + CTC head)")
             model = PPOCRv5RecognitionModel(self.config, self.num_classes)
         else:
-            # Default to PP-OCRv4 compatible architecture
-            logger.info("Building PP-OCRv4 compatible model (VINRecognitionModel)...")
+            logger.info("Architecture: PP-OCRv4 (PPLCNetV3 + SVTR + CTC head)")
             model = VINRecognitionModel(self.config, self.num_classes)
         
         # Load pretrained weights if specified
@@ -1103,53 +1155,114 @@ class VINFineTuner:
     
     def _build_optimizer(self) -> Tuple[optim.Optimizer, Any]:
         """
-        Build optimizer with learning rate scheduler INCLUDING WARMUP.
-        
-        Implements: LinearWarmup -> CosineAnnealing decay
+        Build optimizer and LR scheduler from config['Optimizer'].
+
+        Honours the declared scheduler instead of hardcoding one. Supported
+        `Optimizer.lr.name` values:
+
+            Cosine / CosineAnnealingDecay -> optim.lr.CosineAnnealingDecay
+            Step / StepDecay              -> optim.lr.StepDecay
+            Piecewise / PiecewiseDecay    -> optim.lr.PiecewiseDecay
+            Const / Constant              -> plain float (no decay)
+
+        If `warmup_epoch > 0`, the scheduler is wrapped in optim.lr.LinearWarmup
+        starting from `warmup_start_lr` (default 1e-6, NOT a fraction of base_lr
+        — deriving it as base_lr*0.01 is what caused the documented
+        "LR jumps 100x at epoch 2" instability).
+
+        The returned scheduler is stepped once per epoch by train_epoch().
         """
         opt_config = self.config['Optimizer']
-        
-        # Learning rate scheduler config
-        lr_config = opt_config['lr']
-        base_lr = lr_config['learning_rate']
-        warmup_epoch = lr_config.get('warmup_epoch', 0)  # No warmup for stable training
-        epochs = self.config['Global']['epoch_num']
-        
-        # Use cosine annealing (matches high-performance model)
-        t_max = max(1, epochs - warmup_epoch)
-        
-        # Calculate warmup steps (using estimated steps per epoch)
-        batch_size = self.config['Train']['loader'].get('batch_size_per_card', 64)
-        # Estimate dataset size (will be updated after dataloader creation)
-        estimated_steps_per_epoch = max(1, len(self.train_loader)) if hasattr(self, 'train_loader') else 1000
-        warmup_steps = max(1, warmup_epoch * estimated_steps_per_epoch)
-        
-        # Cosine annealing base scheduler
-        cosine_scheduler = optim.lr.CosineAnnealingDecay(
-            learning_rate=base_lr,
-            T_max=t_max,  # Cosine decay after warmup
-        )
-        
-        # Wrap with linear warmup
-        lr_scheduler = optim.lr.LinearWarmup(
-            learning_rate=cosine_scheduler,
-            warmup_steps=warmup_steps,
-            start_lr=base_lr * 0.1,  # Start at 10% of base LR
-            end_lr=base_lr
-        )
-        
-        # Optimizer with weight decay
-        weight_decay = opt_config.get('regularizer', {}).get('factor', 1e-5)
-        
-        # Create optimizer first
-        optimizer = optim.Adam(
-            parameters=self.model.parameters(),
-            learning_rate=lr_scheduler,
-            beta1=opt_config.get('beta1', 0.9),
-            beta2=opt_config.get('beta2', 0.999),
-            weight_decay=opt_config.get('regularizer', {}).get('factor', 1e-5)
-        )
-        
+        lr_config = opt_config.get('lr', {})
+        base_lr = float(lr_config.get('learning_rate', 1e-3))
+        epochs = int(self.config['Global']['epoch_num'])
+
+        sched_name = str(lr_config.get('name', 'Cosine'))
+        sched_key = sched_name.replace('_', '').replace('-', '').lower()
+
+        if sched_key in ('cosine', 'cosineannealingdecay'):
+            t_max = int(lr_config.get('T_max', epochs))
+            eta_min = float(lr_config.get('eta_min', 0.0))
+            lr_scheduler = optim.lr.CosineAnnealingDecay(
+                learning_rate=base_lr, T_max=max(1, t_max), eta_min=eta_min
+            )
+            logger.info(f"LR scheduler: CosineAnnealingDecay(T_max={t_max}, eta_min={eta_min})")
+
+        elif sched_key in ('step', 'stepdecay'):
+            step_size = int(lr_config.get('step_size', max(1, epochs // 10)))
+            gamma = float(lr_config.get('gamma', lr_config.get('step_decay_gamma', 0.9)))
+            lr_scheduler = optim.lr.StepDecay(
+                learning_rate=base_lr, step_size=max(1, step_size), gamma=gamma
+            )
+            logger.info(f"LR scheduler: StepDecay(step_size={step_size}, gamma={gamma})")
+
+        elif sched_key in ('piecewise', 'piecewisedecay'):
+            boundaries = [int(b) for b in lr_config.get('boundaries', [])]
+            values = [float(v) for v in lr_config.get('values', [base_lr])]
+            if len(values) != len(boundaries) + 1:
+                raise ValueError(
+                    f"PiecewiseDecay requires len(values) == len(boundaries)+1, "
+                    f"got {len(values)} values and {len(boundaries)} boundaries."
+                )
+            lr_scheduler = optim.lr.PiecewiseDecay(boundaries=boundaries, values=values)
+            logger.info(f"LR scheduler: PiecewiseDecay(boundaries={boundaries})")
+
+        elif sched_key in ('const', 'constant', 'fixed'):
+            lr_scheduler = optim.lr.LRScheduler(learning_rate=base_lr)
+            logger.info(f"LR scheduler: constant({base_lr})")
+
+        else:
+            raise ValueError(
+                f"Unsupported Optimizer.lr.name={sched_name!r}. Expected one of: "
+                "Cosine, Step, Piecewise, Const."
+            )
+
+        # Optional linear warmup
+        warmup_epoch = int(lr_config.get('warmup_epoch', 0) or 0)
+        if warmup_epoch > 0:
+            warmup_start_lr = float(lr_config.get('warmup_start_lr', 1e-6))
+            lr_scheduler = optim.lr.LinearWarmup(
+                learning_rate=lr_scheduler,
+                warmup_steps=warmup_epoch,   # stepped per-epoch
+                start_lr=warmup_start_lr,
+                end_lr=base_lr,
+            )
+            logger.info(
+                f"LR warmup: LinearWarmup({warmup_epoch} epochs, "
+                f"{warmup_start_lr:g} -> {base_lr:g})"
+            )
+
+        # Optimizer selection
+        opt_name = str(opt_config.get('name', 'Adam'))
+        opt_key = opt_name.lower()
+        weight_decay = float(opt_config.get('regularizer', {}).get('factor', 1e-5))
+        beta1 = float(opt_config.get('beta1', 0.9))
+        beta2 = float(opt_config.get('beta2', 0.999))
+        params = self.model.parameters()
+
+        if opt_key == 'adam':
+            optimizer = optim.Adam(
+                parameters=params, learning_rate=lr_scheduler,
+                beta1=beta1, beta2=beta2, weight_decay=weight_decay,
+            )
+        elif opt_key == 'adamw':
+            optimizer = optim.AdamW(
+                parameters=params, learning_rate=lr_scheduler,
+                beta1=beta1, beta2=beta2, weight_decay=weight_decay,
+            )
+        elif opt_key in ('momentum', 'sgd'):
+            optimizer = optim.Momentum(
+                parameters=params, learning_rate=lr_scheduler,
+                momentum=float(opt_config.get('momentum', 0.9)),
+                weight_decay=weight_decay,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported Optimizer.name={opt_name!r}. "
+                "Expected one of: Adam, AdamW, Momentum/SGD."
+            )
+
+        logger.info(f"Optimizer: {opt_name}(lr={base_lr:g}, weight_decay={weight_decay:g})")
         return optimizer, lr_scheduler
     
     def _build_dataloaders(self) -> Tuple[DataLoader, DataLoader]:
@@ -1270,18 +1383,23 @@ class VINFineTuner:
                 break
             
             images = paddle.to_tensor(batch['image'])
-            labels = paddle.to_tensor(batch['label'], dtype='int64')  # CrossEntropyLoss needs int64
-            targets = batch['text']          # Forward pass
+            targets = batch['text']
+
+            # Forward pass
             logits = self.model(images)  # [B, T, C]
-            
+
             if self.use_ctc:
-                # CTC Loss path - ensure all tensors are int32
-                lengths = paddle.to_tensor([len(label) for label in batch['label']], dtype='int32')
+                # CTC path: PaddlePaddle's CTCLoss requires int32 for BOTH the
+                # label tensor and the length tensors. Passing int64 labels is
+                # what produced the long-standing "data type mismatch" failure.
+                labels = paddle.to_tensor(batch['label'], dtype='int32')
+                target_lengths = paddle.to_tensor(batch['length'], dtype='int32').reshape([-1])
                 log_probs = F.log_softmax(logits, axis=-1)
                 log_probs = log_probs.transpose([1, 0, 2])  # [T, B, C] for CTC
                 input_lengths = paddle.full([logits.shape[0]], logits.shape[1], dtype='int32')
-                loss = self.criterion(log_probs, labels, input_lengths, lengths)
+                loss = self.criterion(log_probs, labels, input_lengths, target_lengths)
             else:
+                labels = paddle.to_tensor(batch['label'], dtype='int64')  # CrossEntropyLoss needs int64
                 # Cross-Entropy Loss path (simpler, works for fixed-length VINs)
                 # Take only first max_text_length outputs to match label length
                 max_len = labels.shape[1]  # 17 for VINs
@@ -1334,30 +1452,23 @@ class VINFineTuner:
         
         for batch in self.val_loader:
             images = paddle.to_tensor(batch['image'])
-            labels = paddle.to_tensor(batch['label'], dtype='int64')  # CrossEntropyLoss needs int64
             targets = batch['text']
-            
+
             # Forward
             logits = self.model(images)  # [B, T, C]
-            
+
             if self.use_ctc:
-                # CTC Loss path - handle variable length labels
-                # Pad labels to same length for batch processing
-                max_label_len = max(len(label) for label in batch['label'])
-                padded_labels = []
-                for label in batch['label']:
-                    padded = np.zeros(max_label_len, dtype=np.int32)
-                    padded[:len(label)] = label
-                    padded_labels.append(padded)
-                labels = paddle.to_tensor(padded_labels, dtype='int32')
-                
-                lengths = paddle.to_tensor(batch['length'], dtype='int32')
+                # Labels are already fixed-width zero-padded by the dataset, so
+                # no re-padding is needed. int32 is mandatory for Paddle CTCLoss.
+                labels = paddle.to_tensor(batch['label'], dtype='int32')
+                target_lengths = paddle.to_tensor(batch['length'], dtype='int32').reshape([-1])
                 log_probs = F.log_softmax(logits, axis=-1)
                 log_probs_ctc = log_probs.transpose([1, 0, 2])
                 input_lengths = paddle.full([logits.shape[0]], logits.shape[1], dtype='int32')
-                loss = self.criterion(log_probs_ctc, labels, input_lengths, lengths)
+                loss = self.criterion(log_probs_ctc, labels, input_lengths, target_lengths)
             else:
                 # Cross-Entropy Loss path
+                labels = paddle.to_tensor(batch['label'], dtype='int64')  # CrossEntropyLoss needs int64
                 max_len = labels.shape[1]
                 logits_trimmed = logits[:, :max_len, :]
                 batch_size, seq_len, num_classes = logits_trimmed.shape
@@ -1377,6 +1488,11 @@ class VINFineTuner:
         # Calculate comprehensive metrics
         print(f"🔍 DEBUG: Validation started - predictions={len(all_predictions)}, targets={len(all_targets)}")
         if all_predictions and all_targets:
+            # DEBUG: Check for dataset issues
+            unique_targets = set(all_targets)
+            print(f"🔍 DEBUG: Unique targets in validation: {len(unique_targets)}")
+            print(f"🔍 DEBUG: Sample unique targets: {list(unique_targets)[:5]}")
+            
             print(f"🔍 DEBUG: Sample prediction: '{all_predictions[0]}' (len={len(all_predictions[0])})")
             print(f"🔍 DEBUG: Sample target: '{all_targets[0]}' (len={len(all_targets[0])})")
             print(f"🔍 DEBUG: Total predictions: {len(all_predictions)}, Total targets: {len(all_targets)}")
@@ -1401,6 +1517,13 @@ class VINFineTuner:
         for key, value in metrics.items():
             if isinstance(value, (int, float)):
                 print(f"🔍 DEBUG: {key}: {value}")
+        
+        # DEBUG: Check if character metrics are being lost
+        if 'char_accuracy' in metrics:
+            print(f"🔍 DEBUG: Char accuracy found in metrics: {metrics['char_accuracy']}")
+        else:
+            print("🔍 DEBUG: char_accuracy NOT found in metrics dict!")
+            print(f"🔍 DEBUG: Available keys: {[k for k in metrics.keys() if 'char' in k.lower()]}")
         
         if len(all_predictions) > 0:
             print(f"  📊 Image-Level: {metrics.get('correct_images', 0)}/{metrics.get('total_images', 0)} correct ({accuracy:.4f})")
@@ -1427,10 +1550,27 @@ class VINFineTuner:
             - Industry: cer, word_accuracy, valid_vin_rate
         """
         try:
-            from ..evaluation.metrics import EvaluationMetricsCalculator
+            print("🔍 DEBUG: Attempting to import EvaluationMetricsCalculator...")
+            # Use absolute import instead of relative
+            import sys
+            import os
+            # Add the project root to path if not already there
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+            
+            from src.vin_ocr.evaluation.metrics import EvaluationMetricsCalculator
+            print("🔍 DEBUG: Import successful!")
             calc = EvaluationMetricsCalculator()
+            print("🔍 DEBUG: Calculator instantiated!")
             calc.add_batch(predictions, targets)
+            print("🔍 DEBUG: Batch added!")
             full_metrics = calc.compute()
+            print("🔍 DEBUG: Metrics computed!")
+            print(f"🔍 DEBUG: Full metrics type: {type(full_metrics)}")
+            print(f"🔍 DEBUG: Has char_accuracy: {hasattr(full_metrics, 'character_level')}")
+            if hasattr(full_metrics, 'character_level'):
+                print(f"🔍 DEBUG: Char accuracy value: {full_metrics.character_level.char_accuracy}")
             
             return {
                 # Image-level
@@ -1456,7 +1596,13 @@ class VINFineTuner:
                 # Full metrics object for detailed reporting
                 '_full_metrics': full_metrics,
             }
-        except ImportError:
+        except ImportError as e:
+            print(f"🔍 DEBUG: ImportError caught: {e}")
+            print("🔍 DEBUG: Falling back to basic metrics...")
+        except Exception as e:
+            print(f"🔍 DEBUG: Other exception caught: {e}")
+            print(f"🔍 DEBUG: Exception type: {type(e).__name__}")
+            print("🔍 DEBUG: Falling back to basic metrics...")
             # Fallback to basic metrics
             correct = sum(1 for p, t in zip(predictions, targets) if p == t)
             total = len(predictions)
@@ -1623,14 +1769,41 @@ class VINFineTuner:
                 self._save_best_model()
                 print(f"  🎉 New best accuracy: {val_accuracy:.4f}")
             
+            # Early stopping logic
+            early_stopping_enabled = self.config['Global'].get('early_stopping', False)
+            if early_stopping_enabled:
+                patience = self.config['Global'].get('early_stopping_patience', 7)
+                min_delta = self.config['Global'].get('early_stopping_min_delta', 0.001)
+                
+                # Track epochs without improvement
+                if not hasattr(self, 'epochs_without_improvement'):
+                    self.epochs_without_improvement = 0
+                else:
+                    self.epochs_without_improvement += 1
+                
+                # Check if we have improvement
+                if val_accuracy > self.best_accuracy + min_delta:
+                    self.epochs_without_improvement = 0
+                    print(f"  📈 Improvement detected: {val_accuracy:.4f} > {self.best_accuracy + min_delta:.4f}")
+                else:
+                    print(f"  ⏳ No improvement: {self.epochs_without_improvement}/{patience} epochs (need >{min_delta:.4f} improvement)")
+                
+                # Check for early stopping
+                if self.epochs_without_improvement >= patience:
+                    print(f"  🛑 Early stopping triggered after {patience} epochs without improvement")
+                    print(f"  📊 Best accuracy achieved: {self.best_accuracy:.4f} at epoch {epoch - self.epochs_without_improvement}")
+                    break
+            
             epoch_time = time.time() - epoch_start
             
             # Logging - flush immediately for real-time visibility during GPU training
+            current_lr = self.optimizer.get_lr()
             print(
                 f"Epoch [{epoch}/{epochs}] "
                 f"Train Loss: {train_loss:.4f} "
                 f"Val Loss: {val_loss:.4f} "
                 f"Val Acc: {val_accuracy:.4f} "
+                f"LR: {current_lr:.6f} "
                 f"Best: {self.best_accuracy:.4f} "
                 f"Time: {epoch_time:.1f}s",
                 flush=True
@@ -2264,6 +2437,7 @@ def main():
     parser = argparse.ArgumentParser(
         description='Fine-tune PaddleOCR for VIN Recognition'
     )
+    # Only essential arguments - no config overrides
     parser.add_argument(
         '--config', '-c',
         default='configs/vin_finetune_config.yml',
@@ -2273,69 +2447,6 @@ def main():
         '--resume', '-r',
         default=None,
         help='Path to checkpoint to resume from (without extension)'
-    )
-    parser.add_argument(
-        '--output', '--output-dir', '-o',
-        dest='output',
-        default=None,
-        help='Output directory (overrides config)'
-    )
-    parser.add_argument(
-        '--epochs',
-        type=int,
-        default=None,
-        help='Number of epochs (overrides config)'
-    )
-    parser.add_argument(
-        '--batch-size',
-        type=int,
-        default=None,
-        help='Batch size (overrides config)'
-    )
-    parser.add_argument(
-        '--lr',
-        type=float,
-        default=None,
-        help='Learning rate (overrides config)'
-    )
-    parser.add_argument(
-        '--gpu',
-        action='store_true',
-        default=True,
-        help='Use GPU for training'
-    )
-    parser.add_argument(
-        '--cpu', '--no-gpu',
-        dest='cpu',
-        action='store_true',
-        help='Force CPU training'
-    )
-    parser.add_argument(
-        '--train-data-dir',
-        default=None,
-        help='Training data directory'
-    )
-    parser.add_argument(
-        '--train-labels',
-        default=None,
-        help='Training labels file'
-    )
-    parser.add_argument(
-        '--val-data-dir',
-        default=None,
-        help='Validation data directory'
-    )
-    parser.add_argument(
-        '--val-labels',
-        default=None,
-        help='Validation labels file'
-    )
-    parser.add_argument(
-        '--architecture', '--arch',
-        dest='architecture',
-        default=None,
-        choices=['PP-OCRv5', 'PP_OCRv5', 'SVTR_LCNet', 'SVTR_Tiny', 'CRNN'],
-        help='Model architecture (PP-OCRv5 recommended for best accuracy)'
     )
     parser.add_argument(
         '--export-onnx',
@@ -2369,6 +2480,8 @@ def main():
         print("Install with: pip install paddlepaddle-gpu")
         sys.exit(1)
     
+    args = parser.parse_args()
+    
     # Initialize DagsHub streaming if requested
     if DAGSHUB_INTEGRATION_AVAILABLE and getattr(args, 'stream', False):
         print("🌐 Initializing DagsHub streaming...")
@@ -2381,42 +2494,8 @@ def main():
             print("❌ Failed to enable DagsHub streaming")
             sys.exit(1)
     
-    # Load config
+    # Load configuration - ONLY source of truth
     config = load_config(args.config)
-    
-    # Apply CLI overrides
-    if args.output:
-        config['Global']['save_model_dir'] = args.output
-    if args.epochs:
-        config['Global']['epoch_num'] = args.epochs
-    if args.batch_size:
-        config['Train']['loader']['batch_size_per_card'] = args.batch_size
-    if args.lr:
-        config['Optimizer']['lr']['learning_rate'] = args.lr
-    if args.cpu:
-        config['Global']['use_gpu'] = False
-    
-    # Apply architecture override
-    if args.architecture:
-        # Normalize architecture name
-        arch = args.architecture.replace('_', '-')
-        if 'Architecture' not in config:
-            config['Architecture'] = {}
-        config['Architecture']['model_type'] = arch
-        print(f"Using architecture: {arch}")
-    
-    # Apply data path overrides from CLI
-    if args.train_data_dir:
-        config['Train']['dataset']['data_dir'] = args.train_data_dir
-        # Also set for eval if not separately specified
-        if not args.val_data_dir:
-            config['Eval']['dataset']['data_dir'] = args.train_data_dir
-    if args.train_labels:
-        config['Train']['dataset']['label_file_list'] = [args.train_labels]
-    if args.val_data_dir:
-        config['Eval']['dataset']['data_dir'] = args.val_data_dir
-    if args.val_labels:
-        config['Eval']['dataset']['label_file_list'] = [args.val_labels]
     
     # Set seed for reproducibility
     seed = config['Global'].get('seed', 42)

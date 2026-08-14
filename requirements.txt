@@ -26,8 +26,12 @@ paddleocr==3.3.3
 # ============================================
 # Computer Vision & Image Processing
 # ============================================
+# NOTE: install exactly ONE opencv distribution. opencv-python and
+# opencv-contrib-python both ship the `cv2` module; installing both leaves
+# whichever pip unpacked last, at an unpredictable version.
+# This codebase uses only core OpenCV (no ximgproc/xfeatures2d/aruco/...),
+# so the contrib build is not needed.
 opencv-python==4.13.0.90
-opencv-contrib-python==4.10.0.84
 Pillow==12.1.0
 scikit-image==0.26.0
 imageio==2.37.2

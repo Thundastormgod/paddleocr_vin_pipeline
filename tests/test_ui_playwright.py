@@ -1,10 +1,29 @@
 """
 Comprehensive Playwright UI Tests for VIN OCR Streamlit Application
 Tests all buttons, tabs, and functionality to ensure proper operation
+
+These are end-to-end tests: they require both the `playwright` package
+(`pip install playwright && playwright install chromium`) and a running
+Streamlit server on http://localhost:8501.
+
+Both are optional, so this module skips cleanly rather than breaking
+collection for the rest of the suite.
 """
 import asyncio
-from playwright.async_api import async_playwright, expect
 import time
+
+import pytest
+
+playwright_async = pytest.importorskip(
+    "playwright.async_api",
+    reason="playwright not installed; run `pip install playwright && playwright install chromium`",
+)
+
+async_playwright = playwright_async.async_playwright
+expect = playwright_async.expect
+
+# End-to-end tests need a live server; opt in with `pytest -m e2e`.
+pytestmark = pytest.mark.e2e
 
 
 async def test_streamlit_ui():

@@ -1,0 +1,23 @@
+# Optuna Hyperparameter Tuning Requirements
+# =====================================
+# Install with: pip install -r requirements_optuna.txt
+
+# Core Optuna
+optuna>=3.4.0
+
+# Visualization (optional but recommended)
+optuna[visualization]>=3.4.0
+
+# Progress tracking
+tqdm>=4.64.0
+
+# YAML handling
+PyYAML>=6.0
+
+# JSON handling (built-in, but specifying for completeness)
+
+# Logging
+colorlog>=6.7.0
+
+# Study persistence (optional)
+optuna-integration[all]>=3.4.0

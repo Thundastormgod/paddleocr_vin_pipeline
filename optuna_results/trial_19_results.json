@@ -1,0 +1,19 @@
+{
+  "trial_number": 19,
+  "params": {
+    "learning_rate": 0.0016965509499581115,
+    "scheduler_type": "StepDecay",
+    "step_decay_gamma": 0.8435420848137982,
+    "beta1": 0.9057378990755187,
+    "beta2": 0.9930601632294548,
+    "regularizer_factor": 1.0430294735542345e-05,
+    "batch_size": 16,
+    "patience": 5,
+    "min_delta": 0.0006431873710461327
+  },
+  "accuracy": 0.023255813953488372,
+  "character_accuracy": 0.6908344733242134,
+  "f1_micro": 0.6908344733242134,
+  "training_time": 145.8061339855194,
+  "final_epoch": 30
+}

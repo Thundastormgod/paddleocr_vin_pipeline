@@ -23,26 +23,14 @@ Global:
   # if no CUDA GPU is present this silently falls back to CPU.
   use_gpu: false
   epoch_num: 30
-  log_smooth_window: 20
   print_batch_step: 10
   save_model_dir: ./output/vin_rec_finetune
   save_epoch_step: 5
-  eval_batch_step: [0, 500]
-  cal_metric_during_train: true
   # Path prefix WITHOUT the .pdparams suffix, e.g. ./output/vin_rec_finetune/best_accuracy
   pretrained_model: null
-  checkpoints: null
-  save_inference_dir: ./inference/vin_rec
-  use_visualdl: true
-  visualdl_log_dir: ./output/vdl_logs
-  infer_img: null
   # 34 entries: '<blank>' at index 0 (CTC blank) + 33 valid VIN characters.
   character_dict_path: ./configs/vin_dict.txt
   max_text_length: 17
-  infer_mode: false
-  use_space_char: false
-  distributed: false
-  save_res_path: ./output/rec_results.txt
   use_amp: false
   # Early stopping (evaluated per epoch on validation exact-match accuracy)
   early_stopping: true
@@ -71,22 +59,23 @@ Optimizer:
 Architecture:
   # PaddleOCR task type. Informational only for this trainer.
   model_type: rec
-  # THE selector. Supported: PP-OCRv4 | PP-OCRv5
+  # THE selector - the only Architecture key that changes the network.
+  # Supported: PP-OCRv4 | PP-OCRv5
   #   PP-OCRv4 -> PPLCNetV3 backbone + SVTR encoder + CTC head
   #   PP-OCRv5 -> PPHGNetV2 backbone + SVTR encoder + CTC head
+  # The backbone is implied by `algorithm`; there is no separate Backbone key,
+  # because nothing reads one (declaring `Backbone.name: ResNet34_vd` would be
+  # silently ignored, which is how the previous config misled).
   algorithm: PP-OCRv4
-  Backbone:
-    name: PPLCNetV3
   Neck:
-    name: SVTREncoder
+    # Only Neck.hidden_dim and Neck.Transformer.* are read.
     hidden_dim: 256
-    # Read by SVTREncoder via Architecture.Neck.Transformer.*
     Transformer:
       num_heads: 8
       num_layers: 2
       dropout: 0.1
   Head:
-    name: CTCHead
+    # Only Head.dropout is read; the head type is fixed by `algorithm`.
     dropout: 0.1
 
 Loss:
@@ -100,12 +89,7 @@ PostProcess:
   # SARLabelDecode  <-> Loss: CrossEntropyLoss
   name: CTCLabelDecode
   character_dict_path: ./configs/vin_dict.txt
-  use_space_char: false
 
-Metric:
-  name: RecMetric
-  main_indicator: acc
-  ignore_space: true
 
 Train:
   dataset:
@@ -118,7 +102,6 @@ Train:
     batch_size_per_card: 16
     drop_last: true
     num_workers: 0
-    use_shared_memory: false
 
 Eval:
   dataset:
@@ -131,17 +114,4 @@ Eval:
     drop_last: false
     batch_size_per_card: 16
     num_workers: 0
-    use_shared_memory: false
 
-Test:
-  dataset:
-    name: SimpleDataSet
-    data_dir: ./finetune_data/
-    label_file_list:
-      - ./finetune_data/test_labels.txt
-  loader:
-    shuffle: false
-    drop_last: false
-    batch_size_per_card: 16
-    num_workers: 0
-    use_shared_memory: false

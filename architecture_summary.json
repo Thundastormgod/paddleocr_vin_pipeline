@@ -1,5 +1,9 @@
 {
-  "timestamp": "2026-02-15",
+  "measured": false,
+  "source": "hardcoded literals transcribed from VIN_OCR_Architecture_Performance.md",
+  "warning": "NOT a measurement. No model, dataset or checkpoint was loaded to produce these numbers. For real measured results see optuna_results/trial_*_results.json (best measured exact match 0.4186 = 18/43).",
+  "generated_by": "validate_architectures.py",
+  "timestamp": "2026-08-14T18:41:12.522821+00:00",
   "best_architecture": "Rosetta + CTC",
   "best_accuracy": 0.4651,
   "architectures_tested": 3,

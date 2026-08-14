@@ -6,28 +6,36 @@ PaddleOCR Fine-Tuning Pipeline for VIN Recognition
 Industry-standard neural network fine-tuning for PaddleOCR recognition model.
 This script trains the model weights (not just rule-based corrections).
 
-Supported Architectures:
-- PP-OCRv5: State-of-the-art (2024) with PPHGNetV2 backbone - RECOMMENDED
-- PP-OCRv4/SVTR_LCNet: Production-ready with PPLCNetV3 backbone
-- SVTR_Tiny: Lightweight transformer model
-- CRNN: Classic CNN+RNN architecture
+Supported Architectures (see VINFineTuner.SUPPORTED_ARCHITECTURES):
+- PP-OCRv4: PPLCNetV3 backbone + SVTR encoder + CTC head  (default)
+- PP-OCRv5: PPHGNetV2 backbone + SVTR encoder + CTC head
+
+Selected via `Architecture.algorithm`. Anything else raises. This module builds
+its own paddle.nn networks; it does NOT load PaddleOCR's model zoo, so zoo
+architectures (Rosetta, CRNN, ABINet, SVTR_Tiny, ...) are not available here.
+Use PaddleOCR's own tools/train.py for those.
 
 Features:
-- Fine-tunes PaddleOCR recognition model on VIN dataset
-- Proper training loop with gradient updates
-- Learning rate scheduling (cosine with warmup)
-- Mixed precision training (AMP) for faster training
-- Distributed training support (multi-GPU)
+- Fine-tunes the recognition model on a VIN dataset (real gradient updates)
+- LR scheduling: Cosine / Step / Piecewise / Const, with optional LinearWarmup
+- CTC or CrossEntropy loss, selected by `Loss.name` and validated against
+  `PostProcess.name`
+- Mixed precision training (AMP) via GradScaler
 - Checkpoint saving and resumption
-- TensorBoard/VisualDL logging
-- Early stopping and best model tracking
-- Proper train/val split evaluation
+- Early stopping and best-model tracking
+- Train/val split evaluation
 - ONNX export support for deployment
+
+NOT implemented (previously claimed here in error):
+- Distributed / multi-GPU training. There is no DataParallel, fleet or
+  init_parallel_env call in this module; `paddle.distributed.launch` will run
+  N independent single-GPU processes that overwrite each other's checkpoints.
+- TensorBoard / VisualDL logging. `visualdl` is never imported; the
+  `Global.use_visualdl` and `Global.visualdl_log_dir` config keys are inert.
 
 Requirements:
 - PaddlePaddle >= 2.5.0 (with GPU support recommended)
 - PaddleOCR >= 2.7.0
-- 11,000+ labeled VIN images
 
 Usage:
     # Run fine-tuning with PP-OCRv5 (recommended)
@@ -1327,19 +1335,11 @@ class VINFineTuner:
         - If using CTCLoss (use_ctc=True): Use CTC greedy decoding on all timesteps
         """
         if self.use_ctc:
-            # CTC-style greedy decoding (collapse blanks and repeats)
-            preds = logits.argmax(axis=-1).numpy()  # [B, T, C] -> [B, T]
-            decoded = []
-            for pred in preds:
-                chars = []
-                prev_idx = None
-                for idx in pred:
-                    if idx != 0 and idx != prev_idx:  # Skip blank (0) and repeats
-                        if idx in self.idx_to_char:
-                            chars.append(self.idx_to_char[idx])
-                    prev_idx = idx
-                decoded.append(''.join(chars))
-            return decoded
+            # Delegate to the single CTC decoder implementation. This branch
+            # previously inlined a second, near-identical copy of that logic;
+            # two implementations of the decode path is precisely how the
+            # training/inference character-map divergence went unnoticed.
+            return self._ctc_greedy_decode(logits)
         else:
             # Position-by-position decoding for CrossEntropyLoss training
             # Take first max_text_length positions and argmax each
@@ -1364,11 +1364,6 @@ class VINFineTuner:
             return decoded
         
         return decoded
-    
-    def _calculate_accuracy(self, predictions: List[str], targets: List[str]) -> float:
-        """Calculate exact match accuracy."""
-        correct = sum(1 for p, t in zip(predictions, targets) if p == t)
-        return correct / len(targets) if targets else 0.0
     
     def train_epoch(self, epoch: int) -> float:
         """Train for one epoch."""

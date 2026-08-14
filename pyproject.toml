@@ -54,7 +54,10 @@ web = [
     "pandas>=2.0.0",
 ]
 training = [
-    "visualdl>=2.5.0",
+    # NOTE: visualdl was declared here but is never imported anywhere in the
+    # codebase, and the Global.use_visualdl / visualdl_log_dir config keys are
+    # not read. Removed rather than shipping an inert dependency; re-add it
+    # together with an actual LogWriter integration.
     "optuna>=3.5.0",
 ]
 onnx = [

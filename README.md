@@ -8,17 +8,24 @@ and postprocessing.
 
 ## Key Metrics (Current Performance)
 
-Rule-based pipeline (PaddleOCR + preprocessing + postprocessing), 382 images:
+Rule-based pipeline (PaddleOCR + preprocessing + postprocessing).
+**Measured on n=20 images**, not the full 382-image set — see the correction below.
 
 | Metric                   | Value | Baseline | Improvement |
 |--------------------------|-------|----------|-------------|
 | **Character-Level F1**   | 55%   | 43%      | +29%        |
-| **Exact Match Rate**     | 25%   | 5%       | +400%       |
+| **Exact Match Rate**     | 25%   | 5%       | 1/20 → 5/20 |
 | **Precision**            | 57%   | 45%      | +27%        |
 | **Recall**               | 54%   | 42%      | +29%        |
 
 > **Note:** Industry target is 95%+ exact match and 98%+ F1.
 > This pipeline establishes a baseline for further development.
+>
+> **Statistical caveat:** at n=20 the 95% CI on the 25% figure is [0.11, 0.47].
+> The most recent recorded run of this pipeline
+> (`results/batch_evaluation_20260203_150634.json`, n=5, PP-OCRv5) scored
+> **0/5 exact match, 31.8% character accuracy**. None of these sample sizes
+> support the headline numbers. A full 382-image evaluation has not been run.
 
 ### ⚠️ Status of the fine-tuned model numbers
 
@@ -80,9 +87,17 @@ come from the PaddleOCR pipeline, which does not use that char map.
 
 ### Industry Metrics Achieved
 
+> **⚠️ Sample size correction.** This table previously reported the exact match
+> rate as `5% (19/382)` → `25% (96/382)`, implying 382 images were scored. The
+> provenance file `results/experiment_summary.json` records
+> `"sample_size_for_metrics": 20`. The measurement is therefore **1/20 → 5/20**,
+> and the 19/382 and 96/382 counts were extrapolations, never observed.
+> The 95% CI on 5/20 is **[0.11, 0.47]** — consistent with anything from "no
+> improvement" to "large improvement". Treat as a pilot, not a result.
+
 | Metric              | Baseline       | With Pipeline  | Improvement | Industry Target |
 |---------------------|----------------|----------------|-------------|-----------------|
-| Exact Match Rate    | 5% (19/382)    | 25% (96/382)   | +400%       | 95%+            |
+| Exact Match Rate    | 5% (1/20)      | 25% (5/20)     | +4 images   | 95%+            |
 | Character-Level F1  | 43%            | 55%            | +29%        | 98%+            |
 | Precision           | 45%            | 57%            | +27%        | 98%+            |
 | Recall              | 42%            | 54%            | +29%        | 98%+            |
@@ -373,10 +388,12 @@ python -m src.vin_ocr.training.finetune_paddleocr --config configs/vin_finetune_
 python -m src.vin_ocr.training.finetune_paddleocr --config configs/vin_finetune_config.yml \
     --resume output/vin_rec_finetune/latest
 
-# Multi-GPU training
-python -m paddle.distributed.launch --gpus '0,1' -m src.vin_ocr.training.finetune_paddleocr \
-    --config configs/vin_finetune_config.yml
 ```
+
+> **Multi-GPU is NOT supported.** `finetune_paddleocr.py` contains no
+> `DataParallel`, `fleet` or `init_parallel_env` call, so
+> `paddle.distributed.launch` would start N independent single-GPU processes
+> that overwrite each other's checkpoints. Use a single device.
 
 ### DeepSeek-OCR Fine-Tuning (HPC with RTX 3090)
 

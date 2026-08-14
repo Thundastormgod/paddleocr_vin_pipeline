@@ -216,43 +216,70 @@ def create_config_file(config: Dict[str, Any]) -> str:
 
 @step
 def run_training_experiment(config_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
-    """Run training experiment and track results."""
-    
-    logger.info(f"Starting training experiment for {config['name']}")
-    
-    # Import training module
+    """
+    Run a real training experiment and return its measured metrics.
+
+    HISTORY: this step previously constructed a VINFineTuner and then, without
+    ever calling trainer.train(), returned a dict of hardcoded numbers
+    (best_accuracy=0.15, exact_match_count=5, total_samples=43,
+    training_time_hours=0.5) labelled "# Simulated". Downstream steps then
+    computed "exact_match_accuracy", assigned a "performance tier" and emitted
+    "recommendations" from those invented values, and wrote them to
+    zenml_results/ as if they were experiment output.
+
+    Fabricated metrics are worse than no metrics, so the fallback has been
+    removed: this now trains for real, or raises.
+    """
     import sys
+    import time
+
+    logger.info(f"Starting training experiment for {config['name']}")
+
     sys.path.insert(0, '.')
     from src.vin_ocr.training.finetune_paddleocr import VINFineTuner
-    
-    # Load config
+
     with open(config_path, 'r') as f:
         training_config = yaml.safe_load(f)
-    
-    # Initialize trainer
+
     trainer = VINFineTuner(training_config)
-    
-    # Run training (simulate for demo - in real usage, this would run full training)
-    logger.info("Running training simulation...")
-    
-    # Simulate training results (replace with actual training)
-    simulated_results = {
+
+    start = time.time()
+    trainer.train()
+    elapsed_hours = (time.time() - start) / 3600.0
+
+    metrics = trainer.get_last_validation_metrics()
+    if not metrics:
+        raise RuntimeError(
+            "Training produced no validation metrics. Refusing to emit "
+            "placeholder results - fix the training run instead."
+        )
+
+    total_samples = metrics.get("total_samples")
+    exact_match_count = metrics.get("exact_match_count")
+    if total_samples in (None, 0):
+        raise RuntimeError(
+            f"Validation set is empty or unreported (total_samples={total_samples!r}); "
+            "cannot compute a meaningful accuracy."
+        )
+
+    results = {
         "architecture": config["name"],
         "architecture_key": config["architecture_key"],
         "config_path": config_path,
-        "training_time_hours": 0.5,  # Simulated
-        "epochs_completed": 5,  # Simulated
-        "final_train_loss": 0.75,
-        "final_val_loss": 0.85,
-        "best_accuracy": 0.15,  # Simulated
-        "final_accuracy": 0.12,
-        "character_accuracy": 0.85,
-        "f1_micro": 0.85,
-        "f1_macro": 0.75,
-        "cer": 0.15,
-        "ned": 0.85,
-        "exact_match_count": 5,
-        "total_samples": 43,
+        "measured": True,
+        "training_time_hours": round(elapsed_hours, 4),
+        "epochs_completed": trainer.current_epoch,
+        "final_train_loss": trainer.train_losses[-1] if trainer.train_losses else None,
+        "final_val_loss": metrics.get("val_loss"),
+        "best_accuracy": trainer.best_accuracy,
+        "final_accuracy": metrics.get("exact_match_accuracy"),
+        "character_accuracy": metrics.get("character_accuracy"),
+        "f1_micro": metrics.get("f1_micro"),
+        "f1_macro": metrics.get("f1_macro"),
+        "cer": metrics.get("cer"),
+        "ned": metrics.get("ned"),
+        "exact_match_count": exact_match_count,
+        "total_samples": total_samples,
         "timestamp": datetime.now().isoformat(),
         "hyperparameters": {
             "learning_rate": config["learning_rate"],
@@ -263,9 +290,10 @@ def run_training_experiment(config_path: str, config: Dict[str, Any]) -> Dict[st
             "fc_decay": config["fc_decay"]
         }
     }
-    
-    logger.info(f"Training completed. Best accuracy: {simulated_results['best_accuracy']:.4f}")
-    return simulated_results
+
+    logger.info(f"Training completed. Best accuracy: {results['best_accuracy']:.4f} "
+                f"({exact_match_count}/{total_samples})")
+    return results
 
 @step
 def evaluate_model(results: Dict[str, Any]) -> Dict[str, Any]:

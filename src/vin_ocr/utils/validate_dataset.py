@@ -19,6 +19,7 @@ Date: January 2026
 
 import argparse
 import json
+import logging
 import re
 import sys
 from collections import Counter
@@ -87,6 +88,8 @@ class ValidationReport:
 
 # Note: extract_vin_from_filename is imported from vin_utils (Single Source of Truth)
 
+logger = logging.getLogger(__name__)
+
 
 def parse_label_file(filepath: str) -> Optional[str]:
     """
@@ -133,8 +136,13 @@ def parse_label_file(filepath: str) -> Optional[str]:
             return ''.join([c[1] for c in chars]).replace('*', '')
         
         return None
-        
+
     except Exception as e:
+        # Do not fail silently: this is a *validator*, so an unreadable or
+        # malformed label file must be visible in the report. Returning None
+        # without a trace made a corrupt file indistinguishable from a missing
+        # one and let the dataset appear cleaner than it is.
+        logger.warning(f"Failed to parse label file {filepath}: {e.__class__.__name__}: {e}")
         return None
 
 

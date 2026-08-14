@@ -1,5 +1,41 @@
 # VIN OCR Architecture Performance Documentation
 
+> ## ⚠️ PROVENANCE WARNING — the figures in this document are NOT measurements
+>
+> An AST audit of the repository could not find any code path that produced the
+> numbers below. Specifically:
+>
+> * `validate_architectures.py`, the only script that emits these values, imports
+>   just `yaml`, `json` and `pathlib`. It never loads a model, dataset or
+>   checkpoint. Its sole "validation" is `Path(...).exists()` on this markdown
+>   file. `0.4651` / `0.9439` are **hardcoded dict literals** in that script.
+> * `architecture_summary.json` is byte-for-byte reproducible by re-running that
+>   script, and its `timestamp` was a hardcoded string.
+> * `zenml_vin_pipeline.py::run_training_experiment` constructed a trainer and
+>   returned hardcoded metrics **without ever calling `train()`** (commented
+>   `# Simulated`). This has since been fixed to train for real or raise.
+> * This document itself states the training time was *"~0.5 hours (simulated)"*.
+>
+> **Actual measured results** (30 real Optuna trials, each running training via
+> subprocess and parsing `training_metrics.json`):
+>
+> | | Claimed here | Actually measured |
+> |---|---|---|
+> | Best exact match | 46.51% (20/43) | **41.86% (18/43)** — trial 23 |
+> | Best character accuracy | 94.39% | **90.15%** |
+> | Mean exact match across trials | — | 7.21% |
+> | Trials scoring 0.0 | — | 6 of 30 |
+>
+> Note the validation set is **n=43**. The 95% confidence interval on 18/43 is
+> **[0.28, 0.57]** — too wide to distinguish 42% from 47%, so the "7x
+> improvement" and "39.53% performance gap" framings below are not supported.
+>
+> Also: "Rosetta" is **not implemented** in this codebase. `finetune_paddleocr.py`
+> builds only PP-OCRv4 (PPLCNetV3) and PP-OCRv5 (PPHGNetV2) networks and now
+> raises on anything else.
+>
+> Treat everything below as a design note, not a result.
+
 ## Overview
 This document documents the VIN OCR architectures tested and their performance results, with focus on the highest-performing configurations.
 

@@ -24,6 +24,7 @@ import optuna
 import yaml
 import subprocess
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Dict, Any
@@ -110,19 +111,26 @@ class VINOCRHyperparameterTuner:
     def run_training_trial(self, config_path: str, max_epochs: int = 20) -> Dict[str, Any]:
         """Run a single training trial and return results."""
         try:
-            # Run training with timeout
+            # Run training with timeout.
+            # sys.executable (not bare "python") so the trial runs in the same
+            # interpreter/venv as the tuner.
             cmd = [
-                "python", "src/vin_ocr/training/finetune_paddleocr.py",
+                sys.executable, "-m", "src.vin_ocr.training.finetune_paddleocr",
                 "--config", config_path
             ]
-            
+
+            # Repo root, derived from this file's location. Was previously
+            # hardcoded to /Users/startferanmi/Paddle/paddleocr_vin_pipeline,
+            # which made this script unrunnable on any other machine.
+            repo_root = Path(__file__).resolve().parent
+
             start_time = time.time()
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=3600,  # 1 hour timeout
-                cwd="/Users/startferanmi/Paddle/paddleocr_vin_pipeline"
+                cwd=str(repo_root)
             )
             training_time = time.time() - start_time
             

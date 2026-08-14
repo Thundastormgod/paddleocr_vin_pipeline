@@ -1,16 +1,42 @@
 #!/usr/bin/env python3
 """
-Validate and summarize the documented VIN OCR architectures
+Summarise the *documented* VIN OCR architecture claims.
+
+⚠️  THIS SCRIPT MEASURES NOTHING.
+
+It imports only yaml/json/pathlib. It never loads a model, dataset or
+checkpoint; its sole "validation" is checking that a markdown file exists. The
+accuracy figures below are hardcoded literals transcribed from documentation,
+not results.
+
+They were previously written to `architecture_summary.json` with no such
+caveat, and that file became the source of the widely-quoted "46.51% exact
+match / 94.39% character accuracy (Rosetta + CTC)" claim. The output is
+byte-for-byte reproducible by re-running this script, and its "timestamp" is a
+hardcoded string.
+
+For REAL measured numbers use, in order of preference:
+  * optuna_results/trial_*_results.json  (30 real trials; best measured exact
+    match 0.4186 = 18/43, best character accuracy 0.9015)
+  * results/multi_model_evaluation.json
+  * `vin-evaluate single --data-dir ...`
+
+Emitted JSON is tagged `"measured": false` so downstream consumers can tell it
+apart from evaluation output.
 """
 
 import yaml
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 def validate_architecture_documentation():
     """Validate the documented architectures and create summary."""
     
     print("🔍 Validating VIN OCR Architecture Documentation")
+    print("=" * 60)
+    print("⚠️  NOTE: figures below are TRANSCRIBED FROM DOCS, not measured.")
+    print("    Real measurements live in optuna_results/trial_*_results.json")
     print("=" * 60)
     
     # Check if documentation exists
@@ -21,7 +47,7 @@ def validate_architecture_documentation():
         print("❌ Architecture documentation missing")
         return
     
-    # Create architecture summary
+    # Hardcoded literals transcribed from documentation - NOT measurements.
     architectures = {
         "rosetta_ctc": {
             "name": "Rosetta + CTC",
@@ -136,7 +162,17 @@ def validate_architecture_documentation():
     
     # Save summary
     summary = {
-        "timestamp": "2026-02-15",
+        # Provenance flags so downstream consumers cannot mistake this for
+        # evaluation output.
+        "measured": False,
+        "source": "hardcoded literals transcribed from "
+                  "VIN_OCR_Architecture_Performance.md",
+        "warning": "NOT a measurement. No model, dataset or checkpoint was "
+                   "loaded to produce these numbers. For real measured results "
+                   "see optuna_results/trial_*_results.json (best measured "
+                   "exact match 0.4186 = 18/43).",
+        "generated_by": "validate_architectures.py",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "best_architecture": best_arch['name'],
         "best_accuracy": best_arch['exact_match_accuracy'],
         "architectures_tested": len(architectures),

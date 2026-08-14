@@ -99,8 +99,11 @@ def test_config_update():
         integration.repo_name = "test_repo"
         integration.streaming_active = True
         
-        # Test path conversion
-        test_path = "/Users/startferanmi/Paddle/paddleocr_vin_pipeline/finetune_data/train_images"
+        # Test path conversion.
+        # Derived from this file's location; was hardcoded to a foreign home
+        # directory (/Users/startferanmi/...), so the assertion below could
+        # never hold on any other machine.
+        test_path = str(Path(__file__).resolve().parent / "finetune_data" / "train_images")
         streaming_path = integration.get_streaming_path(test_path)
         expected = "/mnt/dagsHub/test_user/test_repo/finetune_data/train_images"
         

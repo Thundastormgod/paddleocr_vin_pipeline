@@ -60,6 +60,17 @@ training = [
     # together with an actual LogWriter integration.
     "optuna>=3.5.0",
 ]
+tracking = [
+    # Experiment tracking with mandatory provenance (src/vin_ocr/tracking).
+    #
+    # Only the SINK needs MLflow. Provenance capture itself (git state,
+    # environment, dataset fingerprints) is stdlib + PyYAML, so the ability to
+    # answer "what code and what data produced this number" never depends on
+    # an optional package being present.
+    #
+    # >=2.9 for mlflow.artifacts.download_artifacts, used by the reproduce CLI.
+    "mlflow>=2.9",
+]
 onnx = [
     "onnx>=1.15.0",
     "onnxruntime>=1.16.0",
@@ -75,7 +86,7 @@ dev = [
     "pre-commit>=3.6.0",
 ]
 all = [
-    "paddleocr-vin-pipeline[web,training,onnx,dev]",
+    "paddleocr-vin-pipeline[web,training,onnx,tracking,dev]",
 ]
 
 [project.urls]
@@ -88,6 +99,7 @@ Issues = "https://github.com/Thundastormgod/paddleocr_vin_pipeline/issues"
 vin-ocr = "src.vin_ocr.cli:main"
 vin-train = "src.vin_ocr.training.cli:main"
 vin-evaluate = "src.vin_ocr.evaluation.cli:main"
+vin-reproduce = "src.vin_ocr.tracking.reproduce:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

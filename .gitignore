@@ -99,3 +99,15 @@ Thumbs.db
 results/multi_eval/
 results/detailed_metrics.json
 results/experiment_summary.json
+
+# Experiment tracking - the default local MLflow store.
+# Run records (metrics, params, diffs, provenance) live in mlflow.db, with
+# artifacts under mlartifacts/. These are per-machine run records, not source:
+# committing them would bloat the repo and recreate the situation the audit
+# found in results/, where JSON result files were tracked in git with no writer
+# left in the tree to explain them. Share runs through a tracking server
+# (MLFLOW_TRACKING_URI), not through git.
+mlflow.db
+mlflow.db-journal
+mlartifacts/
+mlruns/

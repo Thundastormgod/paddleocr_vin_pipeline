@@ -58,8 +58,17 @@ import os
 import sys
 from pathlib import Path
 
-# Add project root to path for imports
-project_root = Path(__file__).parent.parent.parent
+# Add project root to path for imports.
+#
+# This file is at <root>/src/vin_ocr/training/finetune_paddleocr.py, so the
+# repository root is four levels up (parents[3]). It was `.parent.parent.parent`
+# — only three — which resolves to <root>/src. Putting <root>/src on sys.path
+# does NOT make the `from src.vin_ocr...` import below resolvable; that import
+# only ever worked because the repo root was already on sys.path via the normal
+# invocation (conftest.py, `python -m`, or the installed package). The three
+# other root computations in this same file (:91, :179, :257) already use four
+# levels, so the file disagreed with itself.
+project_root = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(project_root))
 
 # Check for DagsHub streaming support

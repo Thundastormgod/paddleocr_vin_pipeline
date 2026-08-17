@@ -35,12 +35,22 @@ from typing import Dict, List, Tuple, Any, Optional
 from dataclasses import dataclass, asdict
 import re
 
-# Add project root to path
-project_root = Path(__file__).parent
+# Add project root to path.
+#
+# This file lives at <root>/src/vin_ocr/evaluation/multi_model_evaluation.py,
+# so the repository root is parents[3]. It was previously `Path(__file__).parent`,
+# i.e. <root>/src/vin_ocr/evaluation — wrong by three levels. Every path derived
+# from it was therefore wrong: the fine-tuned checkpoint, the DeepSeek and ONNX
+# model search roots, and all three default dataset roots. `load_dataset()`
+# found zero images, `run_evaluation()` returned None, and the CLI still exited 0.
+project_root = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(project_root))
 
 # Import shared utilities (Single Source of Truth for VIN extraction)
-from src.vin_ocr.core.vin_utils import extract_vin_from_filename
+from src.vin_ocr.core.vin_utils import (
+    extract_vin_from_filename,
+    extract_vin_from_text as _canonical_extract_vin,
+)
 
 import numpy as np
 
@@ -85,54 +95,75 @@ class VINCharValidator:
     
     VIN_CHARS = set("0123456789ABCDEFGHJKLMNPRSTUVWXYZ")
     INVALID_CHARS = {'I', 'O', 'Q'}  # Not allowed in VINs
-    
-    # Character replacement map for common OCR errors
+
+    # Substitutions for the three characters ISO 3779 forbids in a VIN.
+    #
+    # This map must contain ONLY characters that cannot legally appear in a
+    # VIN. It previously also contained ``'l': '1', 'L': '1'`` — but 'L' is a
+    # perfectly legal VIN character and is a member of VIN_CHARS above. Since
+    # clean_vin() uppercases before substituting, EVERY 'L' in every
+    # prediction was rewritten to '1' before scoring:
+    #
+    #     SAL1A2A40SA606662  ->  SA11A2A40SA606662   (the dataset's own VIN)
+    #     WBALL31069PY12345  ->  WBA1131069PY12345
+    #
+    # A model that read the plate perfectly was therefore scored as wrong, and
+    # every accuracy figure this module produced for an 'L'-bearing VIN was
+    # invalid. The lowercase keys were dead in any case: text is uppercased
+    # before the substitution loop runs.
     CHAR_MAP = {
-        'I': '1', 'O': '0', 'Q': '0',
-        'i': '1', 'o': '0', 'q': '0',
-        'l': '1', 'L': '1',
-        ' ': '', '-': '', '.': '',
+        'I': '1',
+        'O': '0',
+        'Q': '0',
     }
-    
+
+    # Any run of characters that cannot appear in a VIN (plate borders,
+    # separators, stamp noise). I/O/Q pass through so CHAR_MAP can map them.
+    _NON_VIN_RUN = re.compile(r'[^0-9A-Z]+')
+
     @classmethod
     def clean_vin(cls, raw_text: str) -> str:
-        """Clean and normalize VIN text."""
+        """
+        Normalise raw OCR text to the VIN alphabet, WITHOUT truncating.
+
+        Truncation is extraction's job — doing it here discarded the tail of
+        the string before the extractor could look at it.
+        """
         if not raw_text:
             return ""
-        
-        # Uppercase
+
         text = raw_text.upper()
-        
-        # Replace common errors
-        for old, new in cls.CHAR_MAP.items():
-            text = text.replace(old, new)
-        
-        # Keep only valid VIN characters
-        text = ''.join(c for c in text if c in cls.VIN_CHARS)
-        
-        # Truncate/pad to 17 characters
-        if len(text) > 17:
-            text = text[:17]
-        
-        return text
-    
+        text = cls._NON_VIN_RUN.sub('', text)
+        return ''.join(cls.CHAR_MAP.get(c, c) for c in text)
+
     @classmethod
     def extract_vin_from_text(cls, text: str) -> str:
-        """Extract best 17-character VIN from longer text."""
+        """
+        Extract the best 17-character VIN from longer OCR text.
+
+        Delegates the window search to core.vin_utils.extract_vin_from_text,
+        the Single Source of Truth, which scores every 17-character window and
+        treats a valid ISO 3779 check digit as decisive evidence.
+
+        This method used to be a no-op dressed up as a search::
+
+            # Try to find 17 consecutive valid chars
+            if len(cleaned) >= 17:
+                return cleaned[:17]
+
+        There was no search — it returned the first 17 characters. run_paddleocr
+        joins *all* detected text regions before calling this (:563), so any
+        text preceding the VIN on the plate shifted the window and guaranteed a
+        miss that was then reported as a model error.
+        """
         if not text:
             return ""
-        
+
         cleaned = cls.clean_vin(text)
-        
-        # If already 17 chars, return
-        if len(cleaned) == 17:
+        if len(cleaned) < 17:
             return cleaned
-        
-        # Try to find 17 consecutive valid chars
-        if len(cleaned) >= 17:
-            return cleaned[:17]
-        
-        return cleaned
+
+        return _canonical_extract_vin(cleaned)
 
 
 class MultiModelEvaluator:

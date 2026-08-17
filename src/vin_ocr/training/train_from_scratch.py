@@ -78,8 +78,13 @@ logger = logging.getLogger(__name__)
 for handler in logger.handlers:
     handler.flush = sys.stdout.flush
 
-# Project root
-PROJECT_ROOT = Path(__file__).parent
+# NOTE: a module-level `PROJECT_ROOT = Path(__file__).parent` was removed here.
+# It had zero references anywhere in the codebase, and it was also wrong: this
+# file sits at <root>/src/vin_ocr/training/, so `.parent` is that training
+# directory, not the repository root (four levels up). Had anything ever read
+# it, every derived path would have been wrong by three levels — the same
+# defect that made multi_model_evaluation.py resolve zero dataset images.
+# Anything needing the root should use Path(__file__).resolve().parents[3].
 
 
 # =============================================================================
@@ -303,14 +308,47 @@ class PaddleOCRScratchTrainer:
         logger.info("Setup complete!")
         
     def _load_char_dict(self) -> Dict[str, int]:
-        """Load character dictionary."""
-        char_dict = {'<blank>': 0}  # CTC blank token
-        with open(self.config.character_dict_path, 'r') as f:
+        """
+        Load the character dictionary.
+
+        Delegates to src.vin_ocr.core.charset.load_char_dict so that this
+        trainer, finetune_paddleocr.py and both inference backends share ONE
+        char<->index mapping.
+
+        This method previously reimplemented the mapping as::
+
+            char_dict = {'<blank>': 0}
             for idx, line in enumerate(f, start=1):
-                char = line.strip()
-                if char:
-                    char_dict[char] = idx
-        return char_dict
+                char_dict[line.strip()] = idx
+
+        which is the mirror image of the bug core/charset.py was written to
+        prevent. configs/vin_dict.txt ships '<blank>' as its FIRST line, so
+        enumerate(..., start=1) re-mapped '<blank>' to 1 and shifted every
+        character up by one. Three failures followed:
+
+          * num_classes = len(char_dict) = 34, so the final Linear emits
+            indices 0..33 - but 'Z' encoded to 34. Every label containing 'Z'
+            was an out-of-alphabet CTC target.
+          * paddle.nn.CTCLoss(blank=0) and the greedy decoder both treat 0 as
+            blank, while the dict said class 0 was unused and class 1 was
+            '<blank>'. The decoder could splice the literal 7-character string
+            "<blank>" into a predicted VIN.
+          * Inference (which does delegate) mapped '0'->1, 'A'->11, 'Z'->33
+            against training's 2/12/34, so a perfectly-trained model decoded to
+            garbage - exactly the failure documented in core/charset.py.
+
+        It also depended on whether the dict file already existed: create_vin_dict()
+        writes the 33 characters WITHOUT a blank line, which loaded correctly,
+        so identical code produced two different charsets. load_char_dict()
+        normalises both conventions.
+        """
+        from src.vin_ocr.core.charset import load_char_dict
+
+        char_to_idx, idx_to_char = load_char_dict(self.config.character_dict_path)
+        # Cache the canonical reverse map so decoding cannot re-derive a
+        # different one.
+        self.idx_to_char = idx_to_char
+        return char_to_idx
     
     def _build_model(self):
         """Build OCR model from scratch with random weights."""
@@ -1095,8 +1133,16 @@ class PaddleOCRScratchTrainer:
         
         self.model.eval()
         
-        # Reverse char dict for decoding
-        idx_to_char = {v: k for k, v in self.char_dict.items()}
+        # Canonical reverse map, cached by _load_char_dict(). BLANK_TOKEN is
+        # excluded so a stray blank prediction can never splice the literal
+        # string "<blank>" into a decoded VIN.
+        from src.vin_ocr.core.charset import BLANK_INDEX, BLANK_TOKEN
+
+        idx_to_char = {
+            idx: ch
+            for idx, ch in getattr(self, 'idx_to_char', {}).items()
+            if idx != BLANK_INDEX and ch != BLANK_TOKEN
+        }
         
         all_predictions = []
         all_targets = []
@@ -1113,11 +1159,13 @@ class PaddleOCRScratchTrainer:
                     label_len = label_lengths[i].item()
                     label_seq = labels[i][:label_len].numpy()
                     
-                    # CTC decode (remove blanks and duplicates)
+                    # CTC greedy decode: collapse repeats first, then strip
+                    # blanks. `prev` is updated on EVERY step (including
+                    # blanks), which is what makes that ordering correct.
                     decoded = []
                     prev = -1
                     for idx in pred_seq:
-                        if idx != 0 and idx != prev:  # 0 is blank
+                        if idx != BLANK_INDEX and idx != prev:
                             decoded.append(idx)
                         prev = idx
                     

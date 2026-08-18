@@ -172,12 +172,19 @@ class TestInferenceIntegration:
         """Test end-to-end Paddle inference if model available."""
         from src.vin_ocr.inference import VINInference
         
-        # Find an inference model
+        # Find an inference model. A servable export needs the GRAPH file
+        # (inference.json or inference.pdmodel), not just weights: the
+        # weights-only fallback writes inference.pdiparams alone and cannot
+        # be loaded by VINInference.
         inference_dirs = list(Path("output").glob("*/inference"))
-        valid_dirs = [d for d in inference_dirs if (d / "inference.pdiparams").exists()]
+        valid_dirs = [
+            d for d in inference_dirs
+            if (d / "inference.pdiparams").exists()
+            and ((d / "inference.json").exists() or (d / "inference.pdmodel").exists())
+        ]
         
         if not valid_dirs:
-            pytest.skip("No valid inference models found")
+            pytest.skip("No servable inference export found (graph file required)")
         
         inference = VINInference(str(valid_dirs[0]))
         

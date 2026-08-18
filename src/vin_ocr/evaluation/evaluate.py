@@ -304,7 +304,7 @@ def calculate_cer(predictions: List[str], references: List[str]) -> float:
     total_errors = 0
     total_chars = 0
     
-    for pred, ref in zip(predictions, references):
+    for pred, ref in zip(predictions, references, strict=True):
         total_errors += levenshtein_distance(pred, ref)
         total_chars += len(ref)
     
@@ -347,7 +347,7 @@ def calculate_character_metrics(
     from ..core.char_metrics import AlignmentCounts, alignment_counts, micro_prf
 
     totals = AlignmentCounts()
-    for pred, ref in zip(predictions, references):
+    for pred, ref in zip(predictions, references, strict=True):
         totals.update(alignment_counts(pred, ref))
 
     return micro_prf(totals)
@@ -367,7 +367,7 @@ def calculate_position_accuracy(
     position_correct = [0] * vin_length
     position_total = [0] * vin_length
     
-    for pred, ref in zip(predictions, references):
+    for pred, ref in zip(predictions, references, strict=True):
         # Only count if reference is proper length
         if len(ref) != vin_length:
             continue
@@ -536,7 +536,7 @@ class VINEvaluator:
             # Error metrics
             metrics.character_error_rate = calculate_cer(predictions, references)
             
-            edit_distances = [levenshtein_distance(p, r) for p, r in zip(predictions, references)]
+            edit_distances = [levenshtein_distance(p, r) for p, r in zip(predictions, references, strict=True)]
             metrics.mean_edit_distance = sum(edit_distances) / len(edit_distances)
             
             ned_values = [

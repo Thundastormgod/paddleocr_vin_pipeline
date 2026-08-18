@@ -28,6 +28,7 @@ Industry Standard Metrics:
 
 from typing import Dict, List, Tuple, Any, Optional
 import json
+import math
 import os
 from pathlib import Path
 from datetime import datetime
@@ -370,6 +371,42 @@ def calculate_char_level_metrics(predictions: List[str], ground_truths: List[str
     calc = VINMetricsCalculator()
     calc.add_batch(predictions, ground_truths)
     return calc._calculate_character_level_metrics()
+
+
+def require_finite_loss(value: float, *, context: str) -> float:
+    """
+    Assert a loss value is finite before it enters an epoch average.
+
+    A non-finite loss silently poisons every number computed from it: one
+    NaN batch makes the epoch average NaN, the "best accuracy" comparison
+    always False, and the training log useless - while training keeps
+    running and burning compute. The dominant local cause is a CTC
+    alignment that cannot exist: fewer output timesteps than target
+    characters (SVTR_LCNet once downsampled width 32x, giving T=10 for
+    17-character VINs).
+
+    Args:
+        value: The batch loss, already converted to a Python float.
+        context: Where the loss came from, for the error message
+            (e.g. "SVTR_LCNet training epoch 3 batch 41").
+
+    Returns:
+        The same value, when finite.
+
+    Raises:
+        RuntimeError: If the value is NaN or infinite. Failing the run
+            immediately is the point: there is no valid way to continue
+            averaging a poisoned loss.
+    """
+    if not math.isfinite(value):
+        raise RuntimeError(
+            f"non-finite loss ({value}) at {context}. Training cannot "
+            f"continue: every average this value enters becomes "
+            f"meaningless. For CTC models this usually means the output "
+            f"sequence is shorter than the label (timesteps < 17) - check "
+            f"the backbone's width downsampling."
+        )
+    return value
 
 
 if __name__ == "__main__":

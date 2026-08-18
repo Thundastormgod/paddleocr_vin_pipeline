@@ -104,9 +104,11 @@ if __name__ == "__main__":
 # Import unified VIN preprocessing module
 try:
     from ..preprocessing import VINPreprocessor, PreprocessConfig, PreprocessStrategy
+    from .metrics import require_finite_loss
 except ImportError:
     # Fallback for direct execution
     from src.vin_ocr.preprocessing import VINPreprocessor, PreprocessConfig, PreprocessStrategy
+    from src.vin_ocr.training.metrics import require_finite_loss
 
 # Import hardware detection
 try:
@@ -1427,7 +1429,11 @@ class VINFineTuner:
             
             self.optimizer.clear_grad()
             
-            total_loss += loss.item()
+            total_loss += require_finite_loss(
+                loss.item(),
+                context=f"finetune training epoch {self.current_epoch} "
+                        f"batch {batch_idx}",
+            )
             num_batches += 1
             self.global_step += 1
             
@@ -1480,7 +1486,10 @@ class VINFineTuner:
                 labels_flat = labels.reshape([-1])
                 loss = self.criterion(logits_flat, labels_flat)
             
-            total_loss += loss.item()
+            total_loss += require_finite_loss(
+                loss.item(),
+                context=f"finetune validation epoch {self.current_epoch}",
+            )
             
             # Decode predictions
             predictions = self._decode_predictions(logits)

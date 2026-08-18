@@ -65,12 +65,16 @@ The Web UI automatically discovers and lists fine-tuned models for inference:
 
 ### Automatic Model Discovery
 
-Fine-tuned models are automatically detected from these directories:
+Fine-tuned models are detected from the output directory only
+(`src/vin_ocr/web/app.py` scans `Config.OUTPUT_DIR` subdirectories plus
+`output/onnx/`):
 - `output/vin_rec_finetune/` - PaddleOCR fine-tuned models
-- `output/paddleocr_scratch/` - Models trained from scratch  
+- `output/paddleocr_scratch_*/` - Models trained from scratch
 - `output/deepseek_finetune/` - DeepSeek fine-tuned models
-- `models/finetuned/` - Manually placed models
-- `output/onnx/`, `models/onnx/` - ONNX exported models
+- `output/onnx/` - ONNX exported models
+
+`models/finetuned/` and `models/onnx/` are NOT scanned - place models under
+`output/` for the UI to find them.
 
 ### Model Selection for Inference
 
@@ -179,7 +183,8 @@ PaddleOCR(
 **Description:** PaddleOCR model fine-tuned specifically on VIN images for improved accuracy.
 
 **Training Configuration:**
-- Base: CRNN or SVTR architecture
+- Base: PP-OCRv4 or PP-OCRv5 (the trainer raises on any other algorithm;
+  CRNN/SVTR are available only in the from-scratch trainer)
 - Dataset: VIN-specific images
 - Output: `output/vin_rec_finetune/best_accuracy.pdparams`
 
@@ -398,7 +403,7 @@ pip install onnx onnxruntime paddle2onnx
 | Model Type | Output Directory | Key Files |
 |------------|------------------|-----------|
 | Fine-tuned | `output/vin_rec_finetune/` | `best_accuracy.pdparams`, `latest.pdparams` |
-| Scratch | `output/paddleocr_scratch_*/` | `best_model/`, `training_log.json` |
+| Scratch | `output/paddleocr_scratch_*/` | `best_model/` checkpoint |
 | Tuning | `output/*_tuning_*/` | `optimization_results.json`, `trial_history.csv` |
 
 ### Evaluation Results
@@ -411,18 +416,15 @@ pip install onnx onnxruntime paddle2onnx
 
 ---
 
-## 🔄 Model Selection Logic
+## 🔄 Model Selection
 
-The pipeline automatically selects models based on availability:
+There is no automatic priority/fallback selection logic in the code:
 
-```python
-# Priority order for inference
-1. Fine-tuned model (if exists and validated)
-2. VIN Pipeline (default)
-3. PaddleOCR PP-OCRv4 (fallback)
-```
-
-For evaluation, all available models are tested and compared.
+- **Inference (web UI):** the model is chosen manually from a dropdown of
+  discovered models.
+- **Evaluation:** `multi_model_evaluation.py` loads every model it can and
+  compares them; models that fail to load or run are reported under
+  `not_evaluated` in the results JSON rather than scored.
 
 ---
 

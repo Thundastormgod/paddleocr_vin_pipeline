@@ -1,5 +1,16 @@
 # DVC + DagsHub Data Streaming Setup
 
+> [!WARNING]
+> **PROVENANCE CORRECTION (2026-08-18).** The streaming integration this
+> document describes **does not exist in this repository**: it depends on
+> `src/vin_ocr/data/` (never committed), and both entry points
+> (`setup_dagshub_dvc.py`, `train_vin_streaming.py`) crash on import with
+> `ModuleNotFoundError` - reproduced during audit. The `--stream` flag is
+> never registered because its import guard always fails. Claims below of
+> a "complete", "functional" or "production-ready" streaming setup are
+> false. Only the plain DVC remote configuration (`.dvc/config`) is real.
+
+
 This guide shows how to set up DVC and DagsHub data streaming for the VIN OCR project, allowing training without local data downloads.
 
 ## 🚀 Quick Start

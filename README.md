@@ -9,14 +9,17 @@ and postprocessing.
 ## Key Metrics (Current Performance)
 
 Rule-based pipeline (PaddleOCR + preprocessing + postprocessing).
-**Measured on n=20 images**, not the full 382-image set — see the correction below.
+**Measured on n=20 images**, not the full 381-image set — see the correction below.
 
 | Metric                   | Value | Baseline | Improvement |
 |--------------------------|-------|----------|-------------|
-| **Character-Level F1**   | 55%   | 43%      | +29%        |
+| **Character-Level F1**   | 55.3% | 43%      | +29%        |
 | **Exact Match Rate**     | 25%   | 5%       | 1/20 → 5/20 |
-| **Precision**            | 57%   | 45%      | +27%        |
-| **Recall**               | 54%   | 42%      | +29%        |
+
+Pipeline precision/recall were **not numerically recorded** — the source
+artifact (`results/experiment_summary.json`) stores them as the string
+`"improved"`. Baseline (raw PaddleOCR) precision/recall from
+`results/detailed_metrics.json`: **41.7% / 44.4%**.
 
 > **Note:** Industry target is 95%+ exact match and 98%+ F1.
 > This pipeline establishes a baseline for further development.
@@ -80,7 +83,7 @@ come from the PaddleOCR pipeline, which does not use that char map.
 
 | Property       | Value                                    |
 |----------------|------------------------------------------|
-| Total Images   | 382 VIN plate images                     |
+| Total Images   | 381 VIN plate images (`results/experiment_summary.json`) |
 | Source         | DagsHub bucket (JRL-VIN project)         |
 | Image Type     | Engraved metal VIN plates from vehicles  |
 | Ground Truth   | Manual annotations with verified VINs    |
@@ -98,11 +101,15 @@ come from the PaddleOCR pipeline, which does not use that char map.
 | Metric              | Baseline       | With Pipeline  | Improvement | Industry Target |
 |---------------------|----------------|----------------|-------------|-----------------|
 | Exact Match Rate    | 5% (1/20)      | 25% (5/20)     | +4 images   | 95%+            |
-| Character-Level F1  | 43%            | 55%            | +29%        | 98%+            |
-| Precision           | 45%            | 57%            | +27%        | 98%+            |
-| Recall              | 42%            | 54%            | +29%        | 98%+            |
-| Detection Rate      | 99.7%          | 99.7%          | --          | 99%+            |
-| Avg Processing Time | ~1.6s/image    | ~2.3s/image    | +44%        | <5s             |
+| Character-Level F1  | 43%            | 55.3%          | +29%        | 98%+            |
+| Precision           | 41.7%          | not recorded   | --          | 98%+            |
+| Recall              | 44.4%          | not recorded   | --          | 98%+            |
+| Avg Processing Time | not recorded   | 3.3s/image (3306 ms) | --    | <5s             |
+
+> "Detection Rate 99.7%" appeared in earlier versions of this table; no code
+> path in this repository computes a detection rate and the figure exists
+> only as a hand-entered value in `results/detailed_metrics.json`. Pipeline
+> precision/recall and baseline timing were never numerically recorded.
 
 ### Additional Metrics to Explore
 
@@ -197,7 +204,7 @@ This baseline establishes:
 | 1000-VIN_-_SAL1P9EU2SA606633_.jpg | SAL1P9EU2SA606633   | 1401SA10EH/SA5066331   | 33%  | No    |
 | 1001-VIN_-_SAL1P9EU2SA606664_.jpg | SAL1P9EU2SA606664   | SAL1P9EU2SA606664      | 96%  | Yes   |
 
-**Summary:** 1/4 exact matches (25%) - consistent with full dataset results
+**Summary:** 1/4 exact matches (25%) on these four examples. No full-dataset run exists to compare against (n=20 is the largest recorded evaluation).
 
 ### Errors Encountered During Development
 
@@ -257,7 +264,7 @@ This installs all core dependencies including:
 ```bash
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"      # or ".[all]" for web + training + onnx
-pytest                        # 167 tests, no GPU or model weights required
+pytest                        # 371 tests (358 run, 13 skipped), no GPU or model weights required
 ```
 
 Copy `.env.example` to `.env` and fill in credentials (DagsHub tokens, device
@@ -334,10 +341,10 @@ streamlit run src/vin_ocr/web/app.py --server.port 8080
 
 | Page | Description |
 |------|-------------|
-| 🔍 **Recognition** | Upload single images for VIN extraction |
-| 📊 **Batch Evaluation** | Process folders with metrics comparison |
+| 📁 **Data Management** | Prepare datasets and labels |
 | 🎯 **Training** | Configure and monitor model training |
-| 📈 **Dashboard** | View results and export data |
+| 🔍 **Inference** | Upload images for VIN extraction |
+| 📈 **Results Dashboard** | View results and export data |
 
 ---
 
@@ -556,7 +563,7 @@ paddleocr_vin_pipeline/
 │
 ├── configs/                  # Training configs + vin_dict.txt charset
 ├── scripts/                  # Standalone ONNX / data utilities
-├── tests/                    # 167 tests (no GPU or weights needed)
+├── tests/                    # 371 tests (no GPU or weights needed)
 ├── docker/                   # CPU + GPU images, compose, entrypoint
 ├── .github/workflows/ci.yml  # Tests, lint, secrets scan, build
 │
@@ -642,7 +649,7 @@ pytest tests/test_vin_pipeline.py -v
 
 ### Data Access
 
-The 382 test images are in DagsHub: `Thundastormgod/jrl-vin`  
+The test images (381 per `results/experiment_summary.json`) are in DagsHub: `Thundastormgod/core-vin`  
 Path: `data/paddleocr_sample/`
 
 ### Known Limitations

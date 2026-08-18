@@ -63,6 +63,27 @@ VIN_LENGTH = VINConstants.LENGTH
 VIN_VALID_CHARS = VINConstants.VALID_CHARS
 VIN_INVALID_CHARS = VINConstants.INVALID_CHARS
 
+# Artifact characters that may be stripped from OCR output.
+#
+# An "artifact" is any character that cannot appear in a VIN at all - plate
+# borders, stamps, scratches and reflections produce these. Deliberately does
+# NOT include letters like X, Y, T, F or A: those are valid VIN characters and
+# stripping them corrupts legitimate VINs. (RuleBasedCorrector previously used
+# the patterns `^[*#XYT]+` and `^[IYTFA][*#]*`; the first removed the leading
+# character of every Volvo "YV1..." VIN, and the second matched with zero
+# trailing artifacts, so any VIN beginning with I/Y/T/F/A silently lost its
+# first character.)
+#
+# This is the single definition. VINPostProcessor (pipeline) and
+# RuleBasedCorrector (this module) both strip with NON_VIN_RUN below; a
+# second copy of either is how the Y-eating bug survived its first fix.
+ARTIFACT_CHARS: FrozenSet[str] = frozenset('*#@$%^&()[]{}<>/\\|!?,;:"\'`~+=_ .-')
+
+# Matches any run of characters that cannot occur in a VIN. I/O/Q are
+# deliberately allowed through so the invalid-character stage can map them to
+# 1/0/0 instead of deleting the evidence.
+NON_VIN_RUN: re.Pattern = re.compile(r'[^0-9A-Z]+')
+
 
 # =============================================================================
 # FILENAME VIN EXTRACTION
@@ -461,16 +482,16 @@ class RuleBasedCorrector:
         'Q': '0',  # Q looks like 0 (round shape)
     }
     
-    # Common OCR confusions on engraved metal
-    GLOBAL_CONFUSION_RULES: Dict[str, str] = {
-        # Lowercase to uppercase (OCR sometimes outputs lowercase)
-        'i': '1', 'l': '1', 'o': '0', 'q': '0',
-        # Similar-looking characters
-        '|': '1', '!': '1', '/': '1',
-        '(': 'C', ')': 'J',
-        '$': 'S', '§': 'S',
-        '@': 'A', '&': '8',
-    }
+    # Global (position-independent) confusion mappings.
+    #
+    # Empty by design, not by omission: correct() uppercases first (making
+    # lowercase keys unreachable) and then strips every non-[0-9A-Z] run with
+    # the canonical NON_VIN_RUN (removing punctuation before any mapping could
+    # fire). The punctuation entries this dict used to carry ('|'->'1',
+    # '('->'C', ...) were therefore dead code, and I/O/Q are handled by
+    # INVALID_CHAR_RULES. The mechanism stays so add_learned_rules() can
+    # inject mappings measured from data.
+    GLOBAL_CONFUSION_RULES: Dict[str, str] = {}
     
     # Position 12-17 (sequential number) should be digits
     # These rules only apply to those positions
@@ -488,16 +509,6 @@ class RuleBasedCorrector:
         'I': '1', 'i': '1',
         'C': '0', 'c': '0',  # C can look like 0
     }
-    
-    # Artifact characters to remove
-    ARTIFACT_CHARS: FrozenSet[str] = frozenset('*#@$%^&')
-    
-    # Artifact patterns at string boundaries
-    ARTIFACT_PATTERNS: List[re.Pattern] = [
-        re.compile(r'^[*#XYT]+'),      # Start artifacts
-        re.compile(r'[*#]+$'),          # End artifacts
-        re.compile(r'^[IYTFA][*#]+'),   # Common prefix + artifacts
-    ]
     
     def __init__(self, learned_rules: Optional[Dict[str, str]] = None):
         """
@@ -585,15 +596,20 @@ class RuleBasedCorrector:
         }
     
     def _remove_artifacts(self, text: str) -> str:
-        """Remove common artifact characters and patterns."""
-        # Apply regex patterns
-        for pattern in self.ARTIFACT_PATTERNS:
-            text = pattern.sub('', text)
-        
-        # Remove individual artifact chars
-        text = ''.join(c for c in text if c not in self.ARTIFACT_CHARS)
-        
-        return text
+        """
+        Strip characters that cannot occur in a VIN.
+
+        Uses the module-level NON_VIN_RUN - the same rule VINPostProcessor
+        applies - so only non-alphanumeric noise (plate borders, stamps,
+        scratches: ``* # / | \\ - . space`` etc.) is removed. Letters are
+        never removed: this method previously applied ``^[*#XYT]+``, which
+        deleted the leading character of every VIN starting with X, Y or T
+        (e.g. Volvo "YV1...") and returned a 16-character result.
+
+        I/O/Q are intentionally preserved here - they are plausible OCR
+        output that _apply_global_rules maps to 1/0/0 via INVALID_CHAR_RULES.
+        """
+        return NON_VIN_RUN.sub('', text)
     
     def _apply_global_rules(self, text: str) -> str:
         """Apply global character substitution rules."""

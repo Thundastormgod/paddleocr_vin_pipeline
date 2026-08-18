@@ -171,21 +171,11 @@ INVALID_CHAR_FIXES: Dict[str, str] = {
     'Q': '0',
 }
 
-# Artifact characters to remove.
-#
-# An "artifact" is any character that cannot appear in a VIN at all — plate
-# borders, stamps, scratches and reflections produce these. Deliberately does
-# NOT include letters like X, Y, T, F or A: those are valid VIN characters and
-# stripping them corrupts legitimate VINs.
-#
-# (The previous patterns `^[*#XYT]+` and `^[IYTFA][*#]*` did exactly that; the
-# second matched with zero trailing artifacts, so any VIN beginning with
-# I/Y/T/F/A silently lost its first character.)
-ARTIFACT_CHARS: frozenset = frozenset('*#@$%^&()[]{}<>/\\|!?,;:"\'`~+=_ .-')
-
-# Matches any run of non-alphanumeric characters. I/O/Q are deliberately
-# allowed through so _fix_invalid_chars can map them to 1/0/0.
-_NON_VIN_RUN: re.Pattern = re.compile(r'[^0-9A-Z]+')
+# Artifact stripping: single definition in core.vin_utils, shared with
+# RuleBasedCorrector. A local copy here is how the Y-eating `^[*#XYT]+` bug
+# survived its first fix - it was corrected in this file and left live in the
+# corrector. See the commentary next to the definitions in core/vin_utils.py.
+from ..core.vin_utils import ARTIFACT_CHARS, NON_VIN_RUN as _NON_VIN_RUN
 
 # Position-based character confusion (for ambiguous cases).
 # Positions 12-17 hold the sequential production number, which is *usually*

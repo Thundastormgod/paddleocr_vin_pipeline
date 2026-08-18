@@ -181,8 +181,76 @@ if logger.handlers:
 # CONFIGURATION
 # =============================================================================
 
+class ConfigValidationError(ValueError):
+    """A training config is missing keys or carries unusable values."""
+
+
+#: (path, type) for every key the trainer reads unconditionally. A missing
+#: key used to surface as a bare KeyError deep inside the run; now it is a
+#: named, complete report at startup.
+_REQUIRED_CONFIG_KEYS = (
+    (('Global', 'epoch_num'), int),
+    (('Global', 'save_model_dir'), str),
+    (('Global', 'save_epoch_step'), int),
+    (('Global', 'character_dict_path'), str),
+    (('Global', 'max_text_length'), int),
+    (('Optimizer', 'name'), str),
+    (('Optimizer', 'lr', 'name'), str),
+    (('Optimizer', 'lr', 'learning_rate'), (int, float)),
+    (('Architecture', 'algorithm'), str),
+    (('Loss', 'name'), str),
+    (('PostProcess', 'name'), str),
+    (('Train', 'dataset', 'data_dir'), str),
+    (('Train', 'dataset', 'label_file_list'), list),
+    (('Train', 'loader', 'batch_size_per_card'), int),
+    (('Eval', 'dataset', 'data_dir'), str),
+    (('Eval', 'dataset', 'label_file_list'), list),
+    (('Eval', 'loader', 'batch_size_per_card'), int),
+)
+
+
+def validate_config(config: Dict) -> None:
+    """
+    Validate a training config at startup, reporting EVERY problem at once.
+
+    Args:
+        config: Parsed YAML config.
+
+    Raises:
+        ConfigValidationError: Listing all missing/mistyped keys and any
+            value known-unusable from measurement (e.g. a learning rate in
+            the CTC blank-collapse region).
+    """
+    problems: List[str] = []
+    for path, expected in _REQUIRED_CONFIG_KEYS:
+        node: Any = config
+        for key in path:
+            if not isinstance(node, dict) or key not in node:
+                problems.append(f"missing key: {'.'.join(path)}")
+                node = None
+                break
+            node = node[key]
+        if node is not None and not isinstance(node, expected):
+            problems.append(
+                f"{'.'.join(path)}: expected {expected}, got {type(node).__name__} ({node!r})"
+            )
+
+    lr = (config.get('Optimizer', {}).get('lr', {}) or {}).get('learning_rate')
+    if isinstance(lr, (int, float)) and lr > 0.002:
+        problems.append(
+            f"Optimizer.lr.learning_rate={lr}: measured on this architecture, "
+            f"rates above ~2e-3 collapse CTC training into the blank basin "
+            f"permanently (loss pinned at ln(num_classes)). Use <=0.002."
+        )
+
+    if problems:
+        raise ConfigValidationError(
+            "config validation failed:\n  - " + "\n  - ".join(problems)
+        )
+
+
 def load_config(config_path: str) -> Dict:
-    """Load YAML configuration file with path resolution."""
+    """Load and validate a YAML configuration file with path resolution."""
     # Resolve path relative to project root
     config_file = Path(config_path)
     if not config_file.is_absolute():
@@ -198,6 +266,7 @@ def load_config(config_path: str) -> Dict:
     
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
+    validate_config(config)
     return config
 
 
@@ -371,15 +440,30 @@ class VINRecognitionDataset(Dataset):
         return len(self.samples)
     
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        # Skip unreadable images by advancing to the next sample - but with
+        # a bounded LOOP, not recursion: the previous implementation
+        # recursed on (idx+1) % len, which is infinite recursion when every
+        # image is unreadable and silently duplicates neighbours otherwise.
+        # One full cycle without a readable image is a dataset failure and
+        # raises.
+        image = None
         img_path, label = self.samples[idx]
-        
-        # Load image with proper error handling (no dummy data per Zero-Scaffold Policy)
-        image = cv2.imread(img_path)
+        for offset in range(len(self.samples)):
+            img_path, label = self.samples[(idx + offset) % len(self.samples)]
+            image = cv2.imread(img_path)
+            if image is not None:
+                if offset:
+                    logger.warning(
+                        f"Skipped {offset} unreadable image(s) starting at "
+                        f"{self.samples[idx][0]}"
+                    )
+                break
         if image is None:
-            # Fail fast: Skip corrupted samples by returning next valid sample
-            # This maintains training integrity - never train on fake data
-            logger.warning(f"Failed to load image: {img_path}, skipping to next sample")
-            return self.__getitem__((idx + 1) % len(self.samples))
+            raise RuntimeError(
+                f"No readable image in the entire dataset "
+                f"({len(self.samples)} samples); first path: "
+                f"{self.samples[idx][0]}"
+            )
         
         # Augment and preprocess
         if self.is_training:
@@ -592,10 +676,21 @@ def update_early_stopping(
     previous_best: float,
     epochs_without_improvement: int,
     min_delta: float,
+    val_loss: Optional[float] = None,
+    best_val_loss: Optional[float] = None,
+    loss_min_delta: float = 0.0,
 ) -> Tuple[bool, int]:
     """
     One early-stopping bookkeeping step. Pure function so the decision
     logic is unit-testable without paddle.
+
+    Improvement is EITHER metric getting better: exact-match accuracy OR
+    validation loss. Accuracy alone is a defective stopping signal for CTC
+    on small validation sets: it sits at exactly 0 through the entire
+    blank-collapse phase and is quantised to 1/n_val steps afterwards.
+    Observed live on the first real dataset run: val_loss fell 13.6 -> 0.91
+    over 17 epochs while exact-match stayed 0.0 - an accuracy-only counter
+    would have killed a converging run at patience+1.
 
     Args:
         val_accuracy: This epoch's validation accuracy.
@@ -605,14 +700,25 @@ def update_early_stopping(
             (always False), the counter never resets, and every run is
             killed after exactly patience+1 epochs regardless of progress.
         epochs_without_improvement: Current counter value.
-        min_delta: Minimum improvement that resets the counter.
+        min_delta: Minimum accuracy improvement that resets the counter.
+        val_loss: This epoch's validation loss (optional; loss-awareness is
+            skipped when None).
+        best_val_loss: Best (lowest) validation loss BEFORE this epoch.
+        loss_min_delta: Minimum loss decrease that resets the counter.
 
     Returns:
         (improved, new_counter): improved is True when this epoch beat the
-        previous best by more than min_delta; new_counter is 0 on
+        previous best accuracy by more than min_delta OR reduced the best
+        validation loss by more than loss_min_delta; new_counter is 0 on
         improvement, otherwise the incremented count.
     """
-    if val_accuracy > previous_best + min_delta:
+    improved_accuracy = val_accuracy > previous_best + min_delta
+    improved_loss = (
+        val_loss is not None
+        and best_val_loss is not None
+        and val_loss < best_val_loss - loss_min_delta
+    )
+    if improved_accuracy or improved_loss:
         return True, 0
     return False, epochs_without_improvement + 1
 
@@ -987,6 +1093,7 @@ class VINFineTuner:
         self.global_step = 0
         self.current_epoch = 0
         self.best_accuracy = 0.0
+        self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
         
         # Graceful shutdown support
@@ -1870,25 +1977,39 @@ class VINFineTuner:
                 print(f"  🎉 New best accuracy: {val_accuracy:.4f}")
             
             # Early stopping logic (decision logic is the pure helper
-            # update_early_stopping, unit-tested without paddle)
+            # update_early_stopping, unit-tested without paddle).
+            # Loss-aware: exact-match sits at 0 through the whole
+            # blank-collapse phase, so the counter also resets while
+            # validation loss keeps falling, and a min-epochs floor stops
+            # the counter from firing during warmup at all.
             stop_early = False
             early_stopping_enabled = self.config['Global'].get('early_stopping', False)
             if early_stopping_enabled:
                 patience = self.config['Global'].get('early_stopping_patience', 7)
                 min_delta = self.config['Global'].get('early_stopping_min_delta', 0.001)
+                loss_min_delta = self.config['Global'].get('early_stopping_loss_min_delta', 0.005)
+                min_epochs = self.config['Global'].get('early_stopping_min_epochs', 0)
+                
+                previous_best_loss = self.best_val_loss
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
                 
                 improved, self.epochs_without_improvement = update_early_stopping(
                     val_accuracy=val_accuracy,
                     previous_best=previous_best,
                     epochs_without_improvement=self.epochs_without_improvement,
                     min_delta=min_delta,
+                    val_loss=val_loss,
+                    best_val_loss=previous_best_loss,
+                    loss_min_delta=loss_min_delta,
                 )
                 if improved:
-                    print(f"  📈 Improvement detected: {val_accuracy:.4f} > {previous_best + min_delta:.4f}")
+                    print(f"  📈 Improvement detected (accuracy or val_loss)")
                 else:
-                    print(f"  ⏳ No improvement: {self.epochs_without_improvement}/{patience} epochs (need >{min_delta:.4f} improvement)")
+                    print(f"  ⏳ No improvement: {self.epochs_without_improvement}/{patience} epochs "
+                          f"(need acc >+{min_delta:.4f} or val_loss -{loss_min_delta:.4f})")
                 
-                if self.epochs_without_improvement >= patience:
+                if self.epochs_without_improvement >= patience and epoch >= min_epochs:
                     print(f"  🛑 Early stopping triggered after {patience} epochs without improvement")
                     print(f"  📊 Best accuracy achieved: {self.best_accuracy:.4f}")
                     stop_early = True
@@ -2007,21 +2128,38 @@ class VINFineTuner:
             logger.warning(f"Could not save progress file: {e}")
     
     def _ctc_greedy_decode(self, logits: paddle.Tensor) -> List[str]:
-        """CTC greedy decoding for batch of logits."""
-        probs = paddle.nn.functional.softmax(logits, axis=-1)
-        preds = paddle.argmax(probs, axis=-1).numpy()  # [B, T]
+        """CTC greedy decoding for a batch of logits (canonical decoder)."""
+        texts, _ = self._ctc_greedy_decode_with_confidence(logits)
+        return texts
+    
+    def _ctc_greedy_decode_with_confidence(
+        self, logits: paddle.Tensor
+    ) -> Tuple[List[str], List[float]]:
+        """
+        Decode a batch and compute per-sample confidence over the EMITTED
+        timesteps only.
         
-        decoded_batch = []
-        for seq in preds:
-            decoded = []
-            prev = 0
-            for p in seq:
-                if p != prev and p != 0:  # Skip blank and repeats
-                    if p in self.idx_to_char:
-                        decoded.append(self.idx_to_char[p])
-                prev = p
-            decoded_batch.append(''.join(decoded))
-        return decoded_batch
+        Delegates to core.charset.ctc_greedy_decode (this method previously
+        inlined one more copy of the collapse loop - the duplication that
+        produced the three-blank-indices bug elsewhere). Confidence is the
+        mean per-timestep max-probability at the kept positions; an empty
+        decode has confidence 0.0. The previous definition averaged max
+        probabilities over the first 17 timesteps, which for a blank-heavy
+        CTC output reports the confidence OF PREDICTING NOTHING - an
+        all-blank model scored 92.6%.
+        """
+        from src.vin_ocr.core.charset import ctc_greedy_decode
+        
+        probs = paddle.nn.functional.softmax(logits, axis=-1).numpy()  # [B, T, C]
+        texts: List[str] = []
+        confidences: List[float] = []
+        for sample_probs in probs:
+            indices = sample_probs.argmax(axis=-1)
+            text, kept = ctc_greedy_decode(indices, self.idx_to_char)
+            step_max = sample_probs.max(axis=-1)
+            confidences.append(float(step_max[kept].mean()) if kept else 0.0)
+            texts.append(text)
+        return texts, confidences
     
     def _evaluate_full(self) -> Dict[str, Any]:
         """
@@ -2049,20 +2187,24 @@ class VINFineTuner:
                 # Forward pass
                 logits = self.model(images)
                 
-                # Decode predictions - use same method as validation
-                # This ensures metrics are consistent with training approach
-                predictions = self._decode_predictions(logits)
-                
-                # Get confidence (max prob for each position, first 17 only)
-                max_len = self.config['Global']['max_text_length']
-                logits_trimmed = logits[:, :max_len, :]
-                probs = paddle.nn.functional.softmax(logits_trimmed, axis=-1)
-                max_probs = paddle.max(probs, axis=-1)
-                mean_conf = paddle.mean(max_probs, axis=-1).numpy()
+                # Decode + confidence in one pass. Confidence covers the
+                # EMITTED timesteps only (empty decode -> 0.0); the previous
+                # first-17-timesteps average reported the confidence of
+                # predicting nothing (92.6% for an all-blank model).
+                if self.use_ctc:
+                    predictions, batch_conf = \
+                        self._ctc_greedy_decode_with_confidence(logits)
+                else:
+                    predictions = self._decode_predictions(logits)
+                    max_len = self.config['Global']['max_text_length']
+                    probs = paddle.nn.functional.softmax(
+                        logits[:, :max_len, :], axis=-1)
+                    batch_conf = paddle.mean(
+                        paddle.max(probs, axis=-1), axis=-1).numpy().tolist()
                 
                 all_predictions.extend(predictions)
                 all_ground_truths.extend(texts)
-                all_confidences.extend(mean_conf.tolist())
+                all_confidences.extend(batch_conf)
         
         # Calculate metrics
         metrics = self._calculate_detailed_metrics(

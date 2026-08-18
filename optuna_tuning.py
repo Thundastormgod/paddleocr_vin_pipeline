@@ -77,9 +77,13 @@ class VINOCRHyperparameterTuner:
         """Create a trial configuration with suggested hyperparameters."""
         config = self.load_base_config()
         
-        # Learning Rate Tuning - Expanded range based on best performance
+        # Learning rate. Upper bound is 2e-3, NOT 1e-2: measured on the
+        # PP-OCRv4 architecture, a constant lr of 3e-3 drives training into
+        # the CTC blank basin permanently (600 steps, loss pinned at
+        # ln(34)=3.53, no escape) while 1e-3 learns. Sampling above ~2e-3
+        # spends trial budget on configurations that cannot converge.
         config['Optimizer']['lr']['learning_rate'] = trial.suggest_float(
-            'learning_rate', 0.0005, 0.01, log=True
+            'learning_rate', 0.0002, 0.002, log=True
         )
         
         # Scheduler Type and Parameters

@@ -57,9 +57,12 @@ class PaddleOCRSearchSpace:
         'PP-OCRv5', 'SVTR_LCNet', 'SVTR_Tiny', 'CRNN'
     ])
     
-    # Learning rate
+    # Learning rate. lr_max is 2e-3, not 1e-2: measured on the PP-OCRv4
+    # architecture, constant 3e-3 collapses training into the CTC blank
+    # basin permanently (loss pinned at ln(num_classes)); 1e-3 learns.
+    # Same bound as the repo-root tuner - keep them in sync.
     lr_min: float = 1e-5
-    lr_max: float = 1e-2
+    lr_max: float = 2e-3
     lr_log: bool = True  # Use log scale
     
     # Batch size

@@ -48,6 +48,7 @@ sys.path.insert(0, str(project_root))
 
 # Import shared utilities (Single Source of Truth for VIN extraction)
 from src.vin_ocr.core.vin_utils import (
+    NON_VIN_RUN,
     extract_vin_from_filename,
     extract_vin_from_text as _canonical_extract_vin,
 )
@@ -119,7 +120,10 @@ class VINCharValidator:
 
     # Any run of characters that cannot appear in a VIN (plate borders,
     # separators, stamp noise). I/O/Q pass through so CHAR_MAP can map them.
-    _NON_VIN_RUN = re.compile(r'[^0-9A-Z]+')
+    # Single definition shared with RuleBasedCorrector and VINPostProcessor;
+    # a local copy of this regex is how artifact-strip fixes have failed to
+    # propagate in this repo before.
+    _NON_VIN_RUN = NON_VIN_RUN
 
     @classmethod
     def clean_vin(cls, raw_text: str) -> str:

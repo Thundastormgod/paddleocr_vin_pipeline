@@ -32,7 +32,6 @@ from dataclasses import dataclass, field, asdict
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
-import random
 
 # Add parent directory for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -163,56 +162,66 @@ def create_splits(
     output_dir: Optional[str] = None
 ) -> Dict[str, DatasetSplit]:
     """
-    Create train/validation/test splits.
-    
+    Create train/validation/test splits, GROUPED BY VIN.
+
+    Delegates to utils.prepare_dataset.create_splits - the single splitting
+    implementation in this repository - which shuffles unique VINs (not image
+    paths) and verifies the result with assert_no_vin_leakage().
+
+    This function previously shuffled image PATHS: a physical plate that
+    appears in several images (multiple shots, crops, augmented copies) was
+    scattered across train and test, so the scoring path measured plates the
+    model had trained on. Reproduced directly before the fix: 5 VINs x 4
+    images put the same VIN in train, val and test simultaneously.
+
     Args:
         ground_truth: Dict of image_path -> VIN
-        train_ratio: Proportion for training
-        val_ratio: Proportion for validation  
-        test_ratio: Proportion for testing
+        train_ratio: Proportion of unique VINs for training
+        val_ratio: Proportion of unique VINs for validation
+        test_ratio: Proportion of unique VINs for testing
         seed: Random seed for reproducibility
         output_dir: Directory to save split files
-        
+
     Returns:
-        Dict with 'train', 'val', 'test' DatasetSplit objects
+        Dict with 'train', 'val', 'test' and 'all' DatasetSplit objects.
+        Ratios apply to unique VINs, not image counts, so image counts per
+        split vary with how many images each VIN has.
+
+    Raises:
+        ValueError: If a VIN would appear in more than one split (raised by
+            assert_no_vin_leakage inside the canonical splitter).
     """
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 0.001, \
-        "Ratios must sum to 1.0"
-    
-    # Get all paths and shuffle
-    all_paths = list(ground_truth.keys())
-    random.seed(seed)
-    random.shuffle(all_paths)
-    
-    # Calculate split sizes
-    n = len(all_paths)
-    n_train = int(n * train_ratio)
-    n_val = int(n * val_ratio)
-    
-    # Split
-    train_paths = all_paths[:n_train]
-    val_paths = all_paths[n_train:n_train + n_val]
-    test_paths = all_paths[n_train + n_val:]
-    
+    # Imported here, not at module level: prepare_dataset imports the repo's
+    # root config.py, which this module must not require for plain imports.
+    from ..utils.prepare_dataset import create_splits as create_grouped_splits
+
+    train_gt, val_gt, test_gt = create_grouped_splits(
+        ground_truth,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+        seed=seed,
+    )
+
     splits = {
         'train': DatasetSplit(
             name='train',
-            image_paths=train_paths,
-            ground_truths={p: ground_truth[p] for p in train_paths}
+            image_paths=list(train_gt.keys()),
+            ground_truths=train_gt
         ),
         'val': DatasetSplit(
-            name='val', 
-            image_paths=val_paths,
-            ground_truths={p: ground_truth[p] for p in val_paths}
+            name='val',
+            image_paths=list(val_gt.keys()),
+            ground_truths=val_gt
         ),
         'test': DatasetSplit(
             name='test',
-            image_paths=test_paths,
-            ground_truths={p: ground_truth[p] for p in test_paths}
+            image_paths=list(test_gt.keys()),
+            ground_truths=test_gt
         ),
         'all': DatasetSplit(
             name='all',
-            image_paths=all_paths,
+            image_paths=list(ground_truth.keys()),
             ground_truths=ground_truth
         )
     }

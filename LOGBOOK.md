@@ -49,6 +49,45 @@ Corrections on record, for anyone reading older documents:
 
 ## Entries
 
+### 2026-08-18 — n=1 validation: the fine-tuned checkpoint reads VINs
+
+**Hypothesis.** The recorded 0.0% for
+`output/vin_rec_finetune/best_accuracy.pdparams`
+(`results/multi_model_evaluation.json`, 50 images) was produced by the
+wrong-blank ONNX decoder (blank=33 against a blank=0 model) and measures
+the decoder, not the model. If so, decoding the same checkpoint through
+the canonical charset should produce VIN-like text, not garbage.
+
+**Change.** None to the model. paddlepaddle 3.3.1 (CPU) installed;
+checkpoint loaded into the current `VINRecognitionModel` (201/201 keys,
+zero shape mismatches — architecture code and checkpoint agree); the one
+image in the repo preprocessed exactly as the training dataset does;
+greedy-decoded with `core.charset.ctc_greedy_decode`.
+
+**Runs.** MLflow `66ec508d80344c24bcac028f2a7828ae`
+(experiment `checkpoint_validation`; replay:
+`python -m src.vin_ocr.tracking.reproduce 66ec508d80344c24bcac028f2a7828ae`).
+
+**Result.** n=1 (`data/1-VIN -SAL1A2A40SA606662.jpg`, GT
+`SAL1A2A40SA606662`). Raw greedy decode (T=80):
+`SAL1A2A40SA6062942010170736465617626961547607627601201216` — the
+prefix is unmistakably the plate being read. First-17 window
+`SAL1A2A40SA606294`: edit distance **3/17**, char accuracy **0.8235**,
+alignment F1 **0.8824**, exact match **0/1**, mean kept-step probability
+0.729.
+
+**Verdict.** Hypothesis supported at n=1: the checkpoint reads most of
+the VIN; the 0.0% on record was a decoder artifact. Two real failure
+modes observed and now on record: (a) the model emits digit garbage over
+the black-padded tail instead of blanks (57 chars decoded from 80
+timesteps), so window selection matters; (b)
+`extract_vin_from_text` picked a WORSE window than the plain prefix on
+this garbage-tailed input (edit distance 10 vs 3) — its window-selection
+heuristic deserves a look. A full re-evaluation needs the 381-image
+DagsHub set, which is not in the repo (no DVC pointers; external
+credentials required). At n=1 nothing beyond "the decoder was the
+problem" is claimed.
+
 ### 2026-08-18 — Scoring integrity: splits, corrector, metrics, decode, geometry
 
 **Problem.** Six defects in the measurement path, each confirmed live by

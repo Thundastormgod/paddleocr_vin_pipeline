@@ -36,7 +36,32 @@ of progress**. Combined with the decoder findings of `e3ca117`, the
 and a broken evaluation decoder. Re-running the study after these fixes
 is expected to move the number; nothing is claimed until measured.
 
-## C. OUTSTANDING — required for an enterprise training run
+## C. STATUS UPDATE (same day, commits 527dac1..)
+
+C1 DONE (data): authenticated to DagsHub, pulled the real recognition set
+(2,529 crops, 2,440 unique VINs, 100% checksum-valid, zero unreadable),
+fixed the single upstream VIN leak, staged VIN-grouped splits
+2,387/102/40 through the canonical no-leakage gate. The real dataset is
+5,498 images / 2,445 VINs - the historical "43-image" and "381-image"
+corpora were tiny slices of it.
+C2 DONE: vin-train finetune wraps training in tracking.start_run.
+C3 DONE: loss-aware early stopping + min-epochs floor (observed live:
+val_loss 13.6 -> 0.91 over 17 epochs with exact-match pinned at 0).
+C4 DONE: LR search space capped at 2e-3 in BOTH tuners; config validation
+rejects collapse-region rates.
+C5 DONE: confidence over emitted timesteps only (empty decode -> 0.0).
+C6 DONE: dataset skips bounded (loop + full-cycle RuntimeError).
+C9 DONE: validate_config - named errors, all problems at once.
+C10 DONE: TRAINING_RUNBOOK.md.
+
+## C-outstanding — remaining items
+
+- C7 interrupt semantics (export runs on partial weights after SIGTERM).
+- C8 CI paddle smoke job (paddle-gated tests still never run in CI).
+- DVC pointers for the pulled dataset (currently fingerprinted per-run by
+  the tracking layer; not yet dvc-tracked in-repo).
+
+## C-original list (for the record) — required for an enterprise training run
 
 ### C1. Data access (the external dependency you named)
 - **DagsHub credentials**: `cp .env.example .env`, fill

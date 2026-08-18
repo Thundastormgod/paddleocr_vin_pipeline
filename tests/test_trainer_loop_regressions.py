@@ -208,3 +208,186 @@ class TestCheckpointDurability:
         assert fresh.current_epoch == 9
         assert fresh.global_step == 123
         assert fresh.best_accuracy == 0.5
+
+
+class TestLossAwareEarlyStopping:
+    """
+    Readiness item C3: accuracy alone is a defective stopping signal for
+    CTC (it sits at 0 through the whole blank-collapse phase - observed
+    live: val_loss fell 13.6 -> 0.91 over 17 epochs with exact-match 0.0).
+    The counter must also reset while validation loss keeps falling.
+    """
+
+    def test_falling_loss_resets_counter_while_accuracy_flat(self):
+        improved, counter = update_early_stopping(
+            val_accuracy=0.0, previous_best=0.0,
+            epochs_without_improvement=16, min_delta=0.001,
+            val_loss=0.91, best_val_loss=0.95, loss_min_delta=0.005,
+        )
+        assert improved is True
+        assert counter == 0
+
+    def test_flat_loss_and_flat_accuracy_increment(self):
+        improved, counter = update_early_stopping(
+            val_accuracy=0.0, previous_best=0.0,
+            epochs_without_improvement=3, min_delta=0.001,
+            val_loss=0.95, best_val_loss=0.95, loss_min_delta=0.005,
+        )
+        assert improved is False
+        assert counter == 4
+
+    def test_loss_min_delta_boundary_is_strict(self):
+        improved, _ = update_early_stopping(
+            val_accuracy=0.0, previous_best=0.0,
+            epochs_without_improvement=0, min_delta=0.001,
+            val_loss=0.945, best_val_loss=0.95, loss_min_delta=0.005,
+        )
+        assert improved is False  # exactly loss_min_delta is not enough
+
+    def test_without_loss_arguments_behaviour_is_accuracy_only(self):
+        """Backward compatibility: the 4-argument form still works."""
+        improved, counter = update_early_stopping(
+            val_accuracy=0.5, previous_best=0.4,
+            epochs_without_improvement=9, min_delta=0.001,
+        )
+        assert improved is True and counter == 0
+
+
+class TestConfigValidation:
+    """Readiness item C9: named errors at startup, all problems at once."""
+
+    def test_repo_default_config_validates(self):
+        import yaml
+        from src.vin_ocr.training.finetune_paddleocr import validate_config
+        config = yaml.safe_load(
+            (REPO_ROOT / "configs" / "vin_finetune_config.yml").read_text()
+        )
+        validate_config(config)  # must not raise
+
+    def test_all_problems_reported_at_once(self):
+        from src.vin_ocr.training.finetune_paddleocr import (
+            ConfigValidationError,
+            validate_config,
+            _REQUIRED_CONFIG_KEYS,
+        )
+        with pytest.raises(ConfigValidationError) as excinfo:
+            validate_config({})
+        # every required key is reported, not just the first
+        assert str(excinfo.value).count("missing key") == len(_REQUIRED_CONFIG_KEYS)
+
+    def test_type_errors_are_named(self):
+        from src.vin_ocr.training.finetune_paddleocr import (
+            ConfigValidationError,
+            validate_config,
+        )
+        with pytest.raises(ConfigValidationError) as excinfo:
+            validate_config({'Global': {'epoch_num': 'thirty'}})
+        assert "Global.epoch_num" in str(excinfo.value)
+        assert "str" in str(excinfo.value)
+
+    def test_collapse_region_learning_rate_is_rejected(self):
+        """Measured: >~2e-3 pins CTC loss at ln(num_classes) permanently."""
+        import yaml
+        from src.vin_ocr.training.finetune_paddleocr import (
+            ConfigValidationError,
+            validate_config,
+        )
+        config = yaml.safe_load(
+            (REPO_ROOT / "configs" / "vin_finetune_config.yml").read_text()
+        )
+        config['Optimizer']['lr']['learning_rate'] = 0.003
+        with pytest.raises(ConfigValidationError) as excinfo:
+            validate_config(config)
+        assert "blank basin" in str(excinfo.value)
+
+
+class TestDatasetSkipsAreBounded:
+    """Readiness item C6: unreadable images must not recurse forever."""
+
+    @pytest.fixture()
+    def dataset_factory(self, tmp_path):
+        paddle = pytest.importorskip("paddle")
+        import numpy as np
+        import cv2
+        from src.vin_ocr.core.charset import load_char_dict
+        from src.vin_ocr.training.finetune_paddleocr import VINRecognitionDataset
+
+        char_to_idx, _ = load_char_dict("configs/vin_dict.txt")
+
+        def build(good: int, corrupt: int):
+            lines = []
+            for i in range(good):
+                name = f"good_{i}.jpg"
+                img = np.full((64, 320, 3), 128, np.uint8)
+                cv2.putText(img, "SAL1A2A40SA606662", (5, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                cv2.imwrite(str(tmp_path / name), img)
+                lines.append(f"{name}\tSAL1A2A40SA606662")
+            for i in range(corrupt):
+                name = f"corrupt_{i}.jpg"
+                (tmp_path / name).write_bytes(b"this is not a jpeg")
+                lines.append(f"{name}\tSAL1A2A40SA606662")
+            labels = tmp_path / "labels.txt"
+            labels.write_text("\n".join(lines) + "\n")
+            return VINRecognitionDataset(
+                data_dir=str(tmp_path), label_file=str(labels),
+                char_dict=char_to_idx, is_training=False,
+            )
+
+        return build
+
+    def test_corrupt_image_skips_to_next_readable(self, dataset_factory):
+        ds = dataset_factory(good=1, corrupt=1)
+        # index 1 is the corrupt file; item must come from the good one
+        item = ds[1]
+        assert item['text'] == "SAL1A2A40SA606662"
+        assert item['image'].shape[0] == 3  # CHW, real tensor
+
+    def test_all_corrupt_raises_instead_of_recursing(self, dataset_factory):
+        ds = dataset_factory(good=0, corrupt=3)
+        with pytest.raises(RuntimeError) as excinfo:
+            ds[0]
+        assert "No readable image" in str(excinfo.value)
+
+
+class TestDecodeConfidence:
+    """Readiness item C5: confidence covers emitted timesteps only."""
+
+    @pytest.fixture()
+    def decoder(self):
+        paddle = pytest.importorskip("paddle")
+        from src.vin_ocr.core.charset import load_char_dict
+        trainer = VINFineTuner.__new__(VINFineTuner)
+        char_to_idx, idx_to_char = load_char_dict("configs/vin_dict.txt")
+        trainer.idx_to_char = idx_to_char
+        trainer.char_dict = char_to_idx
+        return trainer, char_to_idx
+
+    def test_all_blank_output_has_zero_confidence(self, decoder):
+        import numpy as np
+        import paddle
+        trainer, _ = decoder
+        logits = np.full((1, 10, 34), -10.0, dtype='float32')
+        logits[:, :, 0] = 10.0  # blank everywhere, very confidently
+        texts, confs = trainer._ctc_greedy_decode_with_confidence(
+            paddle.to_tensor(logits)
+        )
+        assert texts == ['']
+        assert confs == [0.0], (
+            "an empty decode must report 0 confidence, not the confidence "
+            "of predicting nothing"
+        )
+
+    def test_emitted_sequence_confidence_comes_from_kept_steps(self, decoder):
+        import numpy as np
+        import paddle
+        trainer, char_to_idx = decoder
+        seq = [0, char_to_idx['1'], 0, char_to_idx['M'], 0, char_to_idx['8'], 0]
+        logits = np.full((1, len(seq), 34), -10.0, dtype='float32')
+        for t, idx in enumerate(seq):
+            logits[0, t, idx] = 10.0
+        texts, confs = trainer._ctc_greedy_decode_with_confidence(
+            paddle.to_tensor(logits)
+        )
+        assert texts == ['1M8']
+        assert confs[0] > 0.99

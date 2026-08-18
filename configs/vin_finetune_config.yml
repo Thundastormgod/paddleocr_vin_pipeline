@@ -32,10 +32,18 @@ Global:
   character_dict_path: ./configs/vin_dict.txt
   max_text_length: 17
   use_amp: false
-  # Early stopping (evaluated per epoch on validation exact-match accuracy)
+  # Early stopping. Loss-aware: the patience counter resets when EITHER
+  # validation exact-match accuracy improves by min_delta OR validation
+  # loss falls by loss_min_delta. Accuracy alone is a defective stopping
+  # signal for CTC: it sits at exactly 0 through the whole blank-collapse
+  # phase (observed live: val_loss fell 13.6 -> 0.91 over 17 epochs while
+  # exact-match stayed 0.0). min_epochs is a floor below which the stopper
+  # never fires.
   early_stopping: true
   early_stopping_patience: 25
   early_stopping_min_delta: 0.001
+  early_stopping_loss_min_delta: 0.005
+  early_stopping_min_epochs: 10
 
 Optimizer:
   # Supported: Adam | AdamW | Momentum (alias SGD)

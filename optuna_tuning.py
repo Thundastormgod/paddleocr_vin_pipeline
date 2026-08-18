@@ -27,18 +27,46 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import logging
+
+from src.vin_ocr.tracking import start_run
+
+# The single definition of "a trial produced no measurement", shared with the
+# in-process tuner in src/vin_ocr/training/hyperparameter_tuning. Two
+# same-named exception classes would drift exactly like this repository's
+# duplicated charset maps and F1 scorers did - and an except clause written
+# against one would silently not catch the other.
+from src.vin_ocr.training.hyperparameter_tuning.errors import TrialExecutionError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+#: Repository root, derived from this file's location so the tuner works from
+#: any working directory.
+REPO_ROOT = Path(__file__).resolve().parent
+
+#: Where finetune_paddleocr writes the metrics each trial is scored from.
+#: Absolute, because the trial subprocess runs with cwd=REPO_ROOT while the
+#: tuner may have been launched from anywhere. A relative path here read a
+#: file in the tuner's CWD that the subprocess never wrote.
+TRIAL_METRICS_PATH = REPO_ROOT / "output" / "vin_rec_finetune" / "training_metrics.json"
+
+#: Wall-clock ceiling for a single training trial.
+TRIAL_TIMEOUT_SECONDS = 3600
+
+
 class VINOCRHyperparameterTuner:
     def __init__(self, base_config_path: str = "configs/vin_finetune_config.yml"):
         self.base_config_path = base_config_path
-        self.results_dir = Path("optuna_results")
+        self.results_dir = REPO_ROOT / "optuna_results"
         self.results_dir.mkdir(exist_ok=True)
+        # Set here as well as in run_study so objective() is callable directly
+        # (in tests, or from a custom driver) without an AttributeError.
+        self.study_name: str = "vin_ocr_optimization"
+        self.experiment_name: str = "vin_ocr_optimization"
+        self.dataset_roots: tuple = ()
         
     def load_base_config(self) -> Dict[str, Any]:
         """Load the base configuration file."""
@@ -108,88 +136,160 @@ class VINOCRHyperparameterTuner:
             yaml.dump(config, f, default_flow_style=False)
         return trial_config_path
     
-    def run_training_trial(self, config_path: str, max_epochs: int = 20) -> Dict[str, Any]:
-        """Run a single training trial and return results."""
+    def run_training_trial(self, config_path: str) -> Dict[str, Any]:
+        """
+        Run a single training trial and return its measured metrics.
+
+        Args:
+            config_path: Trial configuration to train with.
+
+        Returns:
+            Dict of measured metrics plus the wall-clock training time.
+
+        Raises:
+            TrialExecutionError: If training exits non-zero, times out, or
+                fails to write fresh metrics. Every one of these is an absence
+                of measurement and is reported as such.
+
+        Note:
+            This method previously scored a trial from
+            ``output/vin_rec_finetune/training_metrics.json`` whenever that
+            file merely EXISTED, without checking the subprocess exit status
+            or when the file was written. Since every trial overwrites the same
+            fixed path, a trial that crashed before writing was scored from the
+            PREVIOUS trial's file - reporting another configuration's accuracy
+            under this trial's hyperparameters, and returning it to Optuna as a
+            genuine observation. Reproduced directly: after a successful trial
+            recording 0.4186, a crashed trial returned 0.4186.
+
+            Three independent guards now prevent that: the stale file is
+            removed before launching, a non-zero exit is fatal, and the file's
+            modification time must post-date the launch.
+        """
+        # sys.executable (not bare "python") so the trial runs in the same
+        # interpreter/venv as the tuner.
+        cmd = [
+            sys.executable, "-m", "src.vin_ocr.training.finetune_paddleocr",
+            "--config", config_path
+        ]
+
+        # Guard 1: no output from a previous trial can be mistaken for this one.
+        TRIAL_METRICS_PATH.unlink(missing_ok=True)
+
+        start_time = time.time()
         try:
-            # Run training with timeout.
-            # sys.executable (not bare "python") so the trial runs in the same
-            # interpreter/venv as the tuner.
-            cmd = [
-                sys.executable, "-m", "src.vin_ocr.training.finetune_paddleocr",
-                "--config", config_path
-            ]
-
-            # Repo root, derived from this file's location. Was previously
-            # hardcoded to /Users/startferanmi/Paddle/paddleocr_vin_pipeline,
-            # which made this script unrunnable on any other machine.
-            repo_root = Path(__file__).resolve().parent
-
-            start_time = time.time()
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=3600,  # 1 hour timeout
-                cwd=str(repo_root)
+                timeout=TRIAL_TIMEOUT_SECONDS,
+                cwd=str(REPO_ROOT),
+                check=False,
             )
-            training_time = time.time() - start_time
-            
-            # Parse results from training_metrics.json
-            metrics_path = Path("output/vin_rec_finetune/training_metrics.json")
-            if metrics_path.exists():
-                with open(metrics_path, 'r') as f:
-                    metrics = json.load(f)
-                
-                return {
-                    'success': True,
-                    'exact_match_accuracy': metrics['evaluation_metrics']['image_level']['exact_match_accuracy'],
-                    'character_accuracy': metrics['evaluation_metrics']['character_level']['character_accuracy'],
-                    'f1_micro': metrics['evaluation_metrics']['character_level']['f1_micro'],
-                    'training_time': training_time,
-                    'final_epoch': metrics['training_results']['final_epoch'],
-                    'best_validation_accuracy': metrics['training_results']['best_validation_accuracy']
-                }
-            else:
-                return {
-                    'success': False,
-                    'error': 'Training metrics not found',
-                    'training_time': training_time,
-                    'stdout': result.stdout,
-                    'stderr': result.stderr
-                }
-                
-        except subprocess.TimeoutExpired:
-            return {
-                'success': False,
-                'error': 'Training timeout',
-                'training_time': 3600
-            }
-        except Exception as e:
-            return {
-                'success': False,
-                'error': str(e),
-                'training_time': 0
-            }
+        except subprocess.TimeoutExpired as exc:
+            raise TrialExecutionError(
+                f"training exceeded {TRIAL_TIMEOUT_SECONDS}s and was killed"
+            ) from exc
+
+        training_time = time.time() - start_time
+
+        # Guard 2: a crash is a crash, whatever files happen to be on disk.
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout or "").strip()[-2000:]
+            raise TrialExecutionError(
+                f"training exited {result.returncode}:\n{tail or '<no output>'}"
+            )
+
+        if not TRIAL_METRICS_PATH.is_file():
+            raise TrialExecutionError(
+                f"training exited 0 but wrote no metrics to {TRIAL_METRICS_PATH}"
+            )
+
+        # Guard 3: the file must have been written by THIS run.
+        if TRIAL_METRICS_PATH.stat().st_mtime < start_time:
+            raise TrialExecutionError(
+                f"{TRIAL_METRICS_PATH} predates this trial; it is a stale "
+                f"artifact of an earlier run and must not be scored"
+            )
+
+        try:
+            metrics = json.loads(TRIAL_METRICS_PATH.read_text(encoding="utf-8"))
+            image_level = metrics['evaluation_metrics']['image_level']
+            char_level = metrics['evaluation_metrics']['character_level']
+            training_results = metrics['training_results']
+        except (json.JSONDecodeError, KeyError, OSError) as exc:
+            raise TrialExecutionError(
+                f"could not read metrics from {TRIAL_METRICS_PATH}: {exc}"
+            ) from exc
+
+        return {
+            'exact_match_accuracy': image_level['exact_match_accuracy'],
+            'character_accuracy': char_level['character_accuracy'],
+            'f1_micro': char_level['f1_micro'],
+            'training_time': training_time,
+            'final_epoch': training_results['final_epoch'],
+            'best_validation_accuracy': training_results['best_validation_accuracy'],
+        }
     
     def objective(self, trial: optuna.Trial) -> float:
-        """Objective function for Optuna optimization."""
-        # Create trial configuration
+        """
+        Score one hyperparameter configuration.
+
+        Each trial is recorded as its own tracked run carrying the commit, the
+        working-tree diff, the resolved dependency versions and the dataset
+        fingerprint, so any trial in the study can be replayed and checked. The
+        63 JSON files this script previously left in optuna_results/ recorded
+        hyperparameters and an accuracy with no commit, no data hash and no
+        timestamp - enough to report a number, not enough to verify one.
+
+        Args:
+            trial: The Optuna trial supplying hyperparameters.
+
+        Returns:
+            Exact-match accuracy, the value being maximised.
+
+        Raises:
+            TrialExecutionError: If the trial produced no measurement. This
+                propagates to study.optimize(catch=...), which records the
+                trial as FAILED. It previously returned 0.0, which Optuna
+                cannot distinguish from a real measurement of zero and which
+                therefore poisoned the TPE surrogate model.
+        """
         config = self.create_trial_config(trial)
         trial_number = trial.number
-        
-        # Save trial config
         config_path = self.save_trial_config(config, trial_number)
         logger.info(f"Trial {trial_number}: Starting with config {config_path}")
-        
-        # Run training
-        results = self.run_training_trial(str(config_path))
-        
-        # Log results
-        if results['success']:
+
+        with start_run(
+            f"{self.study_name}-trial-{trial_number}",
+            experiment=self.experiment_name,
+            dataset_roots=self.dataset_roots,
+            params=trial.params,
+            tags={
+                "study_name": self.study_name,
+                "trial_number": trial_number,
+                "optuna_sampler": "TPESampler",
+            },
+        ) as run:
+            run.log_artifact(config_path, "trial_config")
+
+            results = self.run_training_trial(str(config_path))
             accuracy = results['exact_match_accuracy']
-            logger.info(f"Trial {trial_number}: Accuracy = {accuracy:.4f}")
-            
-            # Save trial results
+
+            run.log_metrics({
+                'exact_match_accuracy': accuracy,
+                'character_accuracy': results['character_accuracy'],
+                'f1_micro': results['f1_micro'],
+                'training_time_seconds': results['training_time'],
+                'final_epoch': results['final_epoch'],
+                'best_validation_accuracy': results['best_validation_accuracy'],
+            })
+
+            logger.info(
+                f"Trial {trial_number}: Accuracy = {accuracy:.4f} "
+                f"(run {run.run_id})"
+            )
+
             trial_results = {
                 'trial_number': trial_number,
                 'params': trial.params,
@@ -197,69 +297,132 @@ class VINOCRHyperparameterTuner:
                 'character_accuracy': results['character_accuracy'],
                 'f1_micro': results['f1_micro'],
                 'training_time': results['training_time'],
-                'final_epoch': results['final_epoch']
+                'final_epoch': results['final_epoch'],
+                # Provenance, so this file is self-describing even when read
+                # outside MLflow. The existing trial_*_results.json files carry
+                # none of this and cannot be traced to any commit.
+                'mlflow_run_id': run.run_id,
+                'git_commit': run.provenance.git.commit if run.provenance else None,
+                'reproduce_command': run.reproduce_command,
             }
-            
+
             results_path = self.results_dir / f"trial_{trial_number}_results.json"
             with open(results_path, 'w') as f:
                 json.dump(trial_results, f, indent=2)
-            
-            return accuracy  # Maximize exact match accuracy
-        else:
-            logger.error(f"Trial {trial_number}: Failed - {results['error']}")
-            return 0.0  # Penalty for failed trials
+
+            run.log_artifact(results_path, "trial_results")
+            return accuracy
     
-    def run_study(self, n_trials: int = 50, study_name: str = "vin_ocr_optimization"):
-        """Run the Optuna study."""
-        logger.info(f"Starting Optuna study: {study_name} with {n_trials} trials")
-        
-        # Create study with median sampler for balanced exploration
+    def run_study(
+        self,
+        n_trials: int = 50,
+        study_name: str = "vin_ocr_optimization",
+        experiment_name: Optional[str] = None,
+        dataset_roots: tuple = (),
+    ):
+        """
+        Run the Optuna study, resuming any existing study of the same name.
+
+        Args:
+            n_trials: Number of trials to run in this invocation.
+            study_name: Study identifier, also the SQLite study key.
+            experiment_name: MLflow experiment. Defaults to the study name.
+            dataset_roots: Data directories to fingerprint into each run.
+
+        Returns:
+            The completed optuna.Study.
+
+        Note:
+            The study is persisted to SQLite. It previously had no ``storage``
+            argument, so it lived only in memory: an interrupted study lost
+            every completed trial and had to restart from scratch, and the
+            sampler could not be warm-started. At up to one hour per trial and
+            100 trials, that is days of compute discarded by a single Ctrl-C.
+            ``load_if_exists`` makes re-running the command resume instead of
+            colliding.
+        """
+        self.study_name = study_name
+        self.experiment_name = experiment_name or study_name
+        self.dataset_roots = tuple(dataset_roots)
+
+        storage_path = self.results_dir / f"{study_name}.db"
+        storage_uri = f"sqlite:///{storage_path}"
+
+        logger.info(
+            f"Starting Optuna study '{study_name}' with {n_trials} trials "
+            f"(storage: {storage_uri})"
+        )
+
         study = optuna.create_study(
             direction="maximize",
             sampler=optuna.samplers.TPESampler(seed=42),
-            study_name=study_name
+            study_name=study_name,
+            storage=storage_uri,
+            load_if_exists=True,
         )
-        
-        # Add callback for pruning
+
+        completed = [t for t in study.trials if t.value is not None]
+        if completed:
+            logger.info(f"Resuming: {len(completed)} completed trial(s) already recorded")
+
         def print_callback(study, trial):
-            if trial.number % 5 == 0:
+            if trial.number % 5 == 0 and study.best_trial is not None:
                 logger.info(f"Trial {trial.number}: Best accuracy = {study.best_value:.4f}")
-        
-        # Run optimization
+
+        # catch=(TrialExecutionError,) records a failed trial as FAILED rather
+        # than aborting the whole study, while keeping it out of the sampler's
+        # observations. Returning 0.0 instead - the previous behaviour - made a
+        # crash indistinguishable from a measured zero.
         study.optimize(
             self.objective,
             n_trials=n_trials,
             callbacks=[print_callback],
-            show_progress_bar=True
+            show_progress_bar=True,
+            catch=(TrialExecutionError,),
         )
         
-        # Save best results
+        # Separate real observations from failed trials. `study.trials` counts
+        # both, so reporting len(study.trials) as "n_trials" overstated how
+        # much was actually measured whenever a trial crashed.
+        measured = [t for t in study.trials if t.value is not None]
+        failed = len(study.trials) - len(measured)
+
+        if not measured:
+            # study.best_value raises here. Reporting nothing is correct;
+            # inventing a best is what this codebase is being cleaned up for.
+            logger.error(
+                "OPTUNA STUDY COMPLETE - 0 of %d trials produced a measurement. "
+                "No best configuration exists. Check the FAILED runs in MLflow "
+                "for the training errors.",
+                len(study.trials),
+            )
+            return study
+
         best_results = {
             'study_name': study_name,
-            'n_trials': len(study.trials),
+            'n_trials_total': len(study.trials),
+            'n_trials_measured': len(measured),
+            'n_trials_failed': failed,
             'best_trial': study.best_trial.number,
             'best_accuracy': study.best_value,
             'best_params': study.best_params,
-            'all_trials': []
-        }
-        
-        # Collect all trial results
-        for trial in study.trials:
-            if trial.value is not None:
-                best_results['all_trials'].append({
+            'all_trials': [
+                {
                     'trial_number': trial.number,
                     'accuracy': trial.value,
-                    'params': trial.params
-                })
-        
-        # Save study results
+                    'params': trial.params,
+                }
+                for trial in measured
+            ],
+        }
+
         study_results_path = self.results_dir / f"{study_name}_results.json"
         with open(study_results_path, 'w') as f:
             json.dump(best_results, f, indent=2)
-        
-        # Print summary
+
         logger.info("=" * 60)
         logger.info("OPTUNA STUDY COMPLETE")
+        logger.info(f"Trials measured: {len(measured)} (failed: {failed})")
         logger.info(f"Best accuracy: {study.best_value:.4f}")
         logger.info(f"Best trial: {study.best_trial.number}")
         logger.info("Best parameters:")
@@ -267,26 +430,72 @@ class VINOCRHyperparameterTuner:
             logger.info(f"  {param}: {value}")
         logger.info(f"Results saved to: {study_results_path}")
         logger.info("=" * 60)
-        
+
         return study
 
-def main():
-    """Main function to run hyperparameter tuning."""
-    tuner = VINOCRHyperparameterTuner()
-    
-    # Run study with expanded trials for thorough search
-    study = tuner.run_study(
-        n_trials=100,  # Increased from 30 to 100 for broader exploration
-        study_name="vin_ocr_comprehensive_tuning"
+def parse_args(argv=None):
+    """Parse command-line arguments."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Optuna hyperparameter search for VIN OCR fine-tuning.",
     )
-    
-    # Create best config file
+    parser.add_argument(
+        "--n-trials", type=int, default=30,
+        help="Trials to run in this invocation. The study resumes, so this is "
+             "an increment, not a total. (default: 30)",
+    )
+    parser.add_argument(
+        "--study-name", default="vin_ocr_comprehensive_tuning",
+        help="Study name; also the SQLite study key used to resume.",
+    )
+    parser.add_argument(
+        "--experiment", default=None,
+        help="MLflow experiment name (default: the study name).",
+    )
+    parser.add_argument(
+        "--dataset-root", action="append", default=[],
+        help="Data directory to fingerprint into each run. Repeatable.",
+    )
+    parser.add_argument(
+        "--base-config", default="configs/vin_finetune_config.yml",
+        help="Base configuration each trial perturbs.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    """
+    Run the hyperparameter search.
+
+    Returns:
+        0 on success, 1 when no trial produced a measurement.
+    """
+    args = parse_args(argv)
+    tuner = VINOCRHyperparameterTuner(base_config_path=args.base_config)
+
+    study = tuner.run_study(
+        n_trials=args.n_trials,
+        study_name=args.study_name,
+        experiment_name=args.experiment,
+        dataset_roots=tuple(Path(d) for d in args.dataset_root),
+    )
+
+    # Guard against the ValueError study.best_trial raises when every trial
+    # failed. Emitting a "best config" from no measurements would be exactly
+    # the class of fabricated artifact this codebase is being cleaned of.
+    if not any(t.value is not None for t in study.trials):
+        logger.error("No best configuration written: nothing was measured.")
+        return 1
+
     best_config_path = tuner.results_dir / "best_config.yml"
     best_config = tuner.create_trial_config(study.best_trial)
     with open(best_config_path, 'w') as f:
         yaml.dump(best_config, f, default_flow_style=False)
-    
+
     logger.info(f"Best configuration saved to: {best_config_path}")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

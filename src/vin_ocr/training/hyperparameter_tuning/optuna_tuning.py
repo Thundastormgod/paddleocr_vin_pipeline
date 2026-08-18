@@ -2,31 +2,41 @@
 Optuna Hyperparameter Tuning for VIN OCR Models
 ================================================
 
-Provides automated hyperparameter optimization using Optuna for:
-- PaddleOCR models (PP-OCRv5, CRNN, SVTR_LCNet, SVTR_Tiny)
-- DeepSeek Vision-Language models
+In-process hyperparameter search over the trainers in
+:mod:`src.vin_ocr.training`:
+
+- PaddleOCR-style recognition models trained from scratch
+  (``train_from_scratch.PaddleOCRScratchTrainer``)
+- DeepSeek vision-language fine-tuning
+  (``finetune_deepseek.DeepSeekVINTrainer``)
 
 Features:
-- Bayesian optimization with pruning
-- Multi-objective optimization (accuracy + speed)
-- Distributed training support
-- Checkpoint saving and resumption
+- TPE (Bayesian) search over architecture and optimizer hyperparameters
+- SQLite study persistence and resumption (``--storage``)
+- Honest failure accounting: a trial whose training crashes is recorded as
+  FAILED, never scored. The previous implementation returned 0.0 from a
+  crashed trial, which Optuna cannot distinguish from a measured zero.
 
-Author: VIN OCR Pipeline
-License: MIT
+Note:
+    The trainers expose no per-epoch hook, so trials report no intermediate
+    values to Optuna and the configured pruner never fires. Pruning becomes
+    meaningful only if the trainers grow intermediate reporting.
 """
 
 import optuna
 from optuna import Trial
 from optuna.samplers import TPESampler
-from optuna.pruners import MedianPruner, HyperbandPruner
+from optuna.pruners import MedianPruner
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Callable, Union
 from pathlib import Path
 from datetime import datetime
+
+from .errors import TrialExecutionError
 
 logger = logging.getLogger(__name__)
 
@@ -179,28 +189,24 @@ class PaddleOCRObjective:
     
     def __call__(self, trial: Trial) -> float:
         """
-        Objective function called by Optuna for each trial.
-        
+        Score one PaddleOCR hyperparameter configuration.
+
         Args:
-            trial: Optuna trial object
-            
+            trial: Optuna trial supplying hyperparameters.
+
         Returns:
-            Validation accuracy (metric to maximize)
+            Best validation accuracy measured by the trainer.
+
+        Raises:
+            TrialExecutionError: If training crashed or produced no
+                measurement. ``study.optimize(catch=(TrialExecutionError,))``
+                records the trial as FAILED. This previously returned 0.0 -
+                which Optuna cannot distinguish from a measured zero - and
+                mislabelled every crash as a pruned trial.
         """
-        # Sample hyperparameters
         params = self._sample_params(trial)
-        
         logger.info(f"Trial {trial.number}: {params}")
-        
-        try:
-            # Train model with sampled parameters
-            accuracy = self._train_and_evaluate(params, trial)
-            
-            return accuracy
-            
-        except Exception as e:
-            logger.error(f"Trial {trial.number} failed: {e}")
-            raise optuna.TrialPruned()
+        return self._train_and_evaluate(params, trial)
     
     def _sample_params(self, trial: Trial) -> Dict[str, Any]:
         """Sample hyperparameters from search space."""
@@ -269,7 +275,27 @@ class PaddleOCRObjective:
         params: Dict[str, Any],
         trial: Trial,
     ) -> float:
-        """Train model and return validation accuracy."""
+        """
+        Train one configuration and return its measured best accuracy.
+
+        Args:
+            params: Sampled hyperparameters.
+            trial: The trial being scored, used for its number.
+
+        Returns:
+            The best validation accuracy ``PaddleOCRScratchTrainer.train()``
+            measured and returned.
+
+        Raises:
+            TrialExecutionError: If the trainer raised, or returned something
+                that is not a number. Either way nothing was measured.
+
+        Note:
+            This method previously passed an ``epoch_callback`` keyword that
+            no trainer accepts, so every call raised TypeError - which the old
+            ``except Exception: return 0.0`` converted into a measured zero.
+            Every value this tuner ever reported was therefore fabricated.
+        """
         from src.vin_ocr.training.train_from_scratch import (
             PaddleOCRScratchTrainer,
             PaddleOCRScratchConfig,
@@ -294,7 +320,7 @@ class PaddleOCRObjective:
             # Data paths - matching PaddleOCRScratchConfig field names
             train_data_dir=self.config.train_data_dir,
             train_label_file=self.config.train_labels,
-            val_data_dir=self.config.val_data_dir if hasattr(self.config, 'val_data_dir') else self.config.train_data_dir,
+            val_data_dir=self.config.val_data_dir,
             val_label_file=self.config.val_labels,
             # Output
             output_dir=os.path.join(
@@ -305,26 +331,24 @@ class PaddleOCRObjective:
             use_gpu=(self.device != 'cpu'),
         )
         
-        # Create trainer with pruning callback
         trainer = PaddleOCRScratchTrainer(train_config)
         
-        # Add pruning callback
-        def epoch_callback(epoch: int, metrics: Dict[str, float]):
-            val_acc = metrics.get('val_accuracy', 0.0)
-            trial.report(val_acc, epoch)
-            
-            if trial.should_prune():
-                raise optuna.TrialPruned()
-        
-        # Train
+        # The trainers expose no per-epoch hook, so no intermediate values
+        # are reported and the pruner never fires; the trial is scored on the
+        # trainer's returned best accuracy alone.
         try:
-            best_accuracy = trainer.train(epoch_callback=epoch_callback)
-            return best_accuracy
-        except optuna.TrialPruned:
-            raise
-        except Exception as e:
-            logger.error(f"Training failed: {e}")
-            return 0.0
+            accuracy = trainer.train()
+        except Exception as exc:
+            raise TrialExecutionError(
+                f"trial {trial.number}: training crashed: {exc}"
+            ) from exc
+        
+        if not isinstance(accuracy, (int, float)):
+            raise TrialExecutionError(
+                f"trial {trial.number}: trainer returned {accuracy!r} instead "
+                f"of an accuracy; nothing was measured"
+            )
+        return float(accuracy)
 
 
 class DeepSeekObjective:
@@ -341,17 +365,23 @@ class DeepSeekObjective:
         self.device = device
     
     def __call__(self, trial: Trial) -> float:
-        """Objective function for DeepSeek model tuning."""
+        """
+        Score one DeepSeek hyperparameter configuration.
+
+        Args:
+            trial: Optuna trial supplying hyperparameters.
+
+        Returns:
+            Best validation accuracy recorded by the trainer.
+
+        Raises:
+            TrialExecutionError: If training crashed or produced no
+                measurement; recorded as a FAILED trial by
+                ``study.optimize(catch=(TrialExecutionError,))``.
+        """
         params = self._sample_params(trial)
-        
         logger.info(f"Trial {trial.number}: {params}")
-        
-        try:
-            accuracy = self._train_and_evaluate(params, trial)
-            return accuracy
-        except Exception as e:
-            logger.error(f"Trial {trial.number} failed: {e}")
-            raise optuna.TrialPruned()
+        return self._train_and_evaluate(params, trial)
     
     def _sample_params(self, trial: Trial) -> Dict[str, Any]:
         """Sample hyperparameters for DeepSeek."""
@@ -405,11 +435,42 @@ class DeepSeekObjective:
         params: Dict[str, Any],
         trial: Trial,
     ) -> float:
-        """Train DeepSeek model and return validation accuracy."""
+        """
+        Train one DeepSeek configuration and return its measured accuracy.
+
+        ``DeepSeekVINTrainer.train()`` returns None and never updates the
+        trainer's own ``best_accuracy`` attribute; the only measurement it
+        produces is the ``training_progress.json`` its ProgressCallback
+        writes to the trial's output directory when training ends. That
+        write happens inside a silent try/except in the trainer, so the
+        file's absence - or a file predating this trial - means nothing was
+        measured.
+
+        Args:
+            params: Sampled hyperparameters.
+            trial: The trial being scored, used for its number.
+
+        Returns:
+            The ``best_accuracy`` the trainer recorded for this trial.
+
+        Raises:
+            TrialExecutionError: If training crashed, wrote no progress
+                record, wrote a stale or unreadable one, or recorded no
+                numeric best accuracy.
+
+        Note:
+            This method previously imported ``DeepSeekFineTuner``, a class
+            that has never existed in finetune_deepseek (the trainer is
+            ``DeepSeekVINTrainer``), so every DeepSeek trial died on
+            ImportError - and the old ``except Exception`` in ``__call__``
+            recorded each one as PRUNED rather than failed.
+        """
         from src.vin_ocr.training.finetune_deepseek import (
-            DeepSeekFineTuner,
+            DeepSeekVINTrainer,
             DeepSeekFineTuneConfig,
         )
+        
+        output_dir = os.path.join(self.config.output_dir, f"trial_{trial.number}")
         
         # Create training config
         train_config = DeepSeekFineTuneConfig(
@@ -427,31 +488,48 @@ class DeepSeekObjective:
             val_data_path=self.config.val_labels,
             data_dir=self.config.train_data_dir,
             # Output
-            output_dir=os.path.join(
-                self.config.output_dir,
-                f"trial_{trial.number}"
-            ),
+            output_dir=output_dir,
         )
         
-        # Create trainer
-        trainer = DeepSeekFineTuner(train_config)
+        trainer = DeepSeekVINTrainer(train_config)
         
-        # Train with pruning callback
-        def epoch_callback(epoch: int, metrics: Dict[str, float]):
-            val_acc = metrics.get('val_accuracy', 0.0)
-            trial.report(val_acc, epoch)
-            
-            if trial.should_prune():
-                raise optuna.TrialPruned()
+        start_time = time.time()
+        try:
+            trainer.train()
+        except Exception as exc:
+            raise TrialExecutionError(
+                f"trial {trial.number}: training crashed: {exc}"
+            ) from exc
+        
+        progress_path = Path(output_dir) / "training_progress.json"
+        if not progress_path.is_file():
+            raise TrialExecutionError(
+                f"trial {trial.number}: training finished but wrote no "
+                f"progress record at {progress_path}; nothing was measured"
+            )
+        if progress_path.stat().st_mtime < start_time:
+            raise TrialExecutionError(
+                f"trial {trial.number}: {progress_path} predates this trial; "
+                f"it is a stale artifact and must not be scored"
+            )
         
         try:
-            best_accuracy = trainer.train(epoch_callback=epoch_callback)
-            return best_accuracy
-        except optuna.TrialPruned:
-            raise
-        except Exception as e:
-            logger.error(f"Training failed: {e}")
-            return 0.0
+            best_accuracy = json.loads(
+                progress_path.read_text(encoding="utf-8")
+            )["best_accuracy"]
+        except (json.JSONDecodeError, KeyError, OSError) as exc:
+            raise TrialExecutionError(
+                f"trial {trial.number}: could not read best_accuracy from "
+                f"{progress_path}: {exc}"
+            ) from exc
+        
+        if not isinstance(best_accuracy, (int, float)):
+            raise TrialExecutionError(
+                f"trial {trial.number}: {progress_path} records "
+                f"best_accuracy={best_accuracy!r}, which is not a number; "
+                f"nothing was measured"
+            )
+        return float(best_accuracy)
 
 
 # =============================================================================
@@ -465,9 +543,11 @@ class OptunaHyperparameterTuner:
     Supports:
     - PaddleOCR models (PP-OCRv5, CRNN, SVTR_LCNet, SVTR_Tiny)
     - DeepSeek Vision-Language models
-    - Multi-objective optimization
-    - Distributed tuning
-    - Result persistence
+    - Study persistence and resumption via ``TuningConfig.storage``
+    
+    A trial whose training crashes is recorded as FAILED and excluded from
+    the sampler's observations; it is never scored. A study in which nothing
+    was measured reports no best value.
     
     Example:
         tuner = OptunaHyperparameterTuner(
@@ -585,7 +665,11 @@ class OptunaHyperparameterTuner:
         
         logger.info(f"Starting optimization with {n_trials} trials...")
         
-        # Run optimization
+        # catch=(TrialExecutionError,) records a crashed trial as FAILED and
+        # keeps it out of the sampler's observations while the study
+        # continues. Anything else - a programming error in this module -
+        # aborts the study loudly. The previous behaviour scored crashes as
+        # 0.0, indistinguishable from a measured zero.
         self.study.optimize(
             objective,
             n_trials=n_trials,
@@ -593,6 +677,7 @@ class OptunaHyperparameterTuner:
             n_jobs=self.config.n_jobs,
             callbacks=all_callbacks,
             show_progress_bar=True,
+            catch=(TrialExecutionError,),
         )
         
         # Save results
@@ -690,12 +775,17 @@ class OptunaHyperparameterTuner:
         except ValueError:
             return {}
     
-    def get_best_value(self) -> float:
-        """Get best metric value achieved."""
+    def get_best_value(self) -> Optional[float]:
+        """
+        Best measured value, or None when no trial produced a measurement.
+
+        Returns None rather than 0.0: a study in which nothing was measured
+        has no best value, and reporting zero would fabricate one.
+        """
         try:
             return self.study.best_value
         except ValueError:
-            return 0.0
+            return None
     
     def get_trial_history(self) -> List[Dict[str, Any]]:
         """Get history of all trials."""
@@ -841,12 +931,13 @@ def main():
     
     # Run optimization
     best_params = tuner.optimize()
+    best_value = tuner.get_best_value()
     
     print("\n" + "="*50)
     print("OPTIMIZATION COMPLETE")
     print("="*50)
-    print(f"Best value: {tuner.get_best_value():.4f}")
-    if best_params:
+    if best_value is not None and best_params:
+        print(f"Best value: {best_value:.4f}")
         print(f"Best parameters:")
         for k, v in best_params.items():
             print(f"  {k}: {v}")

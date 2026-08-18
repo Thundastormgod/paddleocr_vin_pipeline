@@ -15,6 +15,7 @@ Usage:
     best_params = tuner.optimize(n_trials=50)
 """
 
+from .errors import TrialExecutionError
 from .optuna_tuning import (
     OptunaHyperparameterTuner,
     TuningConfig,
@@ -27,4 +28,5 @@ __all__ = [
     'TuningConfig',
     'PaddleOCRSearchSpace',
     'DeepSeekSearchSpace',
+    'TrialExecutionError',
 ]

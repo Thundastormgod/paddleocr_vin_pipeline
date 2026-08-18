@@ -230,7 +230,7 @@ except ImportError:
     TRAINING_AVAILABLE = False
 
 try:
-    from src.vin_ocr.training.hyperparameter_tuning import HyperparameterTuner
+    from src.vin_ocr.training.hyperparameter_tuning import OptunaHyperparameterTuner
     HYPERPARAMETER_TUNING_AVAILABLE = True
 except ImportError:
     HYPERPARAMETER_TUNING_AVAILABLE = False

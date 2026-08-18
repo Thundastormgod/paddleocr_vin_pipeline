@@ -61,6 +61,7 @@ import cv2
 
 # Import unified VIN preprocessing module
 from ..preprocessing import VINPreprocessor, PreprocessConfig, PreprocessStrategy
+from .metrics import require_finite_loss
 
 # Import hardware detection
 from ..utils.hardware_utils import HardwareDetector
@@ -475,7 +476,20 @@ class PaddleOCRScratchTrainer:
             def __init__(self, num_classes, img_height=48, img_width=320, hidden_size=120):
                 super().__init__()
                 
-                # Simplified LCNet-like backbone
+                # Simplified LCNet-like backbone.
+                #
+                # CTC GEOMETRY: the output timestep count T is the width of
+                # the final feature map, and CTC needs T >= label length
+                # (17 for a VIN). The stem and stage 1 downsample both axes
+                # (width 320 -> 80); stages 2-4 use stride (2, 1) so height
+                # keeps compressing while WIDTH IS PRESERVED, giving T = 80.
+                #
+                # Every stage previously used isotropic stride 2: width
+                # 320/2^5 = 10 < 17, so no CTC alignment existed, the loss
+                # was inf/nan from the first batch, and the epoch averages
+                # were poisoned silently. PPHGNet below already used (2, 1)
+                # for exactly this reason; this backbone had been left
+                # behind.
                 self.backbone = nn.Sequential(
                     # Stem
                     nn.Conv2D(3, 16, 3, stride=2, padding=1),
@@ -485,14 +499,14 @@ class PaddleOCRScratchTrainer:
                     # Stage 1
                     self._make_stage(16, 32, 2),
                     
-                    # Stage 2
-                    self._make_stage(32, 64, 2),
+                    # Stage 2 (height only)
+                    self._make_stage(32, 64, (2, 1)),
                     
-                    # Stage 3
-                    self._make_stage(64, 128, 2),
+                    # Stage 3 (height only)
+                    self._make_stage(64, 128, (2, 1)),
                     
-                    # Stage 4
-                    self._make_stage(128, 256, 2),
+                    # Stage 4 (height only)
+                    self._make_stage(128, 256, (2, 1)),
                 )
                 
                 # Global pooling on height dimension
@@ -927,7 +941,11 @@ class PaddleOCRScratchTrainer:
                 
                 self.optimizer.clear_grad()
                 
-                epoch_loss += loss.item()
+                epoch_loss += require_finite_loss(
+                    loss.item(),
+                    context=f"scratch training epoch {epoch + 1} "
+                            f"batch {batch_idx}",
+                )
                 num_batches += 1
                 
                 # Log progress and write to progress file
@@ -1475,7 +1493,11 @@ class DeepSeekScratchTrainer:
                     self.optimizer.step()
                     self.optimizer.zero_grad()
                 
-                epoch_loss += loss.item()
+                epoch_loss += require_finite_loss(
+                    loss.item(),
+                    context=f"DeepSeek scratch training epoch {epoch + 1} "
+                            f"batch {batch_idx}",
+                )
                 num_batches += 1
                 
                 if batch_idx % 50 == 0:

@@ -391,3 +391,133 @@ class TestDecodeConfidence:
         )
         assert texts == ['1M8']
         assert confs[0] > 0.99
+
+
+class TestConfigValidationHoles:
+    """
+    Found by adversarial self-audit (2026-08-18): two confirmed-by-execution
+    holes in validate_config as first shipped.
+    """
+
+    def _base(self):
+        import yaml
+        return yaml.safe_load(
+            (REPO_ROOT / "configs" / "vin_finetune_config.yml").read_text()
+        )
+
+    def test_none_value_is_rejected_not_skipped(self):
+        """A null VALUE used to pass: only absent keys were reported."""
+        from src.vin_ocr.training.finetune_paddleocr import (
+            ConfigValidationError, validate_config,
+        )
+        config = self._base()
+        config['Global']['epoch_num'] = None
+        with pytest.raises(ConfigValidationError) as excinfo:
+            validate_config(config)
+        assert "Global.epoch_num" in str(excinfo.value)
+
+    def test_bool_is_not_an_acceptable_int(self):
+        """bool subclasses int; `epoch_num: true` used to validate."""
+        from src.vin_ocr.training.finetune_paddleocr import (
+            ConfigValidationError, validate_config,
+        )
+        config = self._base()
+        config['Global']['epoch_num'] = True
+        with pytest.raises(ConfigValidationError) as excinfo:
+            validate_config(config)
+        assert "bool" in str(excinfo.value)
+
+
+class TestCorruptionThreshold:
+    """C6 as SPECIFIED: warn once per corrupt path, abort past 5%."""
+
+    def test_each_corrupt_path_warned_once_and_threshold_aborts(self, tmp_path, caplog):
+        paddle = pytest.importorskip("paddle")
+        import numpy as np
+        import cv2
+        from src.vin_ocr.core.charset import load_char_dict
+        from src.vin_ocr.training.finetune_paddleocr import VINRecognitionDataset
+
+        char_to_idx, _ = load_char_dict("configs/vin_dict.txt")
+        lines = []
+        for i in range(10):
+            name = f"good_{i}.jpg"
+            img = np.full((64, 320, 3), 128, np.uint8)
+            cv2.imwrite(str(tmp_path / name), img)
+            lines.append(f"{name}\tSAL1A2A40SA606662")
+        for i in range(2):  # 2/12 corrupt > 5% threshold
+            name = f"corrupt_{i}.jpg"
+            (tmp_path / name).write_bytes(b"junk")
+            lines.append(f"{name}\tSAL1A2A40SA606662")
+        (tmp_path / "labels.txt").write_text("\n".join(lines) + "\n")
+        ds = VINRecognitionDataset(
+            data_dir=str(tmp_path), label_file=str(tmp_path / "labels.txt"),
+            char_dict=char_to_idx, is_training=False,
+        )
+
+        # Accessing the first corrupt index scans forward, discovering BOTH
+        # corrupt files before reaching a readable one - so the threshold
+        # (max(1, 5% of 12) = 1) is exceeded within this single access.
+        with pytest.raises(RuntimeError) as excinfo:
+            ds[10]
+        assert "unreadable" in str(excinfo.value)
+
+        # each corrupt path was warned exactly once during the scan
+        for name in ("corrupt_0", "corrupt_1"):
+            warnings = [r for r in caplog.records if name in r.getMessage()]
+            assert len(warnings) == 1, name
+
+
+class TestTrackingFallback:
+    """_run_tracked must run untracked - loudly - when tracking is absent."""
+
+    def test_training_proceeds_without_tracking(self, monkeypatch, capsys):
+        import builtins
+        from src.vin_ocr.training import finetune_paddleocr as ft
+
+        real_import = builtins.__import__
+
+        def no_tracking(name, *args, **kwargs):
+            if name.startswith("src.vin_ocr.tracking"):
+                raise ImportError("tracking extra not installed")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", no_tracking)
+
+        calls = {}
+
+        class StubTrainer:
+            def train(self, resume_from=None):
+                calls['trained'] = True
+
+        class Args:
+            resume = None
+            config = "configs/vin_finetune_config.yml"
+
+        ft._run_tracked(StubTrainer(), {}, Args())
+
+        assert calls.get('trained') is True
+        assert "TRACKING DISABLED" in capsys.readouterr().out
+
+
+class TestCharMetricsInvariantsSurviveOptimization:
+    """Conservation checks must be explicit raises, not -O-strippable asserts."""
+
+    def test_invariants_are_not_bare_asserts(self):
+        source = (REPO_ROOT / "src" / "vin_ocr" / "core" / "char_metrics.py").read_text()
+        import ast as astmod
+        tree = astmod.parse(source)
+        fn = next(
+            n for n in astmod.walk(tree)
+            if isinstance(n, astmod.FunctionDef) and n.name == "alignment_counts"
+        )
+        asserts = [n for n in astmod.walk(fn) if isinstance(n, astmod.Assert)]
+        raises = [n for n in astmod.walk(fn) if isinstance(n, astmod.Raise)]
+        assert asserts == [], "conservation invariants would vanish under -O"
+        assert len(raises) >= 2
+
+    def test_metric_zips_are_strict(self):
+        """A pred/ref length mismatch must raise, never silently truncate."""
+        from src.vin_ocr.evaluation.evaluate import calculate_character_metrics
+        with pytest.raises(ValueError):
+            calculate_character_metrics(["ABC"], ["ABC", "DEF"])

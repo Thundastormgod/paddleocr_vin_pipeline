@@ -50,7 +50,10 @@ val_loss 13.6 -> 0.91 over 17 epochs with exact-match pinned at 0).
 C4 DONE: LR search space capped at 2e-3 in BOTH tuners; config validation
 rejects collapse-region rates.
 C5 DONE: confidence over emitted timesteps only (empty decode -> 0.0).
-C6 DONE: dataset skips bounded (loop + full-cycle RuntimeError).
+C6 DONE: dataset skips bounded (loop + full-cycle RuntimeError), each
+corrupt path warned once, and the run ABORTS past a 5% corruption
+threshold. (First shipped without the threshold while marked DONE -
+caught by adversarial self-audit and delivered.)
 C9 DONE: validate_config - named errors, all problems at once.
 C10 DONE: TRAINING_RUNBOOK.md.
 
@@ -159,3 +162,31 @@ and the reproduce command (`vin-reproduce <run_id>`).
    evaluate through the fixed `multi_model_evaluation` path only.
 6. Re-run the Optuna study (fixed tuner + fixed trainer + fixed scorer)
    to establish the first trustworthy baseline; record in LOGBOOK.
+
+
+## E. Constitution debt (adversarial self-audit, 2026-08-18)
+
+Measured against the Power of 10 over all ground-up code and filed as
+explicit debt rather than silently ignored:
+
+- **Rule 4 (<=50 lines)**: 12 functions over the limit; worst:
+  finetune_paddleocr.train (194 lines, cyclomatic 22),
+  multi_model_evaluation.evaluate_model (113/15), run_deepseek_onnx
+  (94/15), run_study (98/13). Decomposition deferred - train() is
+  executing a live run; refactor between runs with the regression suite
+  as the harness.
+- **Rule 1 (cyclomatic <=10)**: 9 functions over, same offenders.
+- **Rule 5 (assertion density)**: near-zero precondition/postcondition
+  assertions across new functions; retrofit alongside the Rule-4
+  decomposition.
+- **Rule 10**: ruff now installed; ~590 findings on touched files are
+  mostly whitespace/legacy, with new-code F-class issues fixed. Wire
+  ruff into CI lint at strictness (currently flake8-era settings).
+
+Fixed immediately upon discovery (commit history): validate_config
+None/bool holes (executed proof), silent zip truncation in metric paths
+(strict=True), -O-strippable conservation asserts in char_metrics
+(explicit raises), duplicated P/R/F1 formula in char_metrics (single
+_prf), export fallback claiming success for a non-servable artifact
+(loud incomplete-export warning + test filter fixed), unused-import/
+shadowing cleanups, missing _run_tracked fallback test.

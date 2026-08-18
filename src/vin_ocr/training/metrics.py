@@ -110,7 +110,7 @@ class VINMetricsCalculator:
         correct = 0
         failed = 0
         
-        for pred, gt in zip(self.predictions, self.ground_truths):
+        for pred, gt in zip(self.predictions, self.ground_truths, strict=True):
             pred_clean = pred.strip().upper()
             gt_clean = gt.strip().upper()
             
@@ -150,7 +150,7 @@ class VINMetricsCalculator:
 
         pairs = [
             (pred.strip().upper(), gt.strip().upper())
-            for pred, gt in zip(self.predictions, self.ground_truths)
+            for pred, gt in zip(self.predictions, self.ground_truths, strict=True)
         ]
         metrics = char_level_metrics(pairs)
 
@@ -172,13 +172,13 @@ class VINMetricsCalculator:
         total_gt_chars = sum(len(gt.strip()) for gt in self.ground_truths)
         total_edit_distance = sum(
             self._levenshtein(pred.strip().upper(), gt.strip().upper())
-            for pred, gt in zip(self.predictions, self.ground_truths)
+            for pred, gt in zip(self.predictions, self.ground_truths, strict=True)
         )
         cer = total_edit_distance / total_gt_chars if total_gt_chars > 0 else 1.0
         
         # Normalized Edit Distance (NED)
         ned_scores = []
-        for pred, gt in zip(self.predictions, self.ground_truths):
+        for pred, gt in zip(self.predictions, self.ground_truths, strict=True):
             pred_clean = pred.strip().upper()
             gt_clean = gt.strip().upper()
             max_len = max(len(pred_clean), len(gt_clean), 1)
@@ -189,7 +189,7 @@ class VINMetricsCalculator:
         
         # Word/Sequence accuracy (exact match)
         exact_matches = sum(
-            1 for p, g in zip(self.predictions, self.ground_truths)
+            1 for p, g in zip(self.predictions, self.ground_truths, strict=True)
             if p.strip().upper() == g.strip().upper()
         )
         word_accuracy = exact_matches / len(self.predictions) if self.predictions else 0.0

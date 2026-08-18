@@ -125,22 +125,37 @@ def alignment_counts(prediction: str, reference: str) -> AlignmentCounts:
                 counts.add_fp(ch)
 
     # Conservation invariants: alignment must account for every character.
-    assert counts.tp + counts.fp == len(prediction), \
-        f"prediction chars lost by alignment: {prediction!r} vs {reference!r}"
-    assert counts.tp + counts.fn == len(reference), \
-        f"reference chars lost by alignment: {prediction!r} vs {reference!r}"
+    # Explicit raises, not `assert`: python -O strips assert statements, and
+    # this module's central guarantee must hold in optimized deployments too.
+    if counts.tp + counts.fp != len(prediction):
+        raise AssertionError(
+            f"prediction chars lost by alignment: {prediction!r} vs {reference!r}"
+        )
+    if counts.tp + counts.fn != len(reference):
+        raise AssertionError(
+            f"reference chars lost by alignment: {prediction!r} vs {reference!r}"
+        )
     return counts
 
 
-def micro_prf(counts: AlignmentCounts) -> Tuple[float, float, float]:
-    """Micro precision, recall and F1 from global TP/FP/FN."""
-    precision = counts.tp / (counts.tp + counts.fp) if (counts.tp + counts.fp) > 0 else 0.0
-    recall = counts.tp / (counts.tp + counts.fn) if (counts.tp + counts.fn) > 0 else 0.0
+def _prf(tp: int, fp: int, fn: int) -> Tuple[float, float, float]:
+    """
+    Precision/recall/F1 from raw counts - the ONE place the harmonic-mean
+    formula is written in this module. (It was previously inlined here twice,
+    which is exactly the duplication pattern this module exists to end.)
+    """
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = (
         2 * precision * recall / (precision + recall)
         if (precision + recall) > 0 else 0.0
     )
     return precision, recall, f1
+
+
+def micro_prf(counts: AlignmentCounts) -> Tuple[float, float, float]:
+    """Micro precision, recall and F1 from global TP/FP/FN."""
+    return _prf(counts.tp, counts.fp, counts.fn)
 
 
 def per_class_prf(counts: AlignmentCounts) -> Dict[str, Dict[str, float]]:
@@ -154,18 +169,12 @@ def per_class_prf(counts: AlignmentCounts) -> Dict[str, Dict[str, float]]:
     table: Dict[str, Dict[str, float]] = {}
     for char in sorted(counts.per_class):
         bucket = counts.per_class[char]
-        tp, fp, fn = bucket['tp'], bucket['fp'], bucket['fn']
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = (
-            2 * precision * recall / (precision + recall)
-            if (precision + recall) > 0 else 0.0
-        )
+        precision, recall, f1 = _prf(bucket['tp'], bucket['fp'], bucket['fn'])
         table[char] = {
             'precision': precision,
             'recall': recall,
             'f1': f1,
-            'support': tp + fn,
+            'support': bucket['tp'] + bucket['fn'],
         }
     return table
 

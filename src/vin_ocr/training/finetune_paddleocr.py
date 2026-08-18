@@ -222,15 +222,25 @@ def validate_config(config: Dict) -> None:
             the CTC blank-collapse region).
     """
     problems: List[str] = []
+    _MISSING = object()  # sentinel: None is a VALUE and must be type-checked
     for path, expected in _REQUIRED_CONFIG_KEYS:
         node: Any = config
         for key in path:
             if not isinstance(node, dict) or key not in node:
                 problems.append(f"missing key: {'.'.join(path)}")
-                node = None
+                node = _MISSING
                 break
             node = node[key]
-        if node is not None and not isinstance(node, expected):
+        if node is _MISSING:
+            continue
+        # bool is a subclass of int; `epoch_num: true` must not validate.
+        if isinstance(node, bool) and not (
+            isinstance(expected, tuple) and bool in expected
+        ) and expected is not bool:
+            problems.append(
+                f"{'.'.join(path)}: expected {expected}, got bool ({node!r})"
+            )
+        elif not isinstance(node, expected):
             problems.append(
                 f"{'.'.join(path)}: expected {expected}, got {type(node).__name__} ({node!r})"
             )
@@ -321,6 +331,9 @@ class VINRecognitionDataset(Dataset):
         
         # Load samples
         self.samples = self._load_samples(label_file)
+        # Distinct unreadable image paths seen so far (each warned once);
+        # __getitem__ aborts past MAX_CORRUPT_FRACTION.
+        self._corrupt_paths: set = set()
         logger.info(f"Loaded {len(self.samples)} samples from {label_file}")
     
     def _load_samples(self, label_file: str) -> List[Tuple[str, str]]:
@@ -439,30 +452,43 @@ class VINRecognitionDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
     
+    #: Fraction of distinct unreadable images above which the run aborts:
+    #: past this point the epoch is substantially built from duplicated
+    #: neighbour samples and the measurement is no longer of the dataset.
+    MAX_CORRUPT_FRACTION = 0.05
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         # Skip unreadable images by advancing to the next sample - but with
         # a bounded LOOP, not recursion: the previous implementation
         # recursed on (idx+1) % len, which is infinite recursion when every
         # image is unreadable and silently duplicates neighbours otherwise.
-        # One full cycle without a readable image is a dataset failure and
-        # raises.
+        # Each corrupt path is warned about ONCE (not every epoch), and the
+        # run aborts when more than MAX_CORRUPT_FRACTION of the dataset is
+        # unreadable - training on mostly-duplicated neighbours measures
+        # the loader, not the data.
         image = None
         img_path, label = self.samples[idx]
         for offset in range(len(self.samples)):
             img_path, label = self.samples[(idx + offset) % len(self.samples)]
             image = cv2.imread(img_path)
             if image is not None:
-                if offset:
-                    logger.warning(
-                        f"Skipped {offset} unreadable image(s) starting at "
-                        f"{self.samples[idx][0]}"
-                    )
                 break
+            if img_path not in self._corrupt_paths:
+                self._corrupt_paths.add(img_path)
+                logger.warning(f"Unreadable image skipped: {img_path}")
         if image is None:
             raise RuntimeError(
                 f"No readable image in the entire dataset "
                 f"({len(self.samples)} samples); first path: "
                 f"{self.samples[idx][0]}"
+            )
+        max_corrupt = max(1, int(len(self.samples) * self.MAX_CORRUPT_FRACTION))
+        if len(self._corrupt_paths) > max_corrupt:
+            raise RuntimeError(
+                f"{len(self._corrupt_paths)} of {len(self.samples)} images are "
+                f"unreadable (>{self.MAX_CORRUPT_FRACTION:.0%}); aborting - a "
+                f"run padded with duplicated neighbours would measure the "
+                f"loader, not the dataset. Corrupt paths logged above."
             )
         
         # Augment and preprocess
@@ -2609,8 +2635,18 @@ class VINFineTuner:
             logger.warning(f"Could not export static graph model: {e}")
         
         if not export_success:
-            # Fallback: save weights only
-            logger.info("Falling back to weights-only export...")
+            # Fallback: save weights only. This artifact is NOT loadable by
+            # VINInference (no static graph file) - say so, loudly, instead
+            # of claiming a successful export. Observed live: a run's
+            # jit.save failed, the fallback wrote inference.pdiparams, and
+            # the "exported" claim shipped an inference dir that
+            # FileNotFoundError'd at load time.
+            logger.warning(
+                "Static-graph export FAILED; writing weights-only fallback. "
+                "This directory canNOT serve inference (VINInference needs "
+                "inference.json/inference.pdmodel). Re-export from the "
+                "checkpoint or use the .pdparams for warm starts only."
+            )
             paddle.save(self.model.state_dict(), str(inference_dir / 'inference.pdiparams'))
         
         # Create inference.yml config file (required by PaddleOCR v5)
@@ -2627,7 +2663,12 @@ class VINFineTuner:
                 for char in vin_chars:
                     f.write(f"{char}\n")
         
-        logger.info(f"✅ Inference model exported to: {inference_dir}")
+        if export_success:
+            logger.info(f"✅ Inference model exported to: {inference_dir}")
+        else:
+            logger.warning(
+                f"⚠ INCOMPLETE export (weights-only, not servable): {inference_dir}"
+            )
         
         # List exported files
         for f in inference_dir.iterdir():

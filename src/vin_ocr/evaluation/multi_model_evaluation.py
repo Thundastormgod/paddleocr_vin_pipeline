@@ -25,13 +25,12 @@ ONNX format for consistent, production-ready inference.
 Author: JLR VIN Project
 """
 
-import os
 import sys
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional
-from dataclasses import dataclass, asdict
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
 
 # Add project root to path.
 #
@@ -55,7 +54,6 @@ from src.vin_ocr.evaluation.errors import (
     ModelUnavailableError,
 )
 
-import numpy as np
 
 
 @dataclass
@@ -1105,12 +1103,12 @@ class MultiModelEvaluator:
         n_samples = len(predictions)
 
         # Image-level metrics (over measured images only)
-        exact_matches = sum(1 for p, g in zip(predictions, ground_truths) if p == g)
+        exact_matches = sum(1 for p, g in zip(predictions, ground_truths, strict=True) if p == g)
         incorrect_predictions = n_samples - exact_matches
         exact_match_accuracy = exact_matches / n_samples if n_samples > 0 else 0.0
 
         # Character-level metrics: single canonical implementation.
-        char_metrics = char_level_metrics(list(zip(predictions, ground_truths)))
+        char_metrics = char_level_metrics(list(zip(predictions, ground_truths, strict=True)))
 
         # Per-class table keeps its historical shape: classes with support
         # only (hallucinated-only classes are visible in char_metrics.per_class

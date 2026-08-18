@@ -49,6 +49,53 @@ Corrections on record, for anyone reading older documents:
 
 ## Entries
 
+### 2026-08-18 — Trial-score fabrication removed from both Optuna tuners
+
+**Problem.** Both hyperparameter tuners could report accuracies that were
+never measured.
+
+- Root tuner (`optuna_tuning.py`): every trial was scored from
+  `output/vin_rec_finetune/training_metrics.json` whenever that file merely
+  existed — no exit-code check, no freshness check. Every trial overwrites
+  that same fixed path, so a trial that crashed before writing was scored
+  from the *previous* trial's file. Reproduced directly: after a successful
+  trial recording 0.4186, a crashed trial returned 0.4186. Crashes were also
+  returned as 0.0, which the TPE sampler cannot distinguish from a measured
+  zero. The study was in-memory only: one interrupt discarded every
+  completed trial.
+- Package tuner (`src/vin_ocr/training/hyperparameter_tuning/`, the one the
+  web UI and `vin-train tune` launch): the objectives passed an
+  `epoch_callback` keyword that **no trainer accepts**, so every trial
+  raised TypeError — and `except Exception: return 0.0` scored the crash as
+  a measured zero. The DeepSeek path imported `DeepSeekFineTuner`, a class
+  that has never existed (the trainer is `DeepSeekVINTrainer`), and
+  mislabelled the resulting ImportError as a *pruned* trial. This tuner was
+  structurally incapable of producing a genuine measurement. No
+  `optimization_results.json`/`trial_history.csv` artifacts exist in the
+  repo, so no recorded number originates from it.
+
+**Change.** A trial that produced no measurement now raises
+`TrialExecutionError` (one shared definition in
+`src/vin_ocr/training/hyperparameter_tuning/errors.py`) and is recorded by
+Optuna as FAILED — visible, excluded from the sampler, non-fatal to the
+study. Root tuner: metrics file deleted before launch, non-zero exit fatal,
+metrics mtime must post-date the launch; study persisted to SQLite; every
+trial is a tracked MLflow run with full provenance. Package tuner: scores
+`PaddleOCRScratchTrainer.train()`'s returned best accuracy; DeepSeek trials
+read the `training_progress.json` the trainer's callback writes, with
+existence/freshness/parse/numeric guards; a study with no measurements
+reports no best (None, not 0.0). Pinned by 35 regression tests
+(`tests/test_optuna_tuning.py`, `tests/test_hyperparameter_tuning_package.py`),
+including an AST guard that no except handler in either tuner returns a
+numeric literal.
+
+**Effect on model metrics.** None yet — this changes what can be *recorded*,
+not what is computed. The standing 41.86% (18/43) baseline came from the
+root tuner's `optuna_results/` corpus; any trial in that corpus whose
+training crashed may carry a neighbour's accuracy under its own
+hyperparameters, so per-trial hyperparameter conclusions drawn from it are
+suspect until re-measured under the fixed tuner.
+
 ### 2026-08-17 — Experiment tracking with mandatory provenance
 
 **Problem.** Three consecutive audits found metrics that could not be traced to

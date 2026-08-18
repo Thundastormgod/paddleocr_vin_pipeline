@@ -103,11 +103,14 @@ except ImportError:
     VINFineTuner = None
 
 try:
-    from src.vin_ocr.training.hyperparameter_tuning import HyperparameterTuner
+    # The package exports OptunaHyperparameterTuner. This block previously
+    # imported a name that does not exist ("HyperparameterTuner"), so the
+    # ImportError branch always ran and this flag could never be True.
+    from src.vin_ocr.training.hyperparameter_tuning import OptunaHyperparameterTuner
     HYPERPARAMETER_TUNING_AVAILABLE = True
 except ImportError:
     HYPERPARAMETER_TUNING_AVAILABLE = False
-    HyperparameterTuner = None
+    OptunaHyperparameterTuner = None
 
 # Import training components for subprocess-based training with console output
 try:

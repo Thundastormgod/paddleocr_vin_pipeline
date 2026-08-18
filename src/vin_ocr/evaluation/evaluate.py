@@ -29,7 +29,6 @@ import logging
 import sys
 import time
 from dataclasses import dataclass, field, asdict
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -341,30 +340,17 @@ def calculate_character_metrics(
     Returns:
         Tuple of (precision, recall, f1)
     """
-    total_tp = 0  # True positives  (aligned, equal characters)
-    total_fp = 0  # False positives (predicted chars with no reference match)
-    total_fn = 0  # False negatives (reference chars the prediction missed)
+    # Single implementation: core.char_metrics. The opcode walk used to be
+    # inlined here; three other files carried drifted copies of it, and the
+    # drifted copies are what produced four different F1 values for
+    # identical input.
+    from ..core.char_metrics import AlignmentCounts, alignment_counts, micro_prf
 
+    totals = AlignmentCounts()
     for pred, ref in zip(predictions, references):
-        matcher = SequenceMatcher(None, pred, ref, autojunk=False)
-        for tag, p_start, p_end, r_start, r_end in matcher.get_opcodes():
-            n_pred = p_end - p_start
-            n_ref = r_end - r_start
-            if tag == 'equal':
-                total_tp += n_ref
-            elif tag == 'replace':
-                total_fp += n_pred
-                total_fn += n_ref
-            elif tag == 'insert':      # present in ref, absent from pred
-                total_fn += n_ref
-            elif tag == 'delete':      # present in pred, absent from ref
-                total_fp += n_pred
+        totals.update(alignment_counts(pred, ref))
 
-    precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-    recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-
-    return precision, recall, f1
+    return micro_prf(totals)
 
 
 def calculate_position_accuracy(

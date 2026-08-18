@@ -30,10 +30,8 @@ import sys
 import json
 import time
 from pathlib import Path
-from collections import defaultdict, Counter
 from typing import Dict, List, Tuple, Any, Optional
 from dataclasses import dataclass, asdict
-import re
 
 # Add project root to path.
 #
@@ -51,6 +49,10 @@ from src.vin_ocr.core.vin_utils import (
     NON_VIN_RUN,
     extract_vin_from_filename,
     extract_vin_from_text as _canonical_extract_vin,
+)
+from src.vin_ocr.evaluation.errors import (
+    ModelExecutionError,
+    ModelUnavailableError,
 )
 
 import numpy as np
@@ -72,7 +74,15 @@ class ModelResult:
 
 @dataclass
 class ModelMetrics:
-    """Aggregated metrics for a model across all images."""
+    """
+    Aggregated metrics for a model across all MEASURED images.
+
+    ``evaluation_errors`` counts images whose evaluation crashed (OCR call
+    raised, image unreadable). Those images are excluded from every other
+    field: a crash is an absence of measurement, not a wrong prediction.
+    ``total_images`` is therefore the number of measurements, and
+    ``total_images + evaluation_errors`` the number of attempts.
+    """
     model_name: str
     total_images: int
     exact_matches: int
@@ -89,6 +99,7 @@ class ModelMetrics:
     avg_processing_time: float
     per_class_metrics: Dict[str, Dict[str, float]]
     sample_results: List[Dict]
+    evaluation_errors: int = 0
 
 
 class VINCharValidator:
@@ -192,12 +203,12 @@ class MultiModelEvaluator:
         
         # Fine-tuned Models (Custom Trained - Paddle Format)
         'finetuned': 'Fine-tuned PaddleOCR (Paddle format) - Custom trained on VIN dataset',
-        'finetuned_deepseek': 'Fine-tuned DeepSeek (PyTorch format) - Custom trained VLM on VIN dataset',
+        'deepseek_finetuned': 'Fine-tuned DeepSeek (PyTorch format) - Custom trained VLM on VIN dataset',
         
         # Production Models (ONNX Export - Recommended for Evaluation)
         'onnx': 'ONNX Model - Exported model for cross-platform deployment',
         'finetuned_onnx': 'Fine-tuned PaddleOCR (ONNX) - Production-ready exported PaddleOCR model',
-        'finetuned_deepseek_onnx': 'Fine-tuned DeepSeek (ONNX) - Production-ready exported VLM model',
+        'deepseek_finetuned_onnx': 'Fine-tuned DeepSeek (ONNX) - Production-ready exported VLM model',
     }
     
     # Evaluation mode descriptions
@@ -210,8 +221,25 @@ class MultiModelEvaluator:
     # Supported ONNX model prefixes for auto-discovery
     ONNX_MODEL_PREFIXES = {
         'paddleocr': 'finetuned_onnx',
-        'deepseek': 'finetuned_deepseek_onnx',
+        'deepseek': 'deepseek_finetuned_onnx',
         'vin': 'finetuned_onnx',
+    }
+
+    # Model type -> runner method name. THE dispatch table: registration and
+    # dispatch draw from this one mapping. The previous if/elif chain
+    # dispatched on 'deepseek_finetuned_onnx' while the loader registered
+    # 'finetuned_deepseek_onnx' (words transposed), so every fine-tuned
+    # DeepSeek ONNX model fell through to an else-branch that scored
+    # ("", 0.0) per image - tabulated as a model legitimately scoring 0%.
+    MODEL_RUNNERS = {
+        'paddleocr': 'run_paddleocr',
+        'vin_pipeline': 'run_vin_pipeline',
+        'deepseek': 'run_deepseek',
+        'deepseek_finetuned': 'run_deepseek_finetuned',
+        'deepseek_finetuned_onnx': 'run_deepseek_onnx',
+        'onnx': 'run_onnx',
+        'finetuned_onnx': 'run_onnx',
+        'finetuned': 'run_paddleocr',
     }
     
     def __init__(self, output_dir: str = "results", evaluation_mode: str = "recognition"):
@@ -450,9 +478,10 @@ class MultiModelEvaluator:
                 model_name = onnx_path.stem
                 model_key = f"onnx_{model_name}"
                 
-                # Determine model type based on path/name
+                # Determine model type based on path/name. Keys MUST exist in
+                # MODEL_RUNNERS; evaluate_model raises on anything else.
                 if 'deepseek' in str(onnx_path).lower() or 'deepseek' in model_name.lower():
-                    model_type = 'finetuned_deepseek_onnx'
+                    model_type = 'deepseek_finetuned_onnx'
                     display_name = f'ONNX DeepSeek: {model_name}'
                 else:
                     model_type = 'finetuned_onnx'
@@ -555,96 +584,101 @@ class MultiModelEvaluator:
     # Supported formats: "1-VIN -SAL1A2A40SA606662.jpg", "7-VIN_-_SAL109F97TA467227.jpg", etc.
     
     def run_paddleocr(self, engine, image_path: str) -> Tuple[str, float]:
-        """Run PaddleOCR on an image using the new predict() API."""
-        try:
-            # Use predict() instead of deprecated ocr()
-            result = engine.predict(image_path)
-            
-            if not result:
-                return "", 0.0
-            
-            # Handle new PaddleOCR result format
-            texts = []
-            confidences = []
-            
-            # New API returns list of results
-            for item in result:
-                # Try to extract rec_texts and rec_scores from result
-                if hasattr(item, 'rec_texts'):
-                    rec_texts = item.rec_texts if item.rec_texts else []
-                    rec_scores = item.rec_scores if hasattr(item, 'rec_scores') and item.rec_scores else [0.5] * len(rec_texts)
-                    texts.extend(rec_texts)
-                    confidences.extend(rec_scores)
-                elif isinstance(item, dict):
-                    if 'rec_texts' in item:
-                        texts.extend(item['rec_texts'])
-                        confidences.extend(item.get('rec_scores', [0.5] * len(item['rec_texts'])))
-                elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                    # Legacy format: [[box, (text, conf)], ...]
-                    for line in item:
-                        if line and len(line) >= 2:
-                            text = line[1][0] if isinstance(line[1], tuple) else str(line[1])
-                            conf = line[1][1] if isinstance(line[1], tuple) else 0.5
-                            texts.append(text)
-                            confidences.append(conf)
-            
-            if not texts:
-                return "", 0.0
-            
-            combined_text = ' '.join(texts)
-            avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
-            
-            # Clean and extract VIN
-            vin = VINCharValidator.extract_vin_from_text(combined_text)
-            
-            return vin, avg_conf
-            
-        except Exception as e:
-            print(f"    Error processing {image_path}: {e}")
+        """
+        Run PaddleOCR on an image using the new predict() API.
+
+        Returns ("", 0.0) only when OCR genuinely found no text - that is a
+        measurement of "nothing recognised". Crashes propagate to
+        evaluate_model, which records them as evaluation errors; this method
+        previously converted them into ("", 0.0), indistinguishable from a
+        real empty reading inside the accuracy denominator.
+        """
+        # Use predict() instead of deprecated ocr()
+        result = engine.predict(image_path)
+
+        if not result:
             return "", 0.0
+
+        # Handle new PaddleOCR result format
+        texts = []
+        confidences = []
+
+        # New API returns list of results
+        for item in result:
+            # Try to extract rec_texts and rec_scores from result
+            if hasattr(item, 'rec_texts'):
+                rec_texts = item.rec_texts if item.rec_texts else []
+                rec_scores = item.rec_scores if hasattr(item, 'rec_scores') and item.rec_scores else [0.5] * len(rec_texts)
+                texts.extend(rec_texts)
+                confidences.extend(rec_scores)
+            elif isinstance(item, dict):
+                if 'rec_texts' in item:
+                    texts.extend(item['rec_texts'])
+                    confidences.extend(item.get('rec_scores', [0.5] * len(item['rec_texts'])))
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                # Legacy format: [[box, (text, conf)], ...]
+                for line in item:
+                    if line and len(line) >= 2:
+                        text = line[1][0] if isinstance(line[1], tuple) else str(line[1])
+                        conf = line[1][1] if isinstance(line[1], tuple) else 0.5
+                        texts.append(text)
+                        confidences.append(conf)
+
+        if not texts:
+            return "", 0.0
+
+        combined_text = ' '.join(texts)
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+
+        # Clean and extract VIN
+        vin = VINCharValidator.extract_vin_from_text(combined_text)
+
+        return vin, avg_conf
     
     def run_vin_pipeline(self, engine, image_path: str) -> Tuple[str, float]:
-        """Run VIN Pipeline on an image."""
-        try:
-            result = engine.recognize(image_path)
-            vin = result.get('vin', '') or ''
-            conf = result.get('confidence', 0.0) or 0.0
-            return vin[:17], conf
-        except Exception as e:
-            print(f"    Error with VIN pipeline on {image_path}: {e}")
-            return "", 0.0
+        """
+        Run VIN Pipeline on an image.
+
+        The pipeline's recognize() has its own result contract (it reports
+        failures in its result dict); an exception escaping it is a real
+        error and propagates to the per-image error accounting.
+        """
+        result = engine.recognize(image_path)
+        vin = result.get('vin', '') or ''
+        conf = result.get('confidence', 0.0) or 0.0
+        return vin[:17], conf
     
     def run_deepseek(self, engine, image_path: str) -> Tuple[str, float]:
-        """Run DeepSeek-OCR on an image."""
-        try:
-            # Initialize the model if not already initialized
-            if not engine._initialized:
-                # Check if we already tried and failed
-                if hasattr(engine, '_init_failed') and engine._init_failed:
-                    return "", 0.0
-                    
-                print("    Initializing DeepSeek-OCR model (this may take a moment)...")
-                try:
-                    engine.initialize()
-                except Exception as init_error:
-                    print(f"    DeepSeek-OCR initialization failed: {init_error}")
-                    engine._init_failed = True
-                    return "", 0.0
-            
-            # Run OCR
-            result = engine.recognize(image_path)
-            
-            # Extract text and confidence
-            raw_text = result.text if result else ''
-            confidence = result.confidence if result else 0.0
-            
-            # Clean and extract VIN from result
-            vin = VINCharValidator.extract_vin_from_text(raw_text)
-            
-            return vin[:17] if vin else '', confidence
-        except Exception as e:
-            print(f"    Error with DeepSeek-OCR on {image_path}: {e}")
-            return "", 0.0
+        """
+        Run DeepSeek-OCR on an image.
+
+        Raises:
+            ModelUnavailableError: If the model fails to initialise. This
+                previously returned ("", 0.0) for every subsequent image,
+                tabulating a model that never loaded as one that scored 0%
+                across the whole dataset.
+        """
+        # Initialize the model if not already initialized
+        if not engine._initialized:
+            print("    Initializing DeepSeek-OCR model (this may take a moment)...")
+            try:
+                engine.initialize()
+            except Exception as init_error:
+                raise ModelUnavailableError(
+                    f"DeepSeek-OCR initialisation failed: {init_error}"
+                ) from init_error
+
+        # Run OCR
+        result = engine.recognize(image_path)
+
+        # Extract text and confidence
+        raw_text = result.text if result else ''
+        confidence = result.confidence if result else 0.0
+
+        # Clean and extract VIN from result
+        vin = VINCharValidator.extract_vin_from_text(raw_text)
+
+        return vin[:17] if vin else '', confidence
     
     def run_deepseek_finetuned(self, engine, image_path: str) -> Tuple[str, float]:
         """
@@ -655,50 +689,47 @@ class MultiModelEvaluator:
         
         Note: This method expects a transformers-based model loaded from
         a fine-tuned checkpoint (e.g., models/deepseek_finetuned/).
+
+        Raises:
+            ModelUnavailableError: If the model fails to initialise
+                (previously scored as 0% across the whole dataset).
         """
-        try:
-            # Initialize the model if not already initialized
-            if hasattr(engine, '_initialized') and not engine._initialized:
-                if hasattr(engine, '_init_failed') and engine._init_failed:
-                    return "", 0.0
-                    
-                print("    Initializing fine-tuned DeepSeek model (this may take a moment)...")
-                try:
-                    engine.initialize()
-                except Exception as init_error:
-                    print(f"    Fine-tuned DeepSeek initialization failed: {init_error}")
-                    engine._init_failed = True
-                    return "", 0.0
-            
-            # Run inference - fine-tuned model may have different interface
-            if hasattr(engine, 'recognize_vin'):
-                # Custom VIN-specific method if available
-                result = engine.recognize_vin(image_path)
-            elif hasattr(engine, 'recognize'):
-                # Standard recognize interface
-                result = engine.recognize(image_path)
-            else:
-                # Direct model call for transformers models
-                result = engine(image_path)
-            
-            # Handle different result formats
-            if isinstance(result, dict):
-                raw_text = result.get('text', result.get('vin', ''))
-                confidence = result.get('confidence', 0.0)
-            elif hasattr(result, 'text'):
-                raw_text = result.text
-                confidence = result.confidence if hasattr(result, 'confidence') else 0.0
-            else:
-                raw_text = str(result) if result else ''
-                confidence = 0.0
-            
-            # Clean and extract VIN from result
-            vin = VINCharValidator.extract_vin_from_text(raw_text)
-            
-            return vin[:17] if vin else '', confidence
-        except Exception as e:
-            print(f"    Error with fine-tuned DeepSeek on {image_path}: {e}")
-            return "", 0.0
+        # Initialize the model if not already initialized
+        if hasattr(engine, '_initialized') and not engine._initialized:
+            print("    Initializing fine-tuned DeepSeek model (this may take a moment)...")
+            try:
+                engine.initialize()
+            except Exception as init_error:
+                raise ModelUnavailableError(
+                    f"fine-tuned DeepSeek initialisation failed: {init_error}"
+                ) from init_error
+
+        # Run inference - fine-tuned model may have different interface
+        if hasattr(engine, 'recognize_vin'):
+            # Custom VIN-specific method if available
+            result = engine.recognize_vin(image_path)
+        elif hasattr(engine, 'recognize'):
+            # Standard recognize interface
+            result = engine.recognize(image_path)
+        else:
+            # Direct model call for transformers models
+            result = engine(image_path)
+
+        # Handle different result formats
+        if isinstance(result, dict):
+            raw_text = result.get('text', result.get('vin', ''))
+            confidence = result.get('confidence', 0.0)
+        elif hasattr(result, 'text'):
+            raw_text = result.text
+            confidence = result.confidence if hasattr(result, 'confidence') else 0.0
+        else:
+            raw_text = str(result) if result else ''
+            confidence = 0.0
+
+        # Clean and extract VIN from result
+        vin = VINCharValidator.extract_vin_from_text(raw_text)
+
+        return vin[:17] if vin else '', confidence
     
     def run_deepseek_onnx(self, model_info: Dict, image_path: str) -> Tuple[str, float]:
         """
@@ -714,234 +745,297 @@ class MultiModelEvaluator:
             'output_name': str,
             'processor': optional image processor config
         }
+
+        Raises:
+            ModelExecutionError: If the image cannot be read.
+            ModelUnavailableError: If the exported model's input contract is
+                not the expected 4-D vision input.
         """
-        try:
-            import cv2
-            import numpy as np
-            
-            # Load image
-            image = cv2.imread(image_path)
-            if image is None:
-                return "", 0.0
-            
-            # Convert BGR to RGB (transformers models expect RGB)
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            
-            # Get model input requirements
-            session = model_info['engine']
-            input_info = session.get_inputs()[0]
-            input_name = input_info.name
-            input_shape = input_info.shape
-            
-            # Preprocess image for vision transformer
-            # Typical ViT input: [batch, channels, height, width] = [1, 3, 384, 384] or similar
-            if len(input_shape) == 4:
-                # Get expected dimensions
-                if isinstance(input_shape[2], int) and isinstance(input_shape[3], int):
-                    target_h, target_w = input_shape[2], input_shape[3]
-                else:
-                    target_h, target_w = 384, 384  # Default ViT size
-                
-                # Resize image
-                resized = cv2.resize(image_rgb, (target_w, target_h))
-                
-                # Normalize (ImageNet normalization for transformers)
-                mean = np.array([0.485, 0.456, 0.406])
-                std = np.array([0.229, 0.224, 0.225])
-                normalized = (resized.astype(np.float32) / 255.0 - mean) / std
-                
-                # Transpose to NCHW format
-                input_data = np.transpose(normalized, (2, 0, 1))  # HWC -> CHW
-                input_data = np.expand_dims(input_data, axis=0)   # Add batch
-                input_data = input_data.astype(np.float32)
+        import cv2
+        import numpy as np
+
+        # Load image
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ModelExecutionError(f"unreadable image: {image_path}")
+
+        # Convert BGR to RGB (transformers models expect RGB)
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        # Get model input requirements
+        session = model_info['engine']
+        input_info = session.get_inputs()[0]
+        input_name = input_info.name
+        input_shape = input_info.shape
+
+        # Preprocess image for vision transformer
+        # Typical ViT input: [batch, channels, height, width] = [1, 3, 384, 384] or similar
+        if len(input_shape) != 4:
+            raise ModelUnavailableError(
+                f"exported DeepSeek model has input shape {input_shape}; "
+                f"expected a 4-D vision input [batch, channels, h, w]"
+            )
+
+        # Get expected dimensions
+        if isinstance(input_shape[2], int) and isinstance(input_shape[3], int):
+            target_h, target_w = input_shape[2], input_shape[3]
+        else:
+            target_h, target_w = 384, 384  # Default ViT size
+
+        # Resize image
+        resized = cv2.resize(image_rgb, (target_w, target_h))
+
+        # Normalize (ImageNet normalization for transformers)
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        normalized = (resized.astype(np.float32) / 255.0 - mean) / std
+
+        # Transpose to NCHW format
+        input_data = np.transpose(normalized, (2, 0, 1))  # HWC -> CHW
+        input_data = np.expand_dims(input_data, axis=0)   # Add batch
+        input_data = input_data.astype(np.float32)
+
+        # Run inference
+        output_names = [o.name for o in session.get_outputs()]
+        outputs = session.run(output_names, {input_name: input_data})
+
+        # Decode output
+        # For VLM models, output is typically token IDs that need decoding
+        output = outputs[0]
+
+        # If output is logits, decode them
+        if len(output.shape) >= 2:
+            if output.shape[-1] > 100:  # Likely vocabulary logits
+                # Use argmax to get token IDs
+                pred_indices = np.argmax(output, axis=-1)
+
+                # Simple ASCII-based decoding for VIN characters
+                # Fine-tuned model should output VIN-like text
+                decoded_chars = []
+                for idx in pred_indices.flatten():
+                    if 32 <= idx < 127:  # Printable ASCII
+                        decoded_chars.append(chr(idx))
+                raw_text = ''.join(decoded_chars)
             else:
-                # Fallback for unexpected input format
-                print(f"    Unexpected input shape: {input_shape}")
-                return "", 0.0
-            
-            # Run inference
-            output_names = [o.name for o in session.get_outputs()]
-            outputs = session.run(output_names, {input_name: input_data})
-            
-            # Decode output
-            # For VLM models, output is typically token IDs that need decoding
-            output = outputs[0]
-            
-            # If output is logits, decode them
-            if len(output.shape) >= 2:
-                if output.shape[-1] > 100:  # Likely vocabulary logits
-                    # Use argmax to get token IDs
-                    pred_indices = np.argmax(output, axis=-1)
-                    
-                    # Simple ASCII-based decoding for VIN characters
-                    # Fine-tuned model should output VIN-like text
-                    decoded_chars = []
-                    for idx in pred_indices.flatten():
-                        if 32 <= idx < 127:  # Printable ASCII
-                            decoded_chars.append(chr(idx))
-                    raw_text = ''.join(decoded_chars)
-                else:
-                    # Direct character indices
-                    char_set = "0123456789ABCDEFGHJKLMNPRSTUVWXYZ"
-                    decoded = [char_set[int(i)] for i in output.flatten() if 0 <= i < len(char_set)]
-                    raw_text = ''.join(decoded)
-            else:
-                raw_text = str(output)
-            
-            # Extract VIN from decoded text
-            vin = VINCharValidator.extract_vin_from_text(raw_text)
-            
-            # Calculate confidence from output probabilities
-            if len(outputs) > 0 and hasattr(outputs[0], 'shape'):
-                confidence = float(np.mean(np.max(outputs[0], axis=-1))) if outputs[0].size > 0 else 0.0
-            else:
-                confidence = 0.5  # Default confidence
-            
-            return vin[:17] if vin else '', confidence
-            
-        except Exception as e:
-            print(f"    Error with DeepSeek ONNX model on {image_path}: {e}")
-            return "", 0.0
+                # Small output dimension: treat as CTC class indices and
+                # decode with the canonical dict (blank at index 0). The
+                # previous branch indexed a blankless local charset, which
+                # shifts every character for models trained with the
+                # canonical mapping.
+                from src.vin_ocr.core.charset import (
+                    BLANK_INDEX,
+                    ctc_greedy_decode,
+                )
+                raw_text, _ = ctc_greedy_decode(
+                    [int(i) for i in output.flatten()],
+                    self._get_ctc_char_dict(),
+                    blank_index=BLANK_INDEX,
+                )
+        else:
+            raw_text = str(output)
+
+        # Extract VIN from decoded text
+        vin = VINCharValidator.extract_vin_from_text(raw_text)
+
+        # Calculate confidence from output probabilities
+        if len(outputs) > 0 and hasattr(outputs[0], 'shape'):
+            confidence = float(np.mean(np.max(outputs[0], axis=-1))) if outputs[0].size > 0 else 0.0
+        else:
+            confidence = 0.5  # Default confidence
+
+        return vin[:17] if vin else '', confidence
     
+    def _get_ctc_char_dict(self) -> Dict[int, str]:
+        """
+        The canonical index->character map for CTC decoding, cached.
+
+        Loaded via core.charset.load_char_dict so evaluation uses exactly
+        the mapping the models were trained with (blank at index 0).
+        """
+        if not hasattr(self, '_ctc_idx_to_char'):
+            from src.vin_ocr.core.charset import load_char_dict
+            _, idx_to_char = load_char_dict(None)
+            self._ctc_idx_to_char = idx_to_char
+        return self._ctc_idx_to_char
+
     def run_onnx(self, model_info: Dict, image_path: str) -> Tuple[str, float]:
         """
         Run ONNX model inference on an image.
-        
+
         This is the recommended method for evaluating fine-tuned models
         as ONNX provides consistent, production-ready inference.
+
+        Raises:
+            ModelExecutionError: If the image cannot be read.
+
+        Note:
+            Decoding previously used a LOCAL charset with
+            ``blank_idx = len(char_set) = 33`` against models trained with
+            blank at index 0 (core.charset.BLANK_INDEX). Every blank the
+            model emitted decoded as the digit '0' and every character came
+            out shifted by one: the canonically-encoded "1M8" decoded as
+            "020N090". Every ONNX evaluation this file ever recorded -
+            including the 0.0% for output/vin_rec_finetune - was produced
+            by that decoder and measures the decoder, not the model.
         """
-        try:
-            import cv2
-            import numpy as np
-            
-            # Load and preprocess image
-            image = cv2.imread(image_path)
-            if image is None:
-                return "", 0.0
-            
-            # Convert to grayscale if needed
-            if len(image.shape) == 3:
-                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = image
-            
-            # Resize to expected input size (typical OCR input: 32x320 or similar)
-            # TODO: Get actual input shape from model
-            session = model_info['engine']
-            input_shape = session.get_inputs()[0].shape
-            
-            # Handle dynamic shapes
-            if isinstance(input_shape[2], int) and isinstance(input_shape[3], int):
-                target_h, target_w = input_shape[2], input_shape[3]
-            else:
-                target_h, target_w = 32, 320  # Default OCR input size
-            
-            # Resize maintaining aspect ratio
-            h, w = gray.shape[:2]
-            ratio = target_h / h
-            new_w = int(w * ratio)
-            if new_w > target_w:
-                new_w = target_w
-            
-            resized = cv2.resize(gray, (new_w, target_h))
-            
-            # Pad to target width
-            if new_w < target_w:
-                padded = np.zeros((target_h, target_w), dtype=np.uint8)
-                padded[:, :new_w] = resized
-                resized = padded
-            
-            # Normalize and add batch/channel dimensions
-            input_data = resized.astype(np.float32) / 255.0
-            input_data = np.expand_dims(input_data, axis=0)  # Add batch
-            input_data = np.expand_dims(input_data, axis=0)  # Add channel
-            
-            # Run inference
-            input_name = model_info['input_name']
-            output_name = model_info['output_name']
-            
-            outputs = session.run([output_name], {input_name: input_data})
-            
-            # Decode output (CTC decoding)
-            output = outputs[0]
-            pred_indices = np.argmax(output, axis=2)[0]
-            
-            # Simple CTC decode (remove blanks and duplicates)
-            # TODO: Use proper character set from model config
-            char_set = "0123456789ABCDEFGHJKLMNPRSTUVWXYZ"  # VIN valid chars
-            blank_idx = len(char_set)
-            
-            decoded = []
-            prev_idx = blank_idx
-            for idx in pred_indices:
-                if idx != blank_idx and idx != prev_idx:
-                    if idx < len(char_set):
-                        decoded.append(char_set[idx])
-                prev_idx = idx
-            
-            vin = ''.join(decoded)[:17]
-            confidence = float(np.max(output)) if len(output) > 0 else 0.0
-            
-            return vin, confidence
-            
-        except Exception as e:
-            print(f"    Error with ONNX model on {image_path}: {e}")
-            return "", 0.0
+        import cv2
+        import numpy as np
+
+        from src.vin_ocr.core.charset import BLANK_INDEX, ctc_greedy_decode
+
+        # Load and preprocess image
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ModelExecutionError(f"unreadable image: {image_path}")
+
+        # Convert to grayscale if needed
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+
+        # Resize to the model's expected input size
+        session = model_info['engine']
+        input_shape = session.get_inputs()[0].shape
+
+        # Handle dynamic shapes
+        if isinstance(input_shape[2], int) and isinstance(input_shape[3], int):
+            target_h, target_w = input_shape[2], input_shape[3]
+        else:
+            target_h, target_w = 32, 320  # Default OCR input size
+
+        # Resize maintaining aspect ratio
+        h, w = gray.shape[:2]
+        ratio = target_h / h
+        new_w = int(w * ratio)
+        if new_w > target_w:
+            new_w = target_w
+
+        resized = cv2.resize(gray, (new_w, target_h))
+
+        # Pad to target width
+        if new_w < target_w:
+            padded = np.zeros((target_h, target_w), dtype=np.uint8)
+            padded[:, :new_w] = resized
+            resized = padded
+
+        # Normalize and add batch/channel dimensions
+        input_data = resized.astype(np.float32) / 255.0
+        input_data = np.expand_dims(input_data, axis=0)  # Add batch
+        input_data = np.expand_dims(input_data, axis=0)  # Add channel
+
+        # Run inference
+        input_name = model_info['input_name']
+        output_name = model_info['output_name']
+
+        outputs = session.run([output_name], {input_name: input_data})
+
+        # Decode output through the single canonical CTC implementation.
+        output = outputs[0]
+        pred_indices = np.argmax(output, axis=2)[0]
+
+        text, kept_positions = ctc_greedy_decode(
+            pred_indices, self._get_ctc_char_dict(), blank_index=BLANK_INDEX
+        )
+        vin = text[:17]
+
+        # Confidence: mean per-timestep probability of the emitted chars.
+        # (The previous value was np.max over the raw output tensor - the
+        # single largest logit anywhere in the sequence.)
+        exp = np.exp(output[0] - output[0].max(axis=-1, keepdims=True))
+        probs = exp / exp.sum(axis=-1, keepdims=True)
+        step_max = probs.max(axis=-1)
+        confidence = (
+            float(np.mean([step_max[t] for t in kept_positions]))
+            if kept_positions else 0.0
+        )
+
+        return vin, confidence
     
     def evaluate_model(self, model_key: str, model_info: Dict, dataset: List[Tuple[str, str]]) -> ModelMetrics:
         """Evaluate a single model on the entire dataset."""
         print(f"\n  Evaluating: {model_info['name']}...")
-        
+
+        # Dispatch strictly through the table. An unregistered type is a
+        # configuration bug and must halt THIS model's evaluation loudly -
+        # the previous else-branch scored unknown types as ("", 0.0) per
+        # image, tabulating an unevaluated model as one that scored 0%.
+        runner_name = self.MODEL_RUNNERS.get(model_info['type'])
+        if runner_name is None:
+            raise ModelUnavailableError(
+                f"model '{model_info['name']}' has unregistered type "
+                f"'{model_info['type']}'; known types: "
+                f"{sorted(self.MODEL_RUNNERS)}"
+            )
+        runner = getattr(self, runner_name)
+        # run_onnx and run_deepseek_onnx need the full model_info (session,
+        # input/output names); the others take the engine object.
+        runner_arg = (
+            model_info if runner_name in ('run_onnx', 'run_deepseek_onnx')
+            else model_info['engine']
+        )
+
         predictions = []
         ground_truths = []
         confidences = []
         processing_times = []
         sample_results = []
-        
+        evaluation_errors = 0
+
         for i, (img_path, gt_vin) in enumerate(dataset):
             start_time = time.time()
-            
-            if model_info['type'] == 'paddleocr':
-                pred_vin, conf = self.run_paddleocr(model_info['engine'], img_path)
-            elif model_info['type'] == 'vin_pipeline':
-                pred_vin, conf = self.run_vin_pipeline(model_info['engine'], img_path)
-            elif model_info['type'] == 'deepseek':
-                pred_vin, conf = self.run_deepseek(model_info['engine'], img_path)
-            elif model_info['type'] == 'deepseek_finetuned':
-                pred_vin, conf = self.run_deepseek_finetuned(model_info['engine'], img_path)
-            elif model_info['type'] == 'deepseek_finetuned_onnx':
-                pred_vin, conf = self.run_deepseek_onnx(model_info, img_path)
-            elif model_info['type'] == 'onnx':
-                pred_vin, conf = self.run_onnx(model_info, img_path)
-            elif model_info['type'] == 'finetuned_onnx':
-                pred_vin, conf = self.run_onnx(model_info, img_path)
-            elif model_info['type'] == 'finetuned':
-                # For fine-tuned PaddleOCR models (native format)
-                pred_vin, conf = self.run_paddleocr(model_info['engine'], img_path)
-            else:
-                pred_vin, conf = "", 0.0
-            
+
+            try:
+                pred_vin, conf = runner(runner_arg, img_path)
+            except ModelUnavailableError:
+                raise
+            except Exception as exc:
+                # An evaluation crash is an absence of measurement, not an
+                # observation of an empty prediction. Record it as an error
+                # and keep it OUT of every metric denominator.
+                evaluation_errors += 1
+                sample_results.append({
+                    'image': Path(img_path).name,
+                    'ground_truth': gt_vin,
+                    'status': 'error',
+                    'error': f"{type(exc).__name__}: {exc}",
+                    'model_name': model_info['name'],
+                    'model_type': model_info['type'],
+                    'model_key': model_key,
+                })
+                print(f"    ✗ Evaluation error on {Path(img_path).name}: {exc}")
+                continue
+
             proc_time = time.time() - start_time
-            
-            # Ensure 17 chars for comparison
-            pred_vin = (pred_vin + '_' * 17)[:17]
-            
+
+            # No padding: metrics are alignment-based and handle length
+            # differences. The previous `(pred + '_' * 17)[:17]` wrote
+            # padded strings into the results JSON and fed '_' characters
+            # into the scorer, where they counted FN but never FP.
             predictions.append(pred_vin)
             ground_truths.append(gt_vin)
             confidences.append(conf)
             processing_times.append(proc_time)
-            
-            # Character-by-character match
-            chars_correct = sum(1 for j in range(17) if j < len(pred_vin) and pred_vin[j] == gt_vin[j])
-            match_pattern = ''.join(['✓' if j < len(pred_vin) and pred_vin[j] == gt_vin[j] else '✗' for j in range(17)])
-            
+
+            # Positional per-sample diagnostic (kept deliberately positional
+            # so the pattern lines up under the ground truth when printed).
+            chars_correct = sum(
+                1 for j in range(len(gt_vin))
+                if j < len(pred_vin) and pred_vin[j] == gt_vin[j]
+            )
+            match_pattern = ''.join(
+                '✓' if j < len(pred_vin) and pred_vin[j] == gt_vin[j] else '✗'
+                for j in range(len(gt_vin))
+            )
+
             sample_results.append({
                 'image': Path(img_path).name,
                 'ground_truth': gt_vin,
                 'prediction': pred_vin,
+                'status': 'measured',
                 'exact_match': pred_vin == gt_vin,
                 'chars_correct': chars_correct,
-                'char_accuracy': chars_correct / 17,
+                'char_accuracy': chars_correct / len(gt_vin) if gt_vin else 0.0,
                 'match_pattern': match_pattern,
                 'confidence': conf,
                 'processing_time': proc_time,
@@ -950,20 +1044,27 @@ class MultiModelEvaluator:
                 'model_type': model_info['type'],
                 'model_key': model_key,
             })
-            
+
             if (i + 1) % 50 == 0:
                 print(f"    Processed {i + 1}/{len(dataset)} images...")
-        
-        # Calculate metrics
+
+        if evaluation_errors:
+            print(
+                f"    ⚠ {evaluation_errors}/{len(dataset)} image(s) failed to "
+                f"evaluate and are excluded from the metrics"
+            )
+
+        # Calculate metrics over MEASURED images only
         metrics = self._calculate_metrics(
             model_info['name'],
             predictions,
             ground_truths,
             confidences,
             processing_times,
-            sample_results
+            sample_results,
+            evaluation_errors=evaluation_errors,
         )
-        
+
         return metrics
     
     def _calculate_metrics(
@@ -973,92 +1074,61 @@ class MultiModelEvaluator:
         ground_truths: List[str],
         confidences: List[float],
         processing_times: List[float],
-        sample_results: List[Dict]
+        sample_results: List[Dict],
+        evaluation_errors: int = 0,
     ) -> ModelMetrics:
-        """Calculate comprehensive metrics including F1 micro/macro."""
-        
+        """
+        Calculate comprehensive metrics via core.char_metrics.
+
+        This method previously compared ``pred[i] == gt[i]`` positionally
+        (one leading artifact scored a 94%-correct prediction at 0.059) and
+        could only count a false positive when the wrong character was a
+        valid VIN character sitting at a ground-truth position - so missing,
+        extra and invalid characters cost recall but never precision, and
+        precision >= recall held structurally (a 5-character prefix scored
+        precision 1.000 at recall 0.294). All character-level numbers now
+        come from the canonical alignment-based implementation; see
+        core/char_metrics.py for the definitions.
+        """
+        from src.vin_ocr.core.char_metrics import char_level_metrics
+
         n_samples = len(predictions)
-        
-        # Image-level metrics
+
+        # Image-level metrics (over measured images only)
         exact_matches = sum(1 for p, g in zip(predictions, ground_truths) if p == g)
         incorrect_predictions = n_samples - exact_matches
-        exact_match_accuracy = exact_matches / n_samples if n_samples > 0 else 0
-        
-        # Character-level metrics
-        char_correct = 0
-        char_total = 0
-        
-        vin_chars = set("0123456789ABCDEFGHJKLMNPRSTUVWXYZ")
-        class_tp = defaultdict(int)
-        class_fp = defaultdict(int)
-        class_fn = defaultdict(int)
-        
-        for pred, gt in zip(predictions, ground_truths):
-            for i in range(17):
-                pred_char = pred[i] if i < len(pred) else ''
-                gt_char = gt[i] if i < len(gt) else ''
-                
-                if gt_char:
-                    char_total += 1
-                    if pred_char == gt_char:
-                        char_correct += 1
-                        class_tp[gt_char] += 1
-                    else:
-                        class_fn[gt_char] += 1
-                        if pred_char and pred_char in vin_chars:
-                            class_fp[pred_char] += 1
-        
-        char_accuracy = char_correct / char_total if char_total > 0 else 0
-        
-        # F1 Micro
-        total_tp = sum(class_tp.values())
-        total_fp = sum(class_fp.values())
-        total_fn = sum(class_fn.values())
-        
-        micro_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
-        micro_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
-        f1_micro = 2 * micro_precision * micro_recall / (micro_precision + micro_recall) if (micro_precision + micro_recall) > 0 else 0
-        
-        # F1 Macro
-        class_f1_scores = []
-        per_class_metrics = {}
-        
-        for char in sorted(vin_chars):
-            tp = class_tp[char]
-            fp = class_fp[char]
-            fn = class_fn[char]
-            
-            if (tp + fn) > 0:
-                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-                class_f1_scores.append(f1)
-                per_class_metrics[char] = {
-                    'precision': precision,
-                    'recall': recall,
-                    'f1': f1,
-                    'support': tp + fn
-                }
-        
-        f1_macro = sum(class_f1_scores) / len(class_f1_scores) if class_f1_scores else 0
-        
+        exact_match_accuracy = exact_matches / n_samples if n_samples > 0 else 0.0
+
+        # Character-level metrics: single canonical implementation.
+        char_metrics = char_level_metrics(list(zip(predictions, ground_truths)))
+
+        # Per-class table keeps its historical shape: classes with support
+        # only (hallucinated-only classes are visible in char_metrics.per_class
+        # but were never part of this JSON schema).
+        per_class_metrics = {
+            char: row
+            for char, row in char_metrics.per_class.items()
+            if row['support'] > 0
+        }
+
         return ModelMetrics(
             model_name=model_name,
             total_images=n_samples,
             exact_matches=exact_matches,
             incorrect_predictions=incorrect_predictions,
             exact_match_accuracy=exact_match_accuracy,
-            total_characters=char_total,
-            correct_characters=char_correct,
-            character_accuracy=char_accuracy,
-            f1_micro=f1_micro,
-            f1_macro=f1_macro,
-            micro_precision=micro_precision,
-            micro_recall=micro_recall,
-            avg_confidence=sum(confidences) / len(confidences) if confidences else 0,
-            avg_processing_time=sum(processing_times) / len(processing_times) if processing_times else 0,
+            total_characters=char_metrics.total_reference_chars,
+            correct_characters=char_metrics.true_positives,
+            character_accuracy=char_metrics.char_accuracy,
+            f1_micro=char_metrics.f1_micro,
+            f1_macro=char_metrics.f1_macro,
+            micro_precision=char_metrics.precision,
+            micro_recall=char_metrics.recall,
+            avg_confidence=sum(confidences) / len(confidences) if confidences else 0.0,
+            avg_processing_time=sum(processing_times) / len(processing_times) if processing_times else 0.0,
             per_class_metrics=per_class_metrics,
-            sample_results=sample_results
+            sample_results=sample_results,
+            evaluation_errors=evaluation_errors,
         )
     
     def run_evaluation(self, max_images: Optional[int] = None, custom_image_folder: Optional[str] = None, labels_file: Optional[str] = None):
@@ -1092,22 +1162,34 @@ class MultiModelEvaluator:
             dataset = dataset[:max_images]
             print(f"  Limited to {max_images} images for testing")
         
-        # Evaluate each model
+        # Evaluate each model. A model that cannot run is reported as NOT
+        # EVALUATED - never as a row of zeros in the comparison table.
         all_metrics = {}
-        
+        not_evaluated: Dict[str, str] = {}
+
         for model_key, model_info in self.models.items():
             if model_info['type'] == 'finetuned':
                 print(f"\n  Skipping {model_info['name']} (requires separate inference)")
                 continue
-                
-            metrics = self.evaluate_model(model_key, model_info, dataset)
+
+            try:
+                metrics = self.evaluate_model(model_key, model_info, dataset)
+            except ModelUnavailableError as exc:
+                not_evaluated[model_key] = str(exc)
+                print(f"\n  ✗ NOT EVALUATED: {model_info['name']} - {exc}")
+                continue
             all_metrics[model_key] = metrics
-        
+
+        if not_evaluated:
+            print("\n  Models NOT evaluated (no measurements exist for them):")
+            for key, reason in not_evaluated.items():
+                print(f"    - {key}: {reason}")
+
         # Print comparison
         self._print_comparison(all_metrics)
         
         # Save results
-        self._save_results(all_metrics)
+        self._save_results(all_metrics, not_evaluated)
         
         return all_metrics
     
@@ -1210,8 +1292,18 @@ class MultiModelEvaluator:
                 print(f"      {s['match_pattern']} [{status}]")
                 print()
     
-    def _save_results(self, all_metrics: Dict[str, ModelMetrics]):
-        """Save results to JSON file."""
+    def _save_results(
+        self,
+        all_metrics: Dict[str, ModelMetrics],
+        not_evaluated: Optional[Dict[str, str]] = None,
+    ):
+        """
+        Save results to JSON file.
+
+        Models that could not run are recorded under ``not_evaluated`` with
+        their reason, so an absent measurement can never be read as a
+        measured 0%.
+        """
         from datetime import datetime
         
         # Build model registry with detailed information
@@ -1231,6 +1323,7 @@ class MultiModelEvaluator:
                 'total_models_evaluated': len(all_metrics),
             },
             'model_registry': model_registry,
+            'not_evaluated': not_evaluated or {},
             'models': {}
         }
         
@@ -1242,6 +1335,7 @@ class MultiModelEvaluator:
                     'exact_matches': metrics.exact_matches,
                     'incorrect_predictions': metrics.incorrect_predictions,
                     'exact_match_accuracy': metrics.exact_match_accuracy,
+                    'evaluation_errors': metrics.evaluation_errors,
                 },
                 'character_level': {
                     'total_characters': metrics.total_characters,

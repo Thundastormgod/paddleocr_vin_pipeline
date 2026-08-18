@@ -276,21 +276,18 @@ class ONNXVINRecognizer:
         pred_indices = np.argmax(pred_probs, axis=1)
         pred_max_probs = np.max(pred_probs, axis=1)
         
-        # CTC greedy decoding (collapse repeated + remove blanks)
-        decoded_chars = []
-        decoded_probs = []
-        prev_idx = self.config.blank_idx
-        
-        for t, (idx, prob) in enumerate(zip(pred_indices, pred_max_probs)):
-            if idx != self.config.blank_idx and idx != prev_idx:
-                char = self.idx_to_char.get(idx, '')
-                if char and char != '<blank>':
-                    decoded_chars.append(char)
-                    decoded_probs.append(prob)
-            prev_idx = idx
-        
-        text = ''.join(decoded_chars)
-        confidence = float(np.mean(decoded_probs)) if decoded_probs else 0.0
+        # CTC greedy decoding via the single canonical implementation.
+        # A local copy of this loop is how the three-decoders-three-blank-
+        # indices bug happened; see core/charset.ctc_greedy_decode.
+        from src.vin_ocr.core.charset import ctc_greedy_decode
+
+        text, kept_positions = ctc_greedy_decode(
+            pred_indices, self.idx_to_char, blank_index=self.config.blank_idx
+        )
+        confidence = (
+            float(np.mean([pred_max_probs[t] for t in kept_positions]))
+            if kept_positions else 0.0
+        )
         
         return text, confidence
     

@@ -1136,7 +1136,11 @@ class PaddleOCRScratchTrainer:
         # Canonical reverse map, cached by _load_char_dict(). BLANK_TOKEN is
         # excluded so a stray blank prediction can never splice the literal
         # string "<blank>" into a decoded VIN.
-        from src.vin_ocr.core.charset import BLANK_INDEX, BLANK_TOKEN
+        from src.vin_ocr.core.charset import (
+            BLANK_INDEX,
+            BLANK_TOKEN,
+            ctc_greedy_decode,
+        )
 
         idx_to_char = {
             idx: ch
@@ -1159,18 +1163,10 @@ class PaddleOCRScratchTrainer:
                     label_len = label_lengths[i].item()
                     label_seq = labels[i][:label_len].numpy()
                     
-                    # CTC greedy decode: collapse repeats first, then strip
-                    # blanks. `prev` is updated on EVERY step (including
-                    # blanks), which is what makes that ordering correct.
-                    decoded = []
-                    prev = -1
-                    for idx in pred_seq:
-                        if idx != BLANK_INDEX and idx != prev:
-                            decoded.append(idx)
-                        prev = idx
-                    
-                    # Convert to text
-                    pred_text = ''.join([idx_to_char.get(idx, '') for idx in decoded])
+                    # Single canonical decode (collapse-then-strip); a local
+                    # copy of this loop is how the wrong-blank decoder bug
+                    # shipped elsewhere in this repo.
+                    pred_text, _ = ctc_greedy_decode(pred_seq, idx_to_char)
                     label_text = ''.join([idx_to_char.get(idx, '') for idx in label_seq])
                     
                     all_predictions.append(pred_text)

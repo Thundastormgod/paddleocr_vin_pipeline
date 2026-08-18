@@ -49,6 +49,36 @@ Corrections on record, for anyone reading older documents:
 
 ## Entries
 
+### 2026-08-18 — First tracked training run on the real dataset (n=2,387)
+
+**Hypothesis.** With the trainer fixed (CTC contract, checkpoints) and the
+real recognition set staged (2,529 crops from DagsHub
+`Thundastormgod/jlr-vin-ocr`, VIN-grouped splits 2,387/102/40, 100%
+checksum-valid labels), a CPU run under repo-default hyperparameters
+should escape blank collapse and learn.
+
+**Runs.** MLflow `29bccdc235fd47cfa0ddaf0ccb683d4f` (experiment
+`vin_finetune`; full provenance; replay via
+`python -m src.vin_ocr.tracking.reproduce 29bccdc235fd47cfa0ddaf0ccb683d4f`).
+
+**Result.** Blank collapse escaped by ~epoch 3; train loss 13.89 → 0.79,
+val loss 13.6 → 0.862 (still falling). Run was killed at epoch 26 by the
+old accuracy-only early-stop guillotine (the fix landed mid-flight; the
+running process predated it — a live demonstration of readiness item C3).
+Final val metrics (n=102, VIN-disjoint): **exact match 0/102, character
+accuracy 52.19%, F1 0.5219**. Predictions are all well-formed
+`SAL1A2A??SA60????` Land Rover VINs: the model learned the dataset's
+shared structure (~11 of 17 characters are common across plates) but not
+yet the discriminating characters.
+
+**Verdict.** Pipeline proven end-to-end (data → tracked training →
+checkpoints → honest evaluation); model under-trained at 26 CPU epochs
+with LR nearly decayed. Not comparable to the historical 41.86%: that
+number came from a 43-image corpus under a leaky split policy, truncated
+training AND a broken decoder. Continuation run warm-started from this
+checkpoint with the loss-aware stopper; GPU training is the real path to
+convergence.
+
 ### 2026-08-18 — The trainer could not train: CTC contract + early-stop guillotine
 
 **Hypothesis.** Before attempting an enterprise training run, execute the

@@ -49,6 +49,44 @@ Corrections on record, for anyone reading older documents:
 
 ## Entries
 
+### 2026-08-18 — The trainer could not train: CTC contract + early-stop guillotine
+
+**Hypothesis.** Before attempting an enterprise training run, execute the
+trainer end-to-end on a synthetic micro-dataset (12 rendered VIN plates,
+valid check digits) and catalogue every failure.
+
+**Result (all reproduced by execution, fixed in `a6ec119`).**
+1. The trainer crashed on the first batch under paddle 3.3.x: warpctc
+   requires labels int32 + length tensors int64; the code passed
+   all-int32. No one had ever run this trainer on paddle 3.3.
+2. warpctc receives raw logits (it applies softmax internally); the
+   trainer fed log_softmax output.
+3. Early stopping was unconditionally fatal: the improvement test
+   compared `val > val + min_delta` (best already updated), the patience
+   counter never reset, and **every run died after exactly patience+1
+   epochs regardless of progress**. Every historical Optuna trial
+   (patience 3-20) trained under this guillotine — no historical run was
+   allowed past ~21 epochs. The optuna_results/ corpus measures
+   truncated training.
+4. `latest` checkpoints: not refreshed every epoch, no resume info
+   (resume-from-latest restarted the epoch counter and warmup),
+   non-atomic writes.
+
+**Verification.** After fixes: trainer learns (micro-set loss
+13.8 → 0.095, 11/12 exact memorization under repo-default
+hyperparameters), bit-identical same-seed runs, resume-from-latest
+continues at the right epoch with scheduler state, early stopping fires
+only without genuine improvement. Also measured: constant lr 3e-3
+collapses this architecture into the blank basin permanently (600 steps,
+no escape) while 1e-3 learns — the Optuna space reaching 1e-2 samples a
+poison region.
+
+**Effect on model metrics.** None yet — but the 41.86% (18/43) baseline
+must now be read as "best result achievable under ≤21-epoch truncated
+training evaluated through a then-broken decoder". Re-run the study
+before comparing anything against it. Full readiness list:
+ENTERPRISE_TRAINING_READINESS.md.
+
 ### 2026-08-18 — n=1 validation: the fine-tuned checkpoint reads VINs
 
 **Hypothesis.** The recorded 0.0% for

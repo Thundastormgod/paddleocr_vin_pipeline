@@ -511,9 +511,20 @@ class VINEvaluator:
             split_name=split.name
         )
         
-        # Exact match
+        # A sample whose evaluation errored is an absence of measurement,
+        # not a wrong prediction: it is excluded from the exact-match
+        # denominator exactly as it is already excluded from the
+        # character-level metrics below (the `if not error` filter).
+        # exact_match_rate previously divided by len(results), silently
+        # counting every crashed image as a miss.
+        metrics.failed_count = sum(1 for r in results if r.error)
+        measured = len(results) - metrics.failed_count
+        
+        # Exact match (over measured samples only)
         metrics.exact_match_count = sum(1 for r in results if r.exact_match)
-        metrics.exact_match_rate = metrics.exact_match_count / len(results) if results else 0.0
+        metrics.exact_match_rate = (
+            metrics.exact_match_count / measured if measured else 0.0
+        )
         
         # Character-level metrics
         if predictions:
@@ -551,7 +562,6 @@ class VINEvaluator:
         # Processing stats
         metrics.total_processing_time_ms = total_time * 1000
         metrics.mean_processing_time_ms = (total_time * 1000) / len(results) if results else 0.0
-        metrics.failed_count = sum(1 for r in results if r.error)
         
         return metrics, results
 
@@ -570,7 +580,8 @@ def print_metrics_report(metrics: EvaluationMetrics):
     print(f"Failed:  {metrics.failed_count} samples")
     
     print("\n--- PRIMARY METRICS ---")
-    print(f"Exact Match Rate:      {metrics.exact_match_rate:.1%} ({metrics.exact_match_count}/{metrics.total_samples})")
+    print(f"Exact Match Rate:      {metrics.exact_match_rate:.1%} "
+          f"({metrics.exact_match_count}/{metrics.total_samples - metrics.failed_count} measured)")
     print(f"Character-Level F1:    {metrics.character_f1:.1%}")
     print(f"Character Precision:   {metrics.character_precision:.1%}")
     print(f"Character Recall:      {metrics.character_recall:.1%}")

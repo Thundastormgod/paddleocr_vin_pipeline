@@ -263,7 +263,7 @@ def init_session_state():
     try:
         import paddle
         cuda_available = paddle.device.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0
-    except:
+    except Exception:
         pass
     
     # Check for Apple Silicon MPS (PyTorch only - PaddlePaddle doesn't support MPS)
@@ -272,7 +272,7 @@ def init_session_state():
         import torch
         if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
             mps_available = True
-    except:
+    except Exception:
         pass
     
     # Note: For PaddleOCR training, only CUDA is supported, not MPS
@@ -583,7 +583,7 @@ def run_inference(model_path: str, image_path: str, model_type: str = "finetuned
                 if use_gpu:
                     try:
                         paddle.device.set_device('gpu')
-                    except:
+                    except Exception:
                         paddle.device.set_device('cpu')
                 else:
                     paddle.device.set_device('cpu')
@@ -1484,7 +1484,7 @@ def render_inference_page():
                 # Clean up
                 try:
                     os.unlink(tmp_path)
-                except:
+                except Exception:
                     pass
                 
                 # Display result
@@ -1562,7 +1562,7 @@ def render_inference_page():
                     # Cleanup
                     try:
                         os.unlink(tmp_path)
-                    except:
+                    except Exception:
                         pass
                     
                     progress.progress((i + 1) / len(uploaded_files))
@@ -1710,7 +1710,7 @@ def get_training_runs() -> List[Dict]:
             time_str = ts_match.group(2)
             try:
                 run_info['timestamp'] = datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
-            except:
+            except Exception:
                 pass
         
         # Load metrics if available
@@ -1719,13 +1719,13 @@ def get_training_runs() -> List[Dict]:
                 with open(metrics_file, 'r') as f:
                     run_info['metrics'] = json.load(f)
                     run_info['has_metrics'] = True
-            except:
+            except Exception:
                 pass
         elif progress_file.exists():
             try:
                 with open(progress_file, 'r') as f:
                     run_info['progress'] = json.load(f)
-            except:
+            except Exception:
                 pass
         
         runs.append(run_info)
@@ -2050,7 +2050,7 @@ def render_system_health():
                         st.text(f"✅ NVIDIA GPUs: {gpu_count}")
                     else:
                         st.text("❌ NVIDIA GPUs: 0")
-                except:
+                except Exception:
                     st.text("❌ NVIDIA GPUs: 0")
             else:
                 st.text("❌ Paddle CUDA: Not compiled")
@@ -2071,7 +2071,7 @@ def render_system_health():
                 st.text("❌ Apple MPS: Not available")
         except ImportError:
             st.text("❌ PyTorch: Not installed")
-        except:
+        except Exception:
             pass
         
         # Show compatibility info
@@ -2357,7 +2357,7 @@ def render_deepseek_status_tab(deepseek_ready: bool, deepseek_error: Optional[st
                         checks_passed += 1
                     else:
                         issues.append("No GPU detected (CPU inference will be slow)")
-                except:
+                except Exception:
                     issues.append("Could not check GPU")
                 
                 # Check 4: Disk space
@@ -2371,7 +2371,7 @@ def render_deepseek_status_tab(deepseek_ready: bool, deepseek_error: Optional[st
                         checks_passed += 1
                     else:
                         issues.append(f"Low disk space: {free_gb:.1f}GB (need ~15GB for model)")
-                except:
+                except Exception:
                     issues.append("Could not check disk space")
                 
                 # Summary
@@ -2560,9 +2560,9 @@ def render_sidebar() -> str:
                     gpu_count = paddle.device.cuda.device_count()
                     if gpu_count > 0:
                         cuda_available = True
-                except:
+                except Exception:
                     pass
-        except:
+        except Exception:
             pass
         
         # Check MPS (Apple Silicon)
@@ -2570,7 +2570,7 @@ def render_sidebar() -> str:
             import torch
             if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 mps_available = True
-        except:
+        except Exception:
             pass
         
         # Determine GPU status message

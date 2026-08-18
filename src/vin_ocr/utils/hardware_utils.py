@@ -177,8 +177,13 @@ class HardwareDetector:
         try:
             try:
                 import torch
-            except Exception:
-                # Torch may be installed but fail to load CUDA DLLs; treat as unavailable
+            except (ImportError, OSError) as torch_error:
+                # ImportError: torch not installed. OSError: installed but
+                # its native libraries fail to load (e.g. CUDA DLLs).
+                # Anything else is a real bug and must propagate - the
+                # previous `except Exception` silently converted arbitrary
+                # torch failures into "torch unavailable".
+                logger.warning("PyTorch unavailable: %s", torch_error)
                 info.torch_available = False
                 torch = None
             if torch is not None:
@@ -268,11 +273,18 @@ class HardwareDetector:
         return info.device_type.value
     
     def get_torch_device(self):
-        """Get a torch.device object for the best available device."""
+        """
+        Get a torch.device object for the best available device.
+
+        Returns None when torch is unavailable - the same two failure
+        modes as the probe in detect(): not installed (ImportError) or
+        installed with broken native libraries (OSError).
+        """
         try:
             import torch
             return torch.device(self.get_best_device())
-        except ImportError:
+        except (ImportError, OSError) as torch_error:
+            logger.warning("PyTorch unavailable: %s", torch_error)
             return None
     
     def can_use_quantization(self) -> bool:

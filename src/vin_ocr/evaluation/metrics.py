@@ -803,23 +803,9 @@ if __name__ == "__main__":
     save_metrics_to_json(metrics, '/tmp/test_metrics.json')
     print(f"\nMetrics saved to /tmp/test_metrics.json")
     
-    # Training metrics demo
-    print("\n" + "=" * 70)
-    print("TRAINING METRICS TRACKER DEMO")
-    print("=" * 70)
-    
-    tracker = TrainingMetricsTracker(total_epochs=10, total_steps=100)
-    
-    # Simulate training
-    for epoch in range(3):
-        tracker.start_epoch()
-        for step in range(10):
-            loss = 1.0 / (epoch * 10 + step + 1)  # Decreasing loss
-            lr = 0.001 * (0.9 ** epoch)
-            tracker.update_step(loss=loss, lr=lr, batch_size=32, step_time=0.1)
-        
-        val_acc = 0.5 + 0.15 * epoch  # Improving accuracy
-        tracker.update_epoch(val_loss=0.5 - 0.1 * epoch, val_accuracy=val_acc)
-        print(tracker.get_metrics().to_log_string())
-    
-    tracker.print_summary()
+    # The training-tracker demo that used to live here has been removed:
+    # it synthesised a decreasing loss curve and val_accuracy = 0.5 + 0.15
+    # per epoch and printed them through TrainingMetricsTracker, producing
+    # output indistinguishable from a real training log. This repository
+    # has already shipped fabricated metrics once; a built-in generator of
+    # realistic-looking fake training logs is a liability, not a demo.

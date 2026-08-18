@@ -2615,7 +2615,76 @@ def main():
         output_dir=config['Global']['save_model_dir']
     )
     
-    trainer.train(resume_from=args.resume)
+    _run_tracked(trainer, config, args)
+
+
+def _run_tracked(trainer, config: Dict, args) -> None:
+    """
+    Run training inside a provenance-tracked MLflow run when the tracking
+    layer is available; run untracked (with a loud warning) when it is not.
+
+    Training runs previously recorded no commit, no dependency versions and
+    no dataset fingerprint anywhere - the exact gap that made this repo's
+    historical numbers unattributable. Only the run wrapper lives here; the
+    trainer itself stays tracking-agnostic.
+    """
+    try:
+        from src.vin_ocr.tracking import start_run
+    except Exception as exc:  # tracking extra not installed
+        print(f"⚠ TRACKING DISABLED ({exc}); this run will have no provenance record")
+        trainer.train(resume_from=args.resume)
+        return
+
+    dataset_roots = []
+    for section in ('Train', 'Eval'):
+        data_dir = config.get(section, {}).get('dataset', {}).get('data_dir')
+        if data_dir and Path(data_dir).is_dir():
+            dataset_roots.append(Path(data_dir))
+
+    params = {
+        'config_path': str(args.config),
+        'algorithm': config.get('Architecture', {}).get('algorithm'),
+        'loss': config.get('Loss', {}).get('name'),
+        'optimizer': config.get('Optimizer', {}).get('name'),
+        'lr_scheduler': config.get('Optimizer', {}).get('lr', {}).get('name'),
+        'learning_rate': config.get('Optimizer', {}).get('lr', {}).get('learning_rate'),
+        'warmup_epoch': config.get('Optimizer', {}).get('lr', {}).get('warmup_epoch'),
+        'epochs': config.get('Global', {}).get('epoch_num'),
+        'batch_size': config.get('Train', {}).get('loader', {}).get('batch_size_per_card'),
+        'early_stopping_patience': config.get('Global', {}).get('early_stopping_patience'),
+        'seed': config.get('Global', {}).get('seed', 42),
+        'resumed_from': args.resume or 'none',
+    }
+
+    with start_run(
+        f"finetune-{config.get('Architecture', {}).get('algorithm', 'rec')}",
+        experiment="vin_finetune",
+        dataset_roots=dataset_roots,
+        params=params,
+        tags={'entry_point': 'vin-train finetune'},
+    ) as run:
+        run.log_artifact(Path(args.config), 'config')
+
+        trainer.train(resume_from=args.resume)
+
+        run.log_metrics({'best_validation_accuracy': trainer.best_accuracy,
+                         'final_epoch': trainer.current_epoch})
+        metrics_path = trainer.output_dir / 'training_metrics.json'
+        if metrics_path.is_file():
+            run.log_artifact(metrics_path, 'metrics')
+            try:
+                metrics = json.loads(metrics_path.read_text())
+                image_level = metrics['evaluation_metrics']['image_level']
+                char_level = metrics['evaluation_metrics']['character_level']
+                run.log_metrics({
+                    'final_exact_match_accuracy': image_level['exact_match_accuracy'],
+                    'final_character_accuracy': char_level['character_accuracy'],
+                    'final_f1_micro': char_level['f1_micro'],
+                })
+            except (KeyError, ValueError) as exc:
+                print(f"⚠ could not extract final metrics for tracking: {exc}")
+        print(f"📎 Tracked run: {run.run_id}")
+        print(f"   Reproduce:   {run.reproduce_command}")
 
 
 if __name__ == '__main__':

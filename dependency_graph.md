@@ -63,7 +63,8 @@ from contextlib import contextmanager
 # Internal dependencies
 from config import get_config                                    # [2]
 from ..preprocessing import VINPreprocessor, PreprocessConfig, PreprocessStrategy  # [8]
-from ..core.vin_utils import VINConstants                       # [2]
+from ..core.vin_utils import ARTIFACT_CHARS, NON_VIN_RUN         # [2]
+# (VINConstants is imported lazily inside methods, not at module level)
 
 # Optional PaddleOCR import
 try:
@@ -94,7 +95,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 # Internal dependencies
-# None - standalone ONNX inference
+from src.vin_ocr.core.charset import load_char_dict, ctc_greedy_decode  # [2]
+# (imported inside methods; the char dict and CTC decode are shared with
+# training so indices always match)
 ```
 
 ## Provider Layer Dependencies
@@ -115,12 +118,10 @@ from ..core.vin_utils import VINConstants                      # [2]
 from config import get_config                                  # [2]
 from ..preprocessing import VINPreprocessor, PreprocessConfig, PreprocessStrategy  # [8]
 
-# Optional DeepSeek import
-try:
-    import requests
-    from transformers import AutoTokenizer, AutoProcessor
-except ImportError:
-    DEEPSEEK_AVAILABLE = False
+# Optional DeepSeek dependencies (imported LAZILY inside provider
+# methods, not at module level; there is no module-level availability
+# flag - failures surface when the provider is used)
+#   requests, transformers (AutoTokenizer), torch
 ```
 
 ## Preprocessing Dependencies
@@ -169,7 +170,6 @@ import os, sys, json, logging, argparse
 import paddle
 import paddle.nn as nn
 from paddle.io import Dataset, DataLoader
-from paddle.vision.transforms import Compose
 import cv2, numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -301,9 +301,10 @@ from ..core.vin_utils import extract_vin_from_filename, validate_vin  # [2]
 import argparse, sys
 from pathlib import Path
 
-# Internal dependencies
+# Internal dependencies (imported lazily inside command handlers)
 from src.vin_ocr.inference import VINInference, ONNXVINRecognizer  # [4,5]
-from src.vin_ocr.web.app import cmd_serve                         # [10]
+# cmd_serve is defined IN cli.py (launches streamlit via subprocess);
+# it is not imported from web.app
 ```
 
 ## Package Entry Points

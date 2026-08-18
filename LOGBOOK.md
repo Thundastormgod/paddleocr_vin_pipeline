@@ -49,6 +49,55 @@ Corrections on record, for anyone reading older documents:
 
 ## Entries
 
+### 2026-08-18 — Scoring integrity: splits, corrector, metrics, decode, geometry
+
+**Problem.** Six defects in the measurement path, each confirmed live by
+direct execution before fixing (commits 574ab28, e3ca117, ee523b9):
+
+1. `evaluation/evaluate.py:create_splits` shuffled image PATHS - the same
+   VIN landed in train, val and test simultaneously, so the scoring path
+   measured plates the model trained on (the leak already fixed in
+   `utils/prepare_dataset.py`, left live in the scorer).
+2. `RuleBasedCorrector` stripped leading X/Y/T as "artifacts":
+   `correct_vin("YV1MS390X72123456")` returned 16 characters.
+3. Character metrics existed in four drifted copies; identical input
+   scored F1 0.67 / 0.95 / 0.4706 / 0.9412. Two copies were positional
+   (one leading artifact scored a 94%-correct prediction at 0.059) and
+   the multi-model copy structurally could not charge precision for
+   missing/invalid/extra characters (precision 1.000 at recall 0.294).
+4. Three CTC decoders used three blank indices (0, 1, 33). The blank=33
+   copy sat in `run_onnx` - the LIVE path for every exported PaddleOCR
+   model - and decoded canonically-encoded "1M8" as "020N090".
+5. The multi-model dispatch registered `finetuned_deepseek_onnx` but
+   dispatched on `deepseek_finetuned_onnx`; the fall-through scored
+   ("", 0.0) per image. Crashes, unreadable images and failed model
+   initialisation were likewise recorded as empty predictions inside the
+   accuracy denominator.
+6. SVTR_LCNet downsampled width 32x: T=10 timesteps for a 17-char CTC
+   target - inf loss from batch 0, silently averaged into the epoch loss.
+
+**Change.** Single implementations, all consumers delegating:
+`core/char_metrics.py` (alignment-based TP/FP/FN, CER = editdist/len(ref),
+char_accuracy = max(0, 1-CER)); `charset.ctc_greedy_decode` (blank 0,
+collapse-then-strip); the split delegates to the VIN-grouped canonical
+splitter; artifact stripping is one regex shared by identity. The
+multi-model evaluator dispatches through one table, reports crashed images
+under `evaluation_errors` (excluded from denominators) and unrunnable
+models under `not_evaluated` - never as 0% rows. Non-finite losses now
+raise at all four accumulation sites. 57 new regression tests.
+
+**Effect on model metrics.** Definitions changed; numbers move.
+- Historical `multi_model_evaluation.json` results are NOT comparable to
+  new runs: the old character metrics were positional and '_'-padded, and
+  every old ONNX row was decoded with the wrong blank index. In
+  particular, **the recorded 0.0% for `output/vin_rec_finetune` measured
+  the broken decoder, not the model** - that checkpoint has no valid
+  evaluation on record and must be re-run.
+- The 41.86% (18/43) Optuna baseline is unaffected (it comes from the
+  training-side scorer's exact-match count, which did not change).
+- Results produced through `--create-splits` before this date leaked VINs
+  across splits and should be discarded.
+
 ### 2026-08-18 — Trial-score fabrication removed from both Optuna tuners
 
 **Problem.** Both hyperparameter tuners could report accuracies that were

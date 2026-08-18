@@ -1,5 +1,23 @@
 # VIN OCR Fine-tuning Techniques Documentation
 
+> [!WARNING]
+> **PROVENANCE CORRECTION (2026-08-18).** This document is a historical
+> narrative kept for the record; several of its claims were found by audit
+> to be false and are corrected here rather than silently rewritten:
+>
+> - **46.51% / 94.39% / 6.98% were never measured.** They are hardcoded
+>   literals from `validate_architectures.py` (which loads no model, data
+>   or checkpoint). The best measurement this repository has ever produced
+>   is **41.86% exact match (18/43)**, Optuna trial 23.
+> - **The Rosetta / ResNet34_vd / SARHead architecture described below has
+>   never existed in this codebase.** The trainer builds PP-OCRv4/PP-OCRv5
+>   and raises on anything else.
+> - Training commands with flags like `--epochs/--batch-size/--lr/--cpu`
+>   do not run: the trainer accepts only `--config/--resume/--export-onnx`.
+> - Where this document contradicts `LOGBOOK.md` or `README.md`'s corrected
+>   tables, those are authoritative.
+
+
 ## Table of Contents
 1. [Current Architecture Overview](#current-architecture-overview)
 2. [Transfer Learning Foundation](#transfer-learning-foundation)

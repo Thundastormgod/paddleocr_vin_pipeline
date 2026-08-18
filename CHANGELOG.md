@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial release of VIN OCR Pipeline
 - **Training**
-  - Fine-tuning PaddleOCR models (PP-OCRv3, PP-OCRv4, PP-OCRv5)
+  - Fine-tuning PaddleOCR models (PP-OCRv4, PP-OCRv5; the trainer raises on other algorithms)
   - Training from scratch with multiple architectures (SVTR, CRNN, PP-OCRv5)
   - Hyperparameter tuning with Optuna
   - Data augmentation pipeline
@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Single image recognition
   - Batch processing
   - Model training interface
-  - Real-time evaluation dashboard
+  - Evaluation dashboard (static Streamlit results page)
   - Model comparison tools
 - **CLI Tools**
   - `vin-ocr recognize` - Single image recognition

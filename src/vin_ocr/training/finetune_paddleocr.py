@@ -587,6 +587,36 @@ class SVTREncoder(nn.Layer):
         return x
 
 
+def update_early_stopping(
+    val_accuracy: float,
+    previous_best: float,
+    epochs_without_improvement: int,
+    min_delta: float,
+) -> Tuple[bool, int]:
+    """
+    One early-stopping bookkeeping step. Pure function so the decision
+    logic is unit-testable without paddle.
+
+    Args:
+        val_accuracy: This epoch's validation accuracy.
+        previous_best: Best accuracy BEFORE this epoch was applied. Passing
+            the already-updated best is the bug this function exists to
+            prevent: the comparison degenerates to "val > val + delta"
+            (always False), the counter never resets, and every run is
+            killed after exactly patience+1 epochs regardless of progress.
+        epochs_without_improvement: Current counter value.
+        min_delta: Minimum improvement that resets the counter.
+
+    Returns:
+        (improved, new_counter): improved is True when this epoch beat the
+        previous best by more than min_delta; new_counter is 0 on
+        improvement, otherwise the incremented count.
+    """
+    if val_accuracy > previous_best + min_delta:
+        return True, 0
+    return False, epochs_without_improvement + 1
+
+
 class CTCHead(nn.Layer):
     """CTC head for sequence recognition with proper output layer."""
     
@@ -1395,15 +1425,30 @@ class VINFineTuner:
             logits = self.model(images)  # [B, T, C]
 
             if self.use_ctc:
-                # CTC path: PaddlePaddle's CTCLoss requires int32 for BOTH the
-                # label tensor and the length tensors. Passing int64 labels is
-                # what produced the long-standing "data type mismatch" failure.
+                # CTC path. Paddle's warpctc kernel has MIXED dtype
+                # requirements (verified against paddle 3.3.1's own
+                # check_variable_and_dtype calls in nn/functional/loss.py):
+                #   labels        -> int32
+                #   input_lengths -> int64  (LogitsLength)
+                #   label_lengths -> int64  (LabelLength)
+                # The long-standing "data type mismatch" failure had two
+                # eras: int64 labels (pre-fix), then all-int32 (which fixed
+                # labels but broke both length tensors). Executed proof:
+                # all-int32 raises InvalidArgument on paddle 3.3.1; this
+                # combination trains.
                 labels = paddle.to_tensor(batch['label'], dtype='int32')
-                target_lengths = paddle.to_tensor(batch['length'], dtype='int32').reshape([-1])
-                log_probs = F.log_softmax(logits, axis=-1)
-                log_probs = log_probs.transpose([1, 0, 2])  # [T, B, C] for CTC
-                input_lengths = paddle.full([logits.shape[0]], logits.shape[1], dtype='int32')
-                loss = self.criterion(log_probs, labels, input_lengths, target_lengths)
+                target_lengths = paddle.to_tensor(batch['length'], dtype='int64').reshape([-1])
+                # RAW logits, not log_softmax: Paddle's warpctc applies its
+                # own softmax internally ("aliased as softmax with CTC" -
+                # its input is documented as "the UNSCALED probability
+                # sequence"). Feeding log-probabilities gets re-normalised
+                # to a near-uniform distribution, and the gradient signal
+                # collapses. Executed proof: with log_softmax here, 1200
+                # optimizer steps on 12 images never left the ln(34)=3.53
+                # blank plateau; with raw logits the same run overfits.
+                ctc_logits = logits.transpose([1, 0, 2])  # [T, B, C] for CTC
+                input_lengths = paddle.full([logits.shape[0]], logits.shape[1], dtype='int64')
+                loss = self.criterion(ctc_logits, labels, input_lengths, target_lengths)
             else:
                 labels = paddle.to_tensor(batch['label'], dtype='int64')  # CrossEntropyLoss needs int64
                 # Cross-Entropy Loss path (simpler, works for fixed-length VINs)
@@ -1469,13 +1514,16 @@ class VINFineTuner:
 
             if self.use_ctc:
                 # Labels are already fixed-width zero-padded by the dataset, so
-                # no re-padding is needed. int32 is mandatory for Paddle CTCLoss.
+                # no re-padding is needed. Same mixed-dtype contract as the
+                # training loop: labels int32, BOTH length tensors int64
+                # (paddle 3.3 warpctc kernel requirement).
                 labels = paddle.to_tensor(batch['label'], dtype='int32')
-                target_lengths = paddle.to_tensor(batch['length'], dtype='int32').reshape([-1])
-                log_probs = F.log_softmax(logits, axis=-1)
-                log_probs_ctc = log_probs.transpose([1, 0, 2])
-                input_lengths = paddle.full([logits.shape[0]], logits.shape[1], dtype='int32')
-                loss = self.criterion(log_probs_ctc, labels, input_lengths, target_lengths)
+                target_lengths = paddle.to_tensor(batch['length'], dtype='int64').reshape([-1])
+                # RAW logits: warpctc applies softmax internally (see the
+                # training loop). log_softmax here collapsed the gradient.
+                ctc_logits = logits.transpose([1, 0, 2])
+                input_lengths = paddle.full([logits.shape[0]], logits.shape[1], dtype='int64')
+                loss = self.criterion(ctc_logits, labels, input_lengths, target_lengths)
             else:
                 # Cross-Entropy Loss path
                 labels = paddle.to_tensor(batch['label'], dtype='int64')  # CrossEntropyLoss needs int64
@@ -1637,32 +1685,58 @@ class VINFineTuner:
         paddle.save(self.model.state_dict(), str(best_path) + '.pdparams')
         logger.info(f"Saved best model with accuracy: {self.best_accuracy:.4f}")
     
-    def save_checkpoint(self, epoch: int, is_best: bool = False):
-        """Save training checkpoint."""
-        checkpoint = {
+    def _checkpoint_info(self, epoch: int) -> Dict[str, Any]:
+        """The resume metadata written next to every checkpoint."""
+        return {
             'epoch': epoch,
             'global_step': self.global_step,
             'best_accuracy': self.best_accuracy,
             'config': self.config,
         }
+    
+    def _atomic_paddle_save(self, obj: Any, path: Path) -> None:
+        """
+        Save via a temp file + rename so a crash mid-write can never leave
+        a truncated checkpoint at the final path (rename within one
+        filesystem is atomic). paddle.save wrote directly to the final
+        path before, so an interrupt could corrupt `latest.pdparams` - the
+        exact file a resume then depends on.
+        """
+        tmp = path.with_name(path.name + '.tmp')
+        paddle.save(obj, str(tmp))
+        tmp.replace(path)
+    
+    def _atomic_json_save(self, obj: Dict, path: Path) -> None:
+        """Atomic JSON write (same rationale as _atomic_paddle_save)."""
+        tmp = path.with_name(path.name + '.tmp')
+        with open(tmp, 'w') as f:
+            json.dump(obj, f, indent=2)
+        tmp.replace(path)
+    
+    def _save_latest(self, epoch: int) -> None:
+        """
+        Refresh the `latest` checkpoint (weights + optimizer + resume info).
         
-        # Save model weights
+        The info file is what makes resume-from-latest continue at the
+        right epoch: load_checkpoint reads `<name>_info.json`, and `latest`
+        previously had none, so resuming from it silently restarted the
+        epoch counter (and the LR warmup with it).
+        """
+        latest = self.output_dir / 'latest'
+        self._atomic_paddle_save(self.model.state_dict(), latest.with_suffix('.pdparams'))
+        self._atomic_paddle_save(self.optimizer.state_dict(), latest.with_suffix('.pdopt'))
+        self._atomic_json_save(self._checkpoint_info(epoch), self.output_dir / 'latest_info.json')
+    
+    def save_checkpoint(self, epoch: int, is_best: bool = False):
+        """Save training checkpoint (epoch-numbered; atomic writes)."""
         model_path = self.output_dir / f'epoch_{epoch}'
-        paddle.save(self.model.state_dict(), str(model_path) + '.pdparams')
-        paddle.save(self.optimizer.state_dict(), str(model_path) + '.pdopt')
-        
-        # Save checkpoint info
-        with open(self.output_dir / f'epoch_{epoch}_info.json', 'w') as f:
-            json.dump(checkpoint, f, indent=2)
-        
-        # Save latest
-        latest_path = self.output_dir / 'latest'
-        paddle.save(self.model.state_dict(), str(latest_path) + '.pdparams')
-        paddle.save(self.optimizer.state_dict(), str(latest_path) + '.pdopt')
+        self._atomic_paddle_save(self.model.state_dict(), model_path.with_suffix('.pdparams'))
+        self._atomic_paddle_save(self.optimizer.state_dict(), model_path.with_suffix('.pdopt'))
+        self._atomic_json_save(self._checkpoint_info(epoch), self.output_dir / f'epoch_{epoch}_info.json')
         
         if is_best:
             best_path = self.output_dir / 'best_accuracy'
-            paddle.save(self.model.state_dict(), str(best_path) + '.pdparams')
+            self._atomic_paddle_save(self.model.state_dict(), best_path.with_suffix('.pdparams'))
             logger.info(f"Saved best model with accuracy: {self.best_accuracy:.4f}")
     
     def load_checkpoint(self, checkpoint_path: str):
@@ -1720,7 +1794,7 @@ class VINFineTuner:
                 if paddle.device.is_compiled_with_cuda():
                     gpu_count = paddle.device.cuda.device_count()
                     device_display = f"GPU (CUDA, {gpu_count} device(s))"
-            except:
+            except Exception:
                 device_display = "GPU"
         
         print("=" * 60, flush=True)
@@ -1776,36 +1850,48 @@ class VINFineTuner:
             # Validate
             val_loss, val_accuracy = self.validate()
             
-            # Track best accuracy
-            if val_accuracy > self.best_accuracy:
+            # Track best accuracy against the PREVIOUS best. This block used
+            # to update best_accuracy first and then compare val_accuracy
+            # against the UPDATED value further down, with two consequences,
+            # both reproduced by execution:
+            #   - the early-stopping improvement test became
+            #     "val > val + min_delta" (always False), the patience
+            #     counter never reset, and EVERY run was killed after
+            #     exactly patience+1 epochs however well it was converging.
+            #     Every historical Optuna trial (patience 3-20) trained
+            #     under that guillotine.
+            #   - the second is_best computation below was always False, so
+            #     save_checkpoint's best-model branch was dead code.
+            previous_best = self.best_accuracy
+            is_best = val_accuracy > previous_best
+            if is_best:
                 self.best_accuracy = val_accuracy
                 self._save_best_model()
                 print(f"  🎉 New best accuracy: {val_accuracy:.4f}")
             
-            # Early stopping logic
+            # Early stopping logic (decision logic is the pure helper
+            # update_early_stopping, unit-tested without paddle)
+            stop_early = False
             early_stopping_enabled = self.config['Global'].get('early_stopping', False)
             if early_stopping_enabled:
                 patience = self.config['Global'].get('early_stopping_patience', 7)
                 min_delta = self.config['Global'].get('early_stopping_min_delta', 0.001)
                 
-                # Track epochs without improvement
-                if not hasattr(self, 'epochs_without_improvement'):
-                    self.epochs_without_improvement = 0
-                else:
-                    self.epochs_without_improvement += 1
-                
-                # Check if we have improvement
-                if val_accuracy > self.best_accuracy + min_delta:
-                    self.epochs_without_improvement = 0
-                    print(f"  📈 Improvement detected: {val_accuracy:.4f} > {self.best_accuracy + min_delta:.4f}")
+                improved, self.epochs_without_improvement = update_early_stopping(
+                    val_accuracy=val_accuracy,
+                    previous_best=previous_best,
+                    epochs_without_improvement=self.epochs_without_improvement,
+                    min_delta=min_delta,
+                )
+                if improved:
+                    print(f"  📈 Improvement detected: {val_accuracy:.4f} > {previous_best + min_delta:.4f}")
                 else:
                     print(f"  ⏳ No improvement: {self.epochs_without_improvement}/{patience} epochs (need >{min_delta:.4f} improvement)")
                 
-                # Check for early stopping
                 if self.epochs_without_improvement >= patience:
                     print(f"  🛑 Early stopping triggered after {patience} epochs without improvement")
-                    print(f"  📊 Best accuracy achieved: {self.best_accuracy:.4f} at epoch {epoch - self.epochs_without_improvement}")
-                    break
+                    print(f"  📊 Best accuracy achieved: {self.best_accuracy:.4f}")
+                    stop_early = True
             
             epoch_time = time.time() - epoch_start
             
@@ -1829,16 +1915,24 @@ class VINFineTuner:
                 print(f"  📝 Char-Level: Acc={m.get('char_accuracy', 0)*100:.2f}%, F1-micro={m.get('f1_micro', 0):.4f}, F1-macro={m.get('f1_macro', 0):.4f}", flush=True)
                 print(f"  🏭 Industry: CER={m.get('cer', 1)*100:.2f}%, NED={m.get('ned', 1):.4f}", flush=True)
             
-            # Save checkpoint
-            is_best = val_accuracy > self.best_accuracy
-            if is_best:
-                self.best_accuracy = val_accuracy
-            
+            # Save epoch checkpoint on schedule or improvement. (A second
+            # "is_best = val_accuracy > self.best_accuracy" used to live
+            # here, after best_accuracy had already been updated - always
+            # False, making the best branch of save_checkpoint dead code.)
             if epoch % save_epoch_step == 0 or is_best:
                 self.save_checkpoint(epoch, is_best)
             
+            # `latest` is refreshed EVERY epoch - that is what "latest"
+            # means. It was previously only written inside the conditional
+            # save above, so a crash before the first improvement or
+            # save_epoch_step boundary lost all progress.
+            self._save_latest(epoch)
+            
             # Update progress - epoch completed
             self._save_progress('completed_epoch', epoch, epochs, train_loss, val_loss, val_accuracy, time.time() - start_time)
+            
+            if stop_early:
+                break
         
         total_time = time.time() - start_time
         
@@ -2220,7 +2314,7 @@ class VINFineTuner:
                 device_info['gpu_count'] = paddle.device.cuda.device_count()
             else:
                 device_info['cuda_available'] = False
-        except:
+        except Exception:
             pass
         
         # Build complete metrics object

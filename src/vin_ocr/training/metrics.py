@@ -27,7 +27,6 @@ Industry Standard Metrics:
 """
 
 from typing import Dict, List, Tuple, Any, Optional
-from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -58,26 +57,18 @@ class VINMetricsCalculator:
         """Reset accumulated metrics."""
         self.predictions = []
         self.ground_truths = []
-        self.char_predictions = []
-        self.char_labels = []
     
     def add_batch(self, predictions: List[str], ground_truths: List[str]):
-        """Add a batch of predictions and ground truths."""
+        """
+        Add a batch of predictions and ground truths.
+
+        Strings are stored as-is; character-level metrics are computed by
+        alignment at calculation time. (This method previously flattened
+        both sides into space-padded positional character lists, which is
+        what made the old character metrics collapse under insertions.)
+        """
         self.predictions.extend(predictions)
         self.ground_truths.extend(ground_truths)
-        
-        # Also track character-level
-        for pred, gt in zip(predictions, ground_truths):
-            pred_clean = pred.strip().upper()
-            gt_clean = gt.strip().upper()
-            
-            # Pad/truncate to same length for character comparison
-            max_len = max(len(pred_clean), len(gt_clean))
-            pred_padded = pred_clean.ljust(max_len, ' ')
-            gt_padded = gt_clean.ljust(max_len, ' ')
-            
-            self.char_predictions.extend(list(pred_padded))
-            self.char_labels.extend(list(gt_padded))
     
     def calculate_all_metrics(
         self, 
@@ -139,67 +130,39 @@ class VINMetricsCalculator:
         }
     
     def _calculate_character_level_metrics(self) -> Dict[str, Any]:
-        """Calculate character-level metrics including F1 scores."""
-        if not self.char_predictions:
+        """
+        Calculate character-level metrics including F1 scores.
+
+        Delegates to the canonical alignment-based implementation in
+        core.char_metrics. This method previously zipped position-padded
+        character lists (``pred[i] == gt[i]``), so a single leading
+        insertion shifted every later position: '*' + 16 correct characters
+        scored char_accuracy 0.0588 for a prediction that is 88% correct by
+        edit distance. char_accuracy now means max(0, 1 - CER) and TP/FP/FN
+        come from sequence alignment - see core/char_metrics.py for the
+        exact definitions.
+        """
+        if not self.predictions:
             return self._empty_char_metrics()
-        
-        # Basic character accuracy
-        correct_chars = sum(
-            1 for p, g in zip(self.char_predictions, self.char_labels) 
-            if p == g
-        )
-        total_chars = len(self.char_labels)
-        char_accuracy = correct_chars / total_chars if total_chars > 0 else 0.0
-        
-        # Calculate per-character metrics for F1
-        # Build confusion data
-        unique_chars = sorted(set(self.char_labels) | set(self.char_predictions))
-        
-        # True positives, false positives, false negatives per character
-        tp = Counter()
-        fp = Counter()
-        fn = Counter()
-        
-        for pred, label in zip(self.char_predictions, self.char_labels):
-            if pred == label:
-                tp[label] += 1
-            else:
-                fp[pred] += 1
-                fn[label] += 1
-        
-        # Micro F1 (global TP, FP, FN)
-        total_tp = sum(tp.values())
-        total_fp = sum(fp.values())
-        total_fn = sum(fn.values())
-        
-        micro_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-        micro_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-        f1_micro = 2 * micro_precision * micro_recall / (micro_precision + micro_recall) if (micro_precision + micro_recall) > 0 else 0.0
-        
-        # Macro F1 (average per-class F1)
-        f1_scores = []
-        for char in unique_chars:
-            char_tp = tp[char]
-            char_fp = fp[char]
-            char_fn = fn[char]
-            
-            precision = char_tp / (char_tp + char_fp) if (char_tp + char_fp) > 0 else 0.0
-            recall = char_tp / (char_tp + char_fn) if (char_tp + char_fn) > 0 else 0.0
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-            f1_scores.append(f1)
-        
-        f1_macro = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
-        
+
+        from src.vin_ocr.core.char_metrics import char_level_metrics
+
+        pairs = [
+            (pred.strip().upper(), gt.strip().upper())
+            for pred, gt in zip(self.predictions, self.ground_truths)
+        ]
+        metrics = char_level_metrics(pairs)
+
         return {
-            'total_characters': total_chars,
-            'correct_characters': correct_chars,
-            'char_accuracy': char_accuracy,
-            'char_accuracy_pct': f"{char_accuracy * 100:.2f}%",
-            'f1_micro': f1_micro,
-            'f1_macro': f1_macro,
-            'precision': micro_precision,
-            'recall': micro_recall,
-            'unique_chars_seen': len(unique_chars)
+            'total_characters': metrics.total_reference_chars,
+            'correct_characters': metrics.true_positives,
+            'char_accuracy': metrics.char_accuracy,
+            'char_accuracy_pct': f"{metrics.char_accuracy * 100:.2f}%",
+            'f1_micro': metrics.f1_micro,
+            'f1_macro': metrics.f1_macro,
+            'precision': metrics.precision,
+            'recall': metrics.recall,
+            'unique_chars_seen': len(metrics.per_class),
         }
     
     def _calculate_industry_metrics(self) -> Dict[str, Any]:

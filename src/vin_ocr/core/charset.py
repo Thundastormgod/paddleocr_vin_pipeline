@@ -19,7 +19,7 @@ Every component must call load_char_dict() from here.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # Canonical VIN charset (excludes I, O, Q per ISO 3779)
 VIN_CHARSET: str = "0123456789ABCDEFGHJKLMNPRSTUVWXYZ"
@@ -138,3 +138,51 @@ def load_char_dict(
 def num_classes(char_to_idx: Dict[str, int]) -> int:
     """Number of output classes, including the CTC blank."""
     return len(char_to_idx)
+
+
+def ctc_greedy_decode(
+    indices: Sequence[int],
+    idx_to_char: Dict[int, str],
+    blank_index: int = BLANK_INDEX,
+) -> Tuple[str, List[int]]:
+    """
+    Greedy CTC decode: collapse repeats, then strip blanks.
+
+    This is the single decode implementation. The audit of 2026-08-18 found
+    three copies with THREE different blank indices (0, 1 and 33): the copy
+    in multi_model_evaluation hardcoded ``blank_idx = len(char_set) = 33``
+    against models trained with blank 0, so the canonically-encoded "1M8"
+    decoded to "020N090" - every blank became the digit '0' and every
+    character shifted down by one.
+
+    Args:
+        indices: Per-timestep argmax class indices.
+        idx_to_char: Index -> character map, as returned by load_char_dict()
+            (its BLANK_INDEX entry maps to BLANK_TOKEN).
+        blank_index: The CTC blank class. Defaults to the canonical
+            BLANK_INDEX (0); pass a different value only for models whose
+            dict genuinely differs, never as a guess.
+
+    Returns:
+        Tuple of (decoded_text, kept_positions) where kept_positions are the
+        timestep indices whose characters were emitted - callers use them to
+        average per-timestep probabilities into a confidence score.
+
+    Note:
+        ``prev`` is updated on EVERY step, including blanks. That ordering
+        is what makes collapse-then-strip correct: 'A','A',blank,'A' decodes
+        to "AA" (the blank separates a genuine double letter), while
+        'A','A' without a separator collapses to "A".
+    """
+    decoded_chars: List[str] = []
+    kept_positions: List[int] = []
+    prev = blank_index
+    for t, idx in enumerate(indices):
+        idx = int(idx)
+        if idx != blank_index and idx != prev:
+            char = idx_to_char.get(idx, '')
+            if char and char != BLANK_TOKEN:
+                decoded_chars.append(char)
+                kept_positions.append(t)
+        prev = idx
+    return ''.join(decoded_chars), kept_positions

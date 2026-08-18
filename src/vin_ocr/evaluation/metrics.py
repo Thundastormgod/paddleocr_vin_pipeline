@@ -47,11 +47,12 @@ Date: January 2026
 import json
 import time
 from dataclasses import dataclass, field, asdict
-from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple, Any, Set
 from collections import defaultdict
 from pathlib import Path
 import numpy as np
+
+from ..core.char_metrics import AlignmentCounts, alignment_counts, macro_f1, micro_prf
 
 
 # =============================================================================
@@ -555,26 +556,15 @@ class EvaluationMetricsCalculator:
                     position_correct[i + 1] += 1
 
             # --- Alignment-based TP/FP/FN for F1 ---------------------------
-            matcher = SequenceMatcher(None, pred, true, autojunk=False)
-            for tag, p0, p1, t0, t1 in matcher.get_opcodes():
-                if tag == 'equal':
-                    for ch in true[t0:t1]:
-                        char_tp[ch] += 1
-                elif tag == 'replace':
-                    for ch in pred[p0:p1]:
-                        if ch and ch != '_':
-                            char_fp[ch] += 1
-                    for ch in true[t0:t1]:
-                        if ch and ch != '_':
-                            char_fn[ch] += 1
-                elif tag == 'insert':   # in reference, missing from prediction
-                    for ch in true[t0:t1]:
-                        if ch and ch != '_':
-                            char_fn[ch] += 1
-                elif tag == 'delete':   # in prediction, absent from reference
-                    for ch in pred[p0:p1]:
-                        if ch and ch != '_':
-                            char_fp[ch] += 1
+            # Single implementation: core.char_metrics.alignment_counts.
+            # (The opcode walk was previously inlined here with a '_' filter
+            # that silently patched over padded predictions; padding is now
+            # a caller bug, not something the metric hides.)
+            pair_counts = alignment_counts(pred, true)
+            for ch, bucket in pair_counts.per_class.items():
+                char_tp[ch] += bucket['tp']
+                char_fp[ch] += bucket['fp']
+                char_fn[ch] += bucket['fn']
 
         # Calculate metrics
         char_accuracy = correct_chars / total_chars if total_chars > 0 else 0.0
@@ -628,35 +618,31 @@ class EvaluationMetricsCalculator:
         fp: Dict[str, int],
         fn: Dict[str, int],
     ) -> Tuple[float, float, float, float]:
-        """Compute F1 micro and macro scores."""
-        all_chars = set(tp.keys()) | set(fp.keys()) | set(fn.keys())
-        
-        # Micro F1 (global)
-        total_tp = sum(tp.values())
-        total_fp = sum(fp.values())
-        total_fn = sum(fn.values())
-        
-        micro_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-        micro_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-        f1_micro = (
-            2 * micro_precision * micro_recall / (micro_precision + micro_recall)
-            if (micro_precision + micro_recall) > 0 else 0.0
+        """
+        Compute F1 micro and macro scores via the canonical implementation.
+
+        Macro-F1 semantics follow core.char_metrics: the unweighted mean of
+        per-class F1 over classes with support > 0 (present in the
+        references). This previously averaged over the union including
+        FP-only classes, so a single hallucinated character class dragged
+        the macro mean with a guaranteed 0.0 entry.
+        """
+        counts = AlignmentCounts(
+            tp=sum(tp.values()),
+            fp=sum(fp.values()),
+            fn=sum(fn.values()),
+            per_class={
+                char: {
+                    'tp': tp.get(char, 0),
+                    'fp': fp.get(char, 0),
+                    'fn': fn.get(char, 0),
+                }
+                for char in set(tp) | set(fp) | set(fn)
+            },
         )
-        
-        # Macro F1 (per-class average)
-        f1_per_class = []
-        for char in all_chars:
-            char_precision = tp[char] / (tp[char] + fp[char]) if (tp[char] + fp[char]) > 0 else 0.0
-            char_recall = tp[char] / (tp[char] + fn[char]) if (tp[char] + fn[char]) > 0 else 0.0
-            char_f1 = (
-                2 * char_precision * char_recall / (char_precision + char_recall)
-                if (char_precision + char_recall) > 0 else 0.0
-            )
-            f1_per_class.append(char_f1)
-        
-        f1_macro = np.mean(f1_per_class) if f1_per_class else 0.0
-        
-        return f1_micro, f1_macro, micro_precision, micro_recall
+
+        micro_precision, micro_recall, f1_micro = micro_prf(counts)
+        return f1_micro, macro_f1(counts), micro_precision, micro_recall
     
     def _compute_per_class(self) -> Tuple[Dict[str, float], Dict[str, int]]:
         """Compute per-character class accuracy."""

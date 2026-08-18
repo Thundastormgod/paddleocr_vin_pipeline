@@ -639,11 +639,21 @@ class MultiModelEvaluator:
         """
         Run VIN Pipeline on an image.
 
-        The pipeline's recognize() has its own result contract (it reports
-        failures in its result dict); an exception escaping it is a real
-        error and propagates to the per-image error accounting.
+        The pipeline's recognize() converts its internal exceptions into a
+        result dict carrying an 'error' key. That contract is honoured
+        here: an errored result raises ModelExecutionError so the image is
+        recorded as an evaluation error, NOT as an empty prediction. Without
+        this check the pipeline's crash-swallowing re-introduced the exact
+        crash-scoring defect one layer down.
+
+        Raises:
+            ModelExecutionError: If the pipeline reported an internal error.
         """
         result = engine.recognize(image_path)
+        if result.get('error'):
+            raise ModelExecutionError(
+                f"vin_pipeline failed on {image_path}: {result['error']}"
+            )
         vin = result.get('vin', '') or ''
         conf = result.get('confidence', 0.0) or 0.0
         return vin[:17], conf

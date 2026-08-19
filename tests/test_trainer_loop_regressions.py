@@ -831,3 +831,55 @@ class TestCharAccuracyAwareSelection:
         import inspect
         source = inspect.getsource(VINFineTuner.validate)
         assert "return avg_loss, accuracy, val_char_accuracy" in source
+
+
+class TestInterruptSemantics:
+    """C7: an interrupted run must be distinguishable from a completed one,
+    and resuming an already-finished run must terminate cleanly."""
+
+    def test_shutdown_paths_set_interrupted_flag(self):
+        import ast
+        import inspect
+        import sys
+        module_ast = ast.parse(
+            inspect.getsource(sys.modules[VINFineTuner.__module__]))
+        cls = next(n for n in ast.walk(module_ast)
+                   if isinstance(n, ast.ClassDef) and n.name == "VINFineTuner")
+        marked = []
+        for func in (n for n in ast.walk(cls)
+                     if isinstance(n, ast.FunctionDef)
+                     and n.name in ("train", "train_epoch")):
+            for node in ast.walk(func):
+                if (isinstance(node, ast.Assign)
+                        and any(isinstance(t, ast.Attribute)
+                                and t.attr == "interrupted"
+                                for t in node.targets)):
+                    marked.append(func.name)
+        assert set(marked) == {"train", "train_epoch"}, (
+            f"interrupted flag must be set on both shutdown paths, got {marked}"
+        )
+
+    def test_tracked_run_tags_interruption(self):
+        import inspect
+        import sys
+        module = sys.modules[VINFineTuner.__module__]
+        source = inspect.getsource(module._run_tracked)
+        assert "interrupted" in source and "set_tags" in source, (
+            "_run_tracked must tag interrupted runs in the tracking store"
+        )
+
+    def test_completion_variables_exist_when_epoch_loop_runs_zero_times(self):
+        """Resuming a checkpoint that already reached epoch_num historically
+        raised NameError: the completion path read train_loss/val_loss/
+        val_accuracy, which were only assigned inside the epoch loop."""
+        import inspect
+        import textwrap
+        source = textwrap.dedent(inspect.getsource(VINFineTuner.train))
+        loop_pos = source.find("for epoch in range(self.current_epoch + 1")
+        assert loop_pos > 0
+        prefix = source[:loop_pos]
+        for name in ("train_loss", "val_loss", "val_accuracy"):
+            assert f"{name} = " in prefix, (
+                f"{name} must be initialized before the epoch loop; "
+                f"a zero-iteration resume otherwise crashes at completion"
+            )

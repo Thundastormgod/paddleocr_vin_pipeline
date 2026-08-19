@@ -1185,6 +1185,10 @@ class VINFineTuner:
         self.best_val_loss = float('inf')
         self.best_val_char_accuracy = 0.0
         self.epochs_without_improvement = 0
+        #: True when a SIGTERM/SIGINT ended the run early; the tracked-run
+        #: wrapper tags the MLflow run so an interrupted run can never be
+        #: mistaken for a completed one (C7).
+        self.interrupted = False
         #: Optional callable(epoch, metrics_dict) invoked after every epoch;
         #: set by the tracked-run wrapper so training curves land in MLflow
         #: instead of only the final numbers. Hook failures are logged and
@@ -1643,6 +1647,7 @@ class VINFineTuner:
             # Check for shutdown request (responsive to signals within epoch)
             if VINFineTuner.is_shutdown_requested():
                 logger.warning(f"Shutdown requested during epoch {epoch}, batch {batch_idx}")
+                self.interrupted = True
                 break
             
             images = paddle.to_tensor(batch['image'])
@@ -2088,10 +2093,19 @@ class VINFineTuner:
         self.progress_file = self.output_dir / 'training_progress.json'
         self._save_progress('starting', 0, epochs, 0.0, 0.0, 0.0, 0.0)
         
+        # The epoch loop may run zero times (resuming a checkpoint that
+        # already reached epoch_num); the completion path below reads these,
+        # so they must exist even then. Last-known values from history where
+        # available, otherwise 0.0.
+        train_loss = self.train_losses[-1] if self.train_losses else 0.0
+        val_loss = self.best_val_loss if self.best_val_loss != float('inf') else 0.0
+        val_accuracy = self.best_accuracy
+        
         for epoch in range(self.current_epoch + 1, epochs + 1):
             # Check for graceful shutdown request
             if VINFineTuner.is_shutdown_requested():
                 logger.warning(f"⚠️  Shutdown requested - saving checkpoint and exiting...")
+                self.interrupted = True
                 self.save_checkpoint(epoch - 1, is_best=False)
                 self._save_progress('shutdown', epoch - 1, epochs, 
                                    self.train_losses[-1] if self.train_losses else 0.0,
@@ -3016,6 +3030,12 @@ def _run_tracked(trainer, config: Dict, args) -> None:
         )
 
         trainer.train(resume_from=args.resume)
+
+        if getattr(trainer, 'interrupted', False):
+            # An interrupted run must never read like a completed one: the
+            # control flow already skips export/final metrics on shutdown;
+            # this makes the tracked run say so too.
+            run.set_tags({'interrupted': 'true'})
 
         run.log_metrics({'best_validation_accuracy': trainer.best_accuracy,
                          'final_epoch': trainer.current_epoch})

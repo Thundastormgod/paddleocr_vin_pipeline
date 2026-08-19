@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    # Weekly paddle smoke: the heavy-backend job below only runs here and on
+    # manual dispatch, so PR latency is unaffected.
+    - cron: "17 4 * * 1"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -55,6 +59,40 @@ jobs:
           name: coverage-report
           path: coverage.xml
           if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Paddle training smoke (C8). The unit-test job is deliberately paddle-less,
+  # which historically made an entire failure class invisible: the paddle 3.x
+  # warpctc dtype contract crashed every real training run on its first batch
+  # and no CI job could have caught it. This job installs the real backend and
+  # proves the trainer RUNS and LEARNS on a synthetic micro-dataset (loss must
+  # fall, checkpoints must exist, resume must restore). Weekly + manual only.
+  # ---------------------------------------------------------------------------
+  paddle-smoke:
+    name: paddle training smoke
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install training backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            paddlepaddle==3.3.1 \
+            numpy "opencv-python-headless<5" Pillow \
+            pyyaml rapidfuzz tqdm "mlflow>=3.1"
+
+      - name: Run training smoke test
+        run: python scripts/train_smoke_test.py
 
   # ---------------------------------------------------------------------------
   # Static checks. Non-blocking for now: the existing codebase is not yet

@@ -81,6 +81,7 @@ try:
     DAGSHUB_INTEGRATION_AVAILABLE = True
 except ImportError:
     DAGSHUB_INTEGRATION_AVAILABLE = False
+import math
 import yaml
 import json
 import time
@@ -390,7 +391,7 @@ class VINRecognitionDataset(Dataset):
                 encoded[i] = self.char_dict[char]
         return encoded
     
-    def _preprocess_image(self, image: np.ndarray) -> np.ndarray:
+    def _preprocess_image(self, image: np.ndarray) -> Tuple[np.ndarray, int]:
         """
         Preprocess image for model input using VIN-optimized preprocessing.
         
@@ -400,6 +401,14 @@ class VINRecognitionDataset(Dataset):
         3. Pad to target width if needed
         4. Normalize to [-1, 1]
         5. Convert HWC -> CHW
+        
+        Returns:
+            (tensor, valid_width): the CHW tensor and the CONTENT width in
+            pixels before zero-padding. The valid width drives per-sample
+            CTC input lengths: with full-length inputs the loss demands
+            emissions over the black padding, and the model was observed
+            live emitting 40 characters of digit garbage over the padded
+            tail of an 80-timestep sequence.
         """
         # Step 1: Apply VIN-optimized preprocessing (CLAHE, morphology, etc.)
         preprocessed = self._vin_preprocessor.process(image)
@@ -423,7 +432,7 @@ class VINRecognitionDataset(Dataset):
         # Step 5: HWC -> CHW
         transposed = normalized.transpose((2, 0, 1))
         
-        return transposed
+        return transposed, new_w
     
     def _augment(self, image: np.ndarray) -> np.ndarray:
         """Apply data augmentation for training."""
@@ -495,7 +504,7 @@ class VINRecognitionDataset(Dataset):
         if self.is_training:
             image = self._augment(image)
         
-        image = self._preprocess_image(image)
+        image, valid_width = self._preprocess_image(image)
         
         # Encode label
         encoded_label = self._encode_label(label)
@@ -508,7 +517,11 @@ class VINRecognitionDataset(Dataset):
             'image': image,
             'label': encoded_label,  # Fixed-length, zero-padded
             'length': np.array([label_length], dtype=np.int32),
-            'text': label
+            'text': label,
+            # Content width in pixels before zero-padding; drives per-sample
+            # CTC input lengths so the loss never demands emissions over the
+            # black padding.
+            'valid_width': np.array([valid_width], dtype=np.int64),
         }
 
 
@@ -695,6 +708,45 @@ class SVTREncoder(nn.Layer):
         x = x.transpose([1, 0, 2])  # Back to [B, T, C]
         
         return x
+
+
+def ctc_input_lengths(
+    valid_widths: List[int],
+    total_timesteps: int,
+    image_width: int,
+    label_lengths: List[int],
+) -> List[int]:
+    """
+    Per-sample CTC input lengths from content widths. Pure and unit-testable.
+
+    The model's timestep axis maps linearly onto image width
+    (stride = image_width / total_timesteps). A sample whose content ends at
+    pixel new_w has ceil(new_w / stride) informative timesteps; feeding the
+    FULL length instead makes CTC demand emissions over the black padding -
+    the mechanism behind the observed 40-character digit tail decoded from
+    an 80-timestep sequence.
+
+    Args:
+        valid_widths: Content width in pixels per sample (before padding).
+        total_timesteps: T of the logits tensor.
+        image_width: The padded model input width (e.g. 320).
+        label_lengths: True target lengths per sample; CTC requires
+            input_length >= label_length, so lengths are clamped up to it.
+
+    Returns:
+        One input length per sample, each in [label_length, total_timesteps].
+    """
+    if total_timesteps <= 0 or image_width <= 0:
+        raise ValueError(
+            f"total_timesteps={total_timesteps} and image_width={image_width} "
+            f"must be positive"
+        )
+    stride = image_width / total_timesteps
+    lengths = []
+    for width, label_len in zip(valid_widths, label_lengths, strict=True):
+        timesteps = math.ceil(min(int(width), image_width) / stride)
+        lengths.append(max(min(timesteps, total_timesteps), int(label_len)))
+    return lengths
 
 
 def update_early_stopping(
@@ -1121,6 +1173,11 @@ class VINFineTuner:
         self.best_accuracy = 0.0
         self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
+        #: Optional callable(epoch, metrics_dict) invoked after every epoch;
+        #: set by the tracked-run wrapper so training curves land in MLflow
+        #: instead of only the final numbers. Hook failures are logged and
+        #: disable the hook - they never interrupt training.
+        self.epoch_hook: Optional[Any] = None
         
         # Graceful shutdown support
         self._setup_signal_handlers()
@@ -1422,6 +1479,27 @@ class VINFineTuner:
         beta2 = float(opt_config.get('beta2', 0.999))
         params = self.model.parameters()
 
+        # Weight decay applies to weight MATRICES only: decaying BatchNorm
+        # scale/shift and biases regularises parameters whose purpose is to
+        # re-centre activations. Paddle's parameter-level regularizer
+        # overrides the optimizer-level weight_decay, and unlike
+        # apply_decay_param_fun (AdamW-only) it works for every optimizer
+        # here. Structured names: biases end '.b_0'; norm layers carry
+        # 'norm'/'bn'/BatchNorm buffer markers.
+        excluded = 0
+        for name, param in self.model.named_parameters():
+            lowered = name.lower()
+            if (
+                name.endswith('.b_0')
+                or 'bn' in lowered
+                or 'norm' in lowered
+                or '_mean' in lowered
+                or '_variance' in lowered
+            ):
+                param.regularizer = paddle.regularizer.L2Decay(0.0)
+                excluded += 1
+        logger.info(f"Weight decay excluded from {excluded} norm/bias parameters")
+
         if opt_key == 'adam':
             optimizer = optim.Adam(
                 parameters=params, learning_rate=lr_scheduler,
@@ -1500,7 +1578,11 @@ class VINFineTuner:
         
         return train_loader, val_loader
     
-    def _decode_predictions(self, logits: paddle.Tensor) -> List[str]:
+    def _decode_predictions(
+        self,
+        logits: paddle.Tensor,
+        valid_widths: Optional[List[int]] = None,
+    ) -> List[str]:
         """
         Decode model output to text.
         
@@ -1513,7 +1595,7 @@ class VINFineTuner:
             # previously inlined a second, near-identical copy of that logic;
             # two implementations of the decode path is precisely how the
             # training/inference character-map divergence went unnoticed.
-            return self._ctc_greedy_decode(logits)
+            return self._ctc_greedy_decode(logits, valid_widths)
         else:
             # Position-by-position decoding for CrossEntropyLoss training
             # Take first max_text_length positions and argmax each
@@ -1580,7 +1662,18 @@ class VINFineTuner:
                 # optimizer steps on 12 images never left the ln(34)=3.53
                 # blank plateau; with raw logits the same run overfits.
                 ctc_logits = logits.transpose([1, 0, 2])  # [T, B, C] for CTC
-                input_lengths = paddle.full([logits.shape[0]], logits.shape[1], dtype='int64')
+                # Per-sample input lengths from content width: the loss must
+                # not demand emissions over the black padding (observed live:
+                # a 40-char digit tail decoded over the padded region).
+                input_lengths = paddle.to_tensor(
+                    ctc_input_lengths(
+                        [int(w) for w in batch['valid_width'].reshape([-1])],
+                        total_timesteps=logits.shape[1],
+                        image_width=self.config.get('Global', {}).get('image_width', 320),
+                        label_lengths=[int(l) for l in target_lengths],
+                    ),
+                    dtype='int64',
+                )
                 loss = self.criterion(ctc_logits, labels, input_lengths, target_lengths)
             else:
                 labels = paddle.to_tensor(batch['label'], dtype='int64')  # CrossEntropyLoss needs int64
@@ -1655,7 +1748,16 @@ class VINFineTuner:
                 # RAW logits: warpctc applies softmax internally (see the
                 # training loop). log_softmax here collapsed the gradient.
                 ctc_logits = logits.transpose([1, 0, 2])
-                input_lengths = paddle.full([logits.shape[0]], logits.shape[1], dtype='int64')
+                # Same per-sample input lengths as the training loop.
+                input_lengths = paddle.to_tensor(
+                    ctc_input_lengths(
+                        [int(w) for w in batch['valid_width'].reshape([-1])],
+                        total_timesteps=logits.shape[1],
+                        image_width=self.config.get('Global', {}).get('image_width', 320),
+                        label_lengths=[int(l) for l in target_lengths],
+                    ),
+                    dtype='int64',
+                )
                 loss = self.criterion(ctc_logits, labels, input_lengths, target_lengths)
             else:
                 # Cross-Entropy Loss path
@@ -1673,7 +1775,9 @@ class VINFineTuner:
             )
             
             # Decode predictions
-            predictions = self._decode_predictions(logits)
+            predictions = self._decode_predictions(
+                logits, [int(w) for w in batch['valid_width'].reshape([-1])]
+            )
             all_predictions.extend(predictions)
             all_targets.extend(targets)
         
@@ -1743,80 +1847,85 @@ class VINFineTuner:
             - Character-level: total_characters, char_accuracy, f1_micro, f1_macro
             - Industry: cer, word_accuracy, valid_vin_rate
         """
-        try:
-            print("🔍 DEBUG: Attempting to import EvaluationMetricsCalculator...")
-            # Use absolute import instead of relative
-            import sys
-            import os
-            # Add the project root to path if not already there
-            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-            if project_root not in sys.path:
-                sys.path.insert(0, project_root)
-            
-            from src.vin_ocr.evaluation.metrics import EvaluationMetricsCalculator
-            print("🔍 DEBUG: Import successful!")
-            calc = EvaluationMetricsCalculator()
-            print("🔍 DEBUG: Calculator instantiated!")
-            calc.add_batch(predictions, targets)
-            print("🔍 DEBUG: Batch added!")
-            full_metrics = calc.compute()
-            print("🔍 DEBUG: Metrics computed!")
-            print(f"🔍 DEBUG: Full metrics type: {type(full_metrics)}")
-            print(f"🔍 DEBUG: Has char_accuracy: {hasattr(full_metrics, 'character_level')}")
-            if hasattr(full_metrics, 'character_level'):
-                print(f"🔍 DEBUG: Char accuracy value: {full_metrics.character_level.char_accuracy}")
-            
-            return {
-                # Image-level
-                'correct_images': full_metrics.image_level.correct_images,
-                'failed_images': full_metrics.image_level.failed_images,
-                'total_images': full_metrics.image_level.total_images,
-                'image_accuracy': full_metrics.image_level.accuracy,
-                
-                # Character-level
-                'total_characters': full_metrics.character_level.total_characters,
-                'correct_characters': full_metrics.character_level.correct_characters,
-                'char_accuracy': full_metrics.character_level.char_accuracy,
-                'f1_micro': full_metrics.character_level.f1_micro,
-                'f1_macro': full_metrics.character_level.f1_macro,
-                'precision': full_metrics.character_level.precision,
-                'recall': full_metrics.character_level.recall,
-                
-                # Industry
-                'cer': full_metrics.character_level.char_error_rate,
-                'word_accuracy': full_metrics.image_level.accuracy,
-                'ned': full_metrics.character_level.normalized_edit_distance,
-                
-                # Full metrics object for detailed reporting
-                '_full_metrics': full_metrics,
-            }
-        except ImportError as e:
-            print(f"🔍 DEBUG: ImportError caught: {e}")
-            print("🔍 DEBUG: Falling back to basic metrics...")
-        except Exception as e:
-            print(f"🔍 DEBUG: Other exception caught: {e}")
-            print(f"🔍 DEBUG: Exception type: {type(e).__name__}")
-            print("🔍 DEBUG: Falling back to basic metrics...")
-            # Fallback to basic metrics
-            correct = sum(1 for p, t in zip(predictions, targets) if p == t)
-            total = len(predictions)
-            return {
-                'correct_images': correct,
-                'failed_images': total - correct,
-                'total_images': total,
-                'image_accuracy': correct / total if total > 0 else 0.0,
-                'summary': f"Basic metrics: {correct}/{total} correct"
-            }
+        # Straight delegation to the canonical calculator. This method
+        # previously carried debug prints in the production metrics path, a
+        # sys.path hack, a broad except that degraded to partial metrics,
+        # and an ImportError branch that fell through RETURNING NONE. A
+        # metrics failure now raises: a training run whose metrics cannot
+        # be computed is a broken run, not a run with fewer numbers.
+        from src.vin_ocr.evaluation.metrics import EvaluationMetricsCalculator
+
+        calc = EvaluationMetricsCalculator()
+        calc.add_batch(predictions, targets)
+        full_metrics = calc.compute()
+
+        return {
+            # Image-level
+            'correct_images': full_metrics.image_level.correct_images,
+            'failed_images': full_metrics.image_level.failed_images,
+            'total_images': full_metrics.image_level.total_images,
+            'image_accuracy': full_metrics.image_level.accuracy,
+
+            # Character-level
+            'total_characters': full_metrics.character_level.total_characters,
+            'correct_characters': full_metrics.character_level.correct_characters,
+            'char_accuracy': full_metrics.character_level.char_accuracy,
+            'f1_micro': full_metrics.character_level.f1_micro,
+            'f1_macro': full_metrics.character_level.f1_macro,
+            'precision': full_metrics.character_level.precision,
+            'recall': full_metrics.character_level.recall,
+
+            # Industry
+            'cer': full_metrics.character_level.char_error_rate,
+            'word_accuracy': full_metrics.image_level.accuracy,
+            'ned': full_metrics.character_level.normalized_edit_distance,
+
+            # Full metrics object for detailed reporting
+            '_full_metrics': full_metrics,
+        }
     
     def get_last_validation_metrics(self) -> Dict[str, Any]:
         """Get the most recent validation metrics."""
         return getattr(self, '_last_val_metrics', {})
     
     def _save_best_model(self):
-        """Save the best model."""
+        """
+        Save the best-by-exact-match model, atomically, with provenance.
+
+        The info file records WHICH run and epoch produced this checkpoint:
+        without it, a stale best_accuracy.pdparams is indistinguishable from
+        a fresh one (observed live: a run whose exact-match never rose left
+        a six-month-old 'best' checkpoint sitting beside brand-new epoch
+        checkpoints in the same directory).
+        """
         best_path = self.output_dir / 'best_accuracy'
-        paddle.save(self.model.state_dict(), str(best_path) + '.pdparams')
+        self._atomic_paddle_save(self.model.state_dict(), best_path.with_suffix('.pdparams'))
+        self._atomic_json_save(
+            {**self._checkpoint_info(self.current_epoch),
+             'selection_metric': 'val_exact_match_accuracy',
+             'selection_value': self.best_accuracy},
+            self.output_dir / 'best_accuracy_info.json',
+        )
         logger.info(f"Saved best model with accuracy: {self.best_accuracy:.4f}")
+
+    def _save_best_val_loss_model(self):
+        """
+        Save the best-by-validation-loss model, atomically, with provenance.
+
+        Exact-match is 0 through the entire blank-collapse phase and
+        quantised to 1/n_val afterwards, so a run can end with NO
+        best-accuracy checkpoint at all. Validation loss is continuous:
+        this checkpoint always exists after the first epoch and is the
+        principled selection artifact until exact-match becomes non-zero.
+        """
+        best_path = self.output_dir / 'best_val_loss'
+        self._atomic_paddle_save(self.model.state_dict(), best_path.with_suffix('.pdparams'))
+        self._atomic_json_save(
+            {**self._checkpoint_info(self.current_epoch),
+             'selection_metric': 'val_loss',
+             'selection_value': self.best_val_loss},
+            self.output_dir / 'best_val_loss_info.json',
+        )
     
     def _checkpoint_info(self, epoch: int) -> Dict[str, Any]:
         """The resume metadata written next to every checkpoint."""
@@ -2002,6 +2111,16 @@ class VINFineTuner:
                 self._save_best_model()
                 print(f"  🎉 New best accuracy: {val_accuracy:.4f}")
             
+            # Best-by-val-loss selection is UNCONDITIONAL - it must not
+            # depend on early stopping being enabled. Exact-match is 0
+            # through the whole blank-collapse phase, so without this a run
+            # can finish with no principled 'best' checkpoint at all.
+            previous_best_loss = self.best_val_loss
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self._save_best_val_loss_model()
+                print(f"  💾 New best val loss: {val_loss:.4f}")
+            
             # Early stopping logic (decision logic is the pure helper
             # update_early_stopping, unit-tested without paddle).
             # Loss-aware: exact-match sits at 0 through the whole
@@ -2015,10 +2134,6 @@ class VINFineTuner:
                 min_delta = self.config['Global'].get('early_stopping_min_delta', 0.001)
                 loss_min_delta = self.config['Global'].get('early_stopping_loss_min_delta', 0.005)
                 min_epochs = self.config['Global'].get('early_stopping_min_epochs', 0)
-                
-                previous_best_loss = self.best_val_loss
-                if val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
                 
                 improved, self.epochs_without_improvement = update_early_stopping(
                     val_accuracy=val_accuracy,
@@ -2061,6 +2176,25 @@ class VINFineTuner:
                 print(f"  📊 Image-Level: {m.get('correct_images', 0)}/{m.get('total_images', 0)} correct ({m.get('image_accuracy', 0)*100:.2f}%)", flush=True)
                 print(f"  📝 Char-Level: Acc={m.get('char_accuracy', 0)*100:.2f}%, F1-micro={m.get('f1_micro', 0):.4f}, F1-macro={m.get('f1_macro', 0):.4f}", flush=True)
                 print(f"  🏭 Industry: CER={m.get('cer', 1)*100:.2f}%, NED={m.get('ned', 1):.4f}", flush=True)
+            
+            # Per-epoch metrics to the tracked run (training curves in
+            # MLflow, not just final numbers). Hook failure disables the
+            # hook loudly; it never kills training.
+            if self.epoch_hook is not None:
+                try:
+                    self.epoch_hook(epoch, {
+                        'train_loss': train_loss,
+                        'val_loss': val_loss,
+                        'val_exact_match': val_accuracy,
+                        'learning_rate': current_lr,
+                        'best_val_loss': self.best_val_loss,
+                    })
+                except Exception as hook_error:
+                    logger.warning(
+                        f"epoch metrics hook failed ({hook_error}); "
+                        f"disabling per-epoch tracking"
+                    )
+                    self.epoch_hook = None
             
             # Save epoch checkpoint on schedule or improvement. (A second
             # "is_best = val_accuracy > self.best_accuracy" used to live
@@ -2153,13 +2287,17 @@ class VINFineTuner:
         except Exception as e:
             logger.warning(f"Could not save progress file: {e}")
     
-    def _ctc_greedy_decode(self, logits: paddle.Tensor) -> List[str]:
+    def _ctc_greedy_decode(
+        self, logits: paddle.Tensor, valid_widths: Optional[List[int]] = None
+    ) -> List[str]:
         """CTC greedy decoding for a batch of logits (canonical decoder)."""
-        texts, _ = self._ctc_greedy_decode_with_confidence(logits)
+        texts, _ = self._ctc_greedy_decode_with_confidence(logits, valid_widths)
         return texts
     
     def _ctc_greedy_decode_with_confidence(
-        self, logits: paddle.Tensor
+        self,
+        logits: paddle.Tensor,
+        valid_widths: Optional[List[int]] = None,
     ) -> Tuple[List[str], List[float]]:
         """
         Decode a batch and compute per-sample confidence over the EMITTED
@@ -2173,16 +2311,32 @@ class VINFineTuner:
         probabilities over the first 17 timesteps, which for a blank-heavy
         CTC output reports the confidence OF PREDICTING NOTHING - an
         all-blank model scored 92.6%.
+        
+        Args:
+            logits: [B, T, C] model output.
+            valid_widths: Per-sample content width in pixels. When given,
+                decoding is masked to the informative timesteps - the model
+                receives no gradient over padding (per-sample CTC input
+                lengths), so its pad-region outputs are undefined and must
+                not be decoded.
         """
         from src.vin_ocr.core.charset import ctc_greedy_decode
         
         probs = paddle.nn.functional.softmax(logits, axis=-1).numpy()  # [B, T, C]
+        total_t = probs.shape[1]
+        image_width = self.config.get('Global', {}).get('image_width', 320)
+        stride = image_width / total_t
+        
         texts: List[str] = []
         confidences: List[float] = []
-        for sample_probs in probs:
-            indices = sample_probs.argmax(axis=-1)
+        for i, sample_probs in enumerate(probs):
+            if valid_widths is not None:
+                valid_t = max(1, min(total_t, math.ceil(int(valid_widths[i]) / stride)))
+            else:
+                valid_t = total_t
+            indices = sample_probs[:valid_t].argmax(axis=-1)
             text, kept = ctc_greedy_decode(indices, self.idx_to_char)
-            step_max = sample_probs.max(axis=-1)
+            step_max = sample_probs[:valid_t].max(axis=-1)
             confidences.append(float(step_max[kept].mean()) if kept else 0.0)
             texts.append(text)
         return texts, confidences
@@ -2219,7 +2373,10 @@ class VINFineTuner:
                 # predicting nothing (92.6% for an all-blank model).
                 if self.use_ctc:
                     predictions, batch_conf = \
-                        self._ctc_greedy_decode_with_confidence(logits)
+                        self._ctc_greedy_decode_with_confidence(
+                            logits,
+                            [int(w) for w in batch['valid_width'].reshape([-1])],
+                        )
                 else:
                     predictions = self._decode_predictions(logits)
                     max_len = self.config['Global']['max_text_length']
@@ -2257,10 +2414,16 @@ class VINFineTuner:
         - "Incorrect" = Prediction differs from ground truth (partial match possible)
         - All images ARE processed; these metrics measure prediction QUALITY
         
-        Character metrics are calculated only on the first 17 positions
-        (VIN length) for fair comparison.
+        Character-level accuracy/precision/recall/F1 come from the canonical
+        alignment-based implementation (core.char_metrics), computed on the
+        17-char window used for exact match. Per-position tables and the
+        confusion list remain positional - they are positional quantities by
+        definition and are labelled as diagnostics.
         """
-        from collections import Counter, defaultdict
+        from collections import Counter
+        
+        from src.vin_ocr.core.char_metrics import char_level_metrics
+        from src.vin_ocr.core.vin_utils import levenshtein_distance
         
         n_samples = len(predictions)
         
@@ -2270,90 +2433,46 @@ class VINFineTuner:
         # Truncate predictions to 17 chars for fair comparison
         preds_truncated = [p[:17] for p in predictions]
         
-        exact_matches = sum(1 for p, g in zip(preds_truncated, ground_truths) if p == g)
+        exact_matches = sum(
+            1 for p, g in zip(preds_truncated, ground_truths, strict=True) if p == g
+        )
         incorrect_predictions = n_samples - exact_matches
         image_accuracy = exact_matches / n_samples if n_samples > 0 else 0
         
         # =====================================================================
-        # CHARACTER-LEVEL METRICS (only first 17 positions)
+        # CHARACTER-LEVEL METRICS - single canonical implementation.
+        # This method previously inlined one more positional pred[i]==gt[i]
+        # copy with the invalid-character FP hole (H5's exact shape), and
+        # training_metrics.json - the file the Optuna tuner scores from -
+        # was computed with it.
         # =====================================================================
-        char_correct = 0
-        char_total = 0
+        char_metrics = char_level_metrics(
+            list(zip(preds_truncated, ground_truths, strict=True))
+        )
+        per_class_metrics = {
+            char: row
+            for char, row in char_metrics.per_class.items()
+            if row['support'] > 0
+        }
+        
+        # Positional per-position diagnostic (inherently positional).
         position_correct = [0] * 17
         position_total = [0] * 17
-        
-        # Per-class metrics for F1 calculation
-        class_tp = defaultdict(int)  # True Positives per class
-        class_fp = defaultdict(int)  # False Positives per class
-        class_fn = defaultdict(int)  # False Negatives per class
-        
-        # VIN valid characters
-        vin_chars = set("0123456789ABCDEFGHJKLMNPRSTUVWXYZ")
-        
-        for pred, gt in zip(predictions, ground_truths):
-            # Only compare first 17 characters (VIN length)
+        for pred, gt in zip(preds_truncated, ground_truths, strict=True):
             for i in range(17):
-                gt_char = gt[i] if i < len(gt) else ''
-                pred_char = pred[i] if i < len(pred) else ''
-                
-                if gt_char:  # Only count if ground truth has a character at this position
-                    char_total += 1
+                if i < len(gt):
                     position_total[i] += 1
-                    
-                    if pred_char == gt_char:
-                        char_correct += 1
+                    if i < len(pred) and pred[i] == gt[i]:
                         position_correct[i] += 1
-                        class_tp[gt_char] += 1
-                    else:
-                        # Misclassification
-                        class_fn[gt_char] += 1  # Missed the ground truth
-                        if pred_char and pred_char in vin_chars:
-                            class_fp[pred_char] += 1  # Wrongly predicted this
-        
-        char_accuracy = char_correct / char_total if char_total > 0 else 0
         
         # =====================================================================
-        # F1 SCORES (Micro and Macro)
+        # EDIT DISTANCE & OTHER METRICS (canonical Levenshtein - this file
+        # carried its own fifth copy of the algorithm)
         # =====================================================================
-        
-        # F1 Micro: Global TP, FP, FN
-        total_tp = sum(class_tp.values())
-        total_fp = sum(class_fp.values())
-        total_fn = sum(class_fn.values())
-        
-        micro_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
-        micro_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
-        f1_micro = 2 * micro_precision * micro_recall / (micro_precision + micro_recall) if (micro_precision + micro_recall) > 0 else 0
-        
-        # F1 Macro: Average F1 per class
-        class_f1_scores = []
-        per_class_metrics = {}
-        
-        for char in sorted(vin_chars):
-            tp = class_tp[char]
-            fp = class_fp[char]
-            fn = class_fn[char]
-            
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-            
-            # Only include classes that appear in ground truth
-            if (tp + fn) > 0:
-                class_f1_scores.append(f1)
-                per_class_metrics[char] = {
-                    'precision': precision,
-                    'recall': recall,
-                    'f1': f1,
-                    'support': tp + fn  # Total occurrences in ground truth
-                }
-        
-        f1_macro = sum(class_f1_scores) / len(class_f1_scores) if class_f1_scores else 0
-        
-        # =====================================================================
-        # EDIT DISTANCE & OTHER METRICS
-        # =====================================================================
-        edit_distances = [self._levenshtein_distance(p, g) for p, g in zip(predictions, ground_truths)]
+        edit_distances = [
+            levenshtein_distance(p, g)
+            for p, g in zip(predictions, ground_truths, strict=True)
+        ]
         avg_edit_distance = sum(edit_distances) / len(edit_distances) if edit_distances else 0
         
         # Position-wise accuracy
@@ -2405,14 +2524,18 @@ class VINFineTuner:
                 'exact_match_accuracy': image_accuracy,
             },
             'character_level': {
-                'note': 'Character metrics computed on first 17 positions only',
-                'total_characters': char_total,
-                'correct_characters': char_correct,
-                'character_accuracy': char_accuracy,
-                'f1_micro': f1_micro,
-                'f1_macro': f1_macro,
-                'micro_precision': micro_precision,
-                'micro_recall': micro_recall,
+                'note': (
+                    'Alignment-based (core.char_metrics): char accuracy = '
+                    'max(0, 1-CER); P/R/F1 from sequence-alignment TP/FP/FN '
+                    'over the 17-char window'
+                ),
+                'total_characters': char_metrics.total_reference_chars,
+                'correct_characters': char_metrics.true_positives,
+                'character_accuracy': char_metrics.char_accuracy,
+                'f1_micro': char_metrics.f1_micro,
+                'f1_macro': char_metrics.f1_macro,
+                'micro_precision': char_metrics.precision,
+                'micro_recall': char_metrics.recall,
             },
             'position_accuracy': {
                 f'position_{i+1}': acc 
@@ -2435,26 +2558,6 @@ class VINFineTuner:
             'sample_results': sample_results,
             'avg_confidence': avg_confidence,
         }
-    
-    def _levenshtein_distance(self, s1: str, s2: str) -> int:
-        """Calculate Levenshtein edit distance."""
-        if len(s1) < len(s2):
-            return self._levenshtein_distance(s2, s1)
-        
-        if len(s2) == 0:
-            return len(s1)
-        
-        prev_row = range(len(s2) + 1)
-        for i, c1 in enumerate(s1):
-            curr_row = [i + 1]
-            for j, c2 in enumerate(s2):
-                insertions = prev_row[j + 1] + 1
-                deletions = curr_row[j] + 1
-                substitutions = prev_row[j] + (c1 != c2)
-                curr_row.append(min(insertions, deletions, substitutions))
-            prev_row = curr_row
-        
-        return prev_row[-1]
     
     def _save_final_metrics(self, total_time: float, epochs: int):
         """Save comprehensive training metrics to JSON."""
@@ -2847,6 +2950,12 @@ def _run_tracked(trainer, config: Dict, args) -> None:
         tags={'entry_point': 'vin-train finetune'},
     ) as run:
         run.log_artifact(Path(args.config), 'config')
+
+        # Stream per-epoch metrics so the run has training CURVES, not just
+        # final numbers.
+        trainer.epoch_hook = lambda epoch, metrics: run.log_metrics(
+            metrics, step=epoch
+        )
 
         trainer.train(resume_from=args.resume)
 

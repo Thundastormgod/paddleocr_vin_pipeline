@@ -757,6 +757,9 @@ def update_early_stopping(
     val_loss: Optional[float] = None,
     best_val_loss: Optional[float] = None,
     loss_min_delta: float = 0.0,
+    val_char_accuracy: Optional[float] = None,
+    best_val_char_accuracy: Optional[float] = None,
+    char_min_delta: float = 0.0,
 ) -> Tuple[bool, int]:
     """
     One early-stopping bookkeeping step. Pure function so the decision
@@ -796,7 +799,15 @@ def update_early_stopping(
         and best_val_loss is not None
         and val_loss < best_val_loss - loss_min_delta
     )
-    if improved_accuracy or improved_loss:
+    # Char accuracy joins the disjunction: measured on stage-3b, it kept
+    # improving for 25 epochs after validation loss plateaued, and the
+    # char-accuracy-preferred weights won on the held-out test set.
+    improved_char = (
+        val_char_accuracy is not None
+        and best_val_char_accuracy is not None
+        and val_char_accuracy > best_val_char_accuracy + char_min_delta
+    )
+    if improved_accuracy or improved_loss or improved_char:
         return True, 0
     return False, epochs_without_improvement + 1
 
@@ -1172,6 +1183,7 @@ class VINFineTuner:
         self.current_epoch = 0
         self.best_accuracy = 0.0
         self.best_val_loss = float('inf')
+        self.best_val_char_accuracy = 0.0
         self.epochs_without_improvement = 0
         #: Optional callable(epoch, metrics_dict) invoked after every epoch;
         #: set by the tracked-run wrapper so training curves land in MLflow
@@ -1736,8 +1748,19 @@ class VINFineTuner:
         return avg_loss
     
     @paddle.no_grad()
-    def validate(self) -> Tuple[float, float]:
-        """Validate on validation set."""
+    def validate(self) -> Tuple[float, float, float]:
+        """
+        Validate on the validation set.
+
+        Returns:
+            (val_loss, exact_match_accuracy, char_accuracy) - char accuracy
+            is the canonical alignment metric. It exists in the return
+            because exact-match is quantised to 1/n_val and sits at 0
+            through most of training, while VALIDATION LOSS was measured
+            selecting the wrong checkpoint (stage-3b: loss chose epoch 19,
+            char accuracy kept improving through 44 and won on the
+            held-out test set).
+        """
         self.model.eval()
         total_loss = 0.0
         all_predictions = []
@@ -1802,49 +1825,16 @@ class VINFineTuner:
         
         avg_loss = total_loss / max(1, len(self.val_loader))
         
-        # Calculate comprehensive metrics
-        print(f"🔍 DEBUG: Validation started - predictions={len(all_predictions)}, targets={len(all_targets)}")
-        if all_predictions and all_targets:
-            # DEBUG: Check for dataset issues
-            unique_targets = set(all_targets)
-            print(f"🔍 DEBUG: Unique targets in validation: {len(unique_targets)}")
-            print(f"🔍 DEBUG: Sample unique targets: {list(unique_targets)[:5]}")
-            
-            print(f"🔍 DEBUG: Sample prediction: '{all_predictions[0]}' (len={len(all_predictions[0])})")
-            print(f"🔍 DEBUG: Sample target: '{all_targets[0]}' (len={len(all_targets[0])})")
-            print(f"🔍 DEBUG: Total predictions: {len(all_predictions)}, Total targets: {len(all_targets)}")
-            
-            # DEBUG: Character-level analysis
-            sample_pred = all_predictions[0]
-            sample_target = all_targets[0]
-            print(f"🔍 DEBUG: Char comparison - pred: '{sample_pred}', target: '{sample_target}'")
-            for i, (p, t) in enumerate(zip(sample_pred, sample_target)):
-                match = "✓" if p == t else "✗"
-                print(f"🔍 DEBUG: Pos {i+1}: '{p}' vs '{t}' = {match}")
-        else:
-            print(f"🔍 DEBUG: No predictions or targets available!")
-        
+        # Canonical metrics (the debug-print storm that used to live here -
+        # per-position comparisons printed EVERY validation epoch - is gone;
+        # diagnostics belong in the metrics dict and the tracked run).
         metrics = self._calculate_comprehensive_metrics(all_predictions, all_targets)
         accuracy = metrics['image_accuracy']
+        val_char_accuracy = metrics.get('char_accuracy', 0.0)
         
-        # Debug: Force print validation metrics
-        print(f"🔍 DEBUG: Metrics calculated - accuracy={accuracy}")
-        print(f"🔍 DEBUG: Char metrics - acc={metrics.get('char_accuracy', 0)}, f1_micro={metrics.get('f1_micro', 0)}, f1_macro={metrics.get('f1_macro', 0)}")
-        print(f"🔍 DEBUG: Raw metrics dict keys: {list(metrics.keys())}")
-        for key, value in metrics.items():
-            if isinstance(value, (int, float)):
-                print(f"🔍 DEBUG: {key}: {value}")
-        
-        # DEBUG: Check if character metrics are being lost
-        if 'char_accuracy' in metrics:
-            print(f"🔍 DEBUG: Char accuracy found in metrics: {metrics['char_accuracy']}")
-        else:
-            print("🔍 DEBUG: char_accuracy NOT found in metrics dict!")
-            print(f"🔍 DEBUG: Available keys: {[k for k in metrics.keys() if 'char' in k.lower()]}")
-        
-        if len(all_predictions) > 0:
+        if all_predictions:
             print(f"  📊 Image-Level: {metrics.get('correct_images', 0)}/{metrics.get('total_images', 0)} correct ({accuracy:.4f})")
-            print(f"  📝 Char-Level: Acc={metrics.get('char_accuracy', 0):.4f}, F1-micro={metrics.get('f1_micro', 0):.4f}, F1-macro={metrics.get('f1_macro', 0):.4f}")
+            print(f"  📝 Char-Level: Acc={val_char_accuracy:.4f}, F1-micro={metrics.get('f1_micro', 0):.4f}, F1-macro={metrics.get('f1_macro', 0):.4f}")
         else:
             print(f"  ⚠️ No predictions generated during validation")
         
@@ -1852,7 +1842,7 @@ class VINFineTuner:
         self._last_val_metrics = metrics
         self.val_accuracies.append(accuracy)
         
-        return avg_loss, accuracy
+        return avg_loss, accuracy, val_char_accuracy
     
     def _calculate_comprehensive_metrics(
         self, predictions: List[str], targets: List[str]
@@ -1946,6 +1936,24 @@ class VINFineTuner:
             self.output_dir / 'best_val_loss_info.json',
         )
     
+    def _save_best_char_accuracy_model(self):
+        """
+        Save the best-by-validation-char-accuracy model, atomically, with
+        provenance. Measured motivation (stage-3b): validation loss
+        selected epoch 19 while char accuracy kept improving through
+        epoch 44, and the epoch-44 weights won on the held-out test set -
+        char accuracy is the selection metric that tracks what this
+        system is actually for.
+        """
+        best_path = self.output_dir / 'best_char_accuracy'
+        self._atomic_paddle_save(self.model.state_dict(), best_path.with_suffix('.pdparams'))
+        self._atomic_json_save(
+            {**self._checkpoint_info(self.current_epoch),
+             'selection_metric': 'val_char_accuracy',
+             'selection_value': self.best_val_char_accuracy},
+            self.output_dir / 'best_char_accuracy_info.json',
+        )
+
     def _checkpoint_info(self, epoch: int) -> Dict[str, Any]:
         """The resume metadata written next to every checkpoint."""
         return {
@@ -2109,7 +2117,7 @@ class VINFineTuner:
             self._save_progress('validating', epoch, epochs, train_loss, 0.0, 0.0, time.time() - start_time)
             
             # Validate
-            val_loss, val_accuracy = self.validate()
+            val_loss, val_accuracy, val_char_accuracy = self.validate()
             
             # Track best accuracy against the PREVIOUS best. This block used
             # to update best_accuracy first and then compare val_accuracy
@@ -2140,6 +2148,15 @@ class VINFineTuner:
                 self._save_best_val_loss_model()
                 print(f"  💾 New best val loss: {val_loss:.4f}")
             
+            # Best-by-CHAR-ACCURACY selection - the measured recommendation
+            # from stage-3b (loss/accuracy decoupling): the epoch-44 weights
+            # beat the best-val-loss checkpoint on the held-out test set.
+            previous_best_char = self.best_val_char_accuracy
+            if val_char_accuracy > self.best_val_char_accuracy:
+                self.best_val_char_accuracy = val_char_accuracy
+                self._save_best_char_accuracy_model()
+                print(f"  💾 New best val char accuracy: {val_char_accuracy:.4f}")
+            
             # Early stopping logic (decision logic is the pure helper
             # update_early_stopping, unit-tested without paddle).
             # Loss-aware: exact-match sits at 0 through the whole
@@ -2154,6 +2171,8 @@ class VINFineTuner:
                 loss_min_delta = self.config['Global'].get('early_stopping_loss_min_delta', 0.005)
                 min_epochs = self.config['Global'].get('early_stopping_min_epochs', 0)
                 
+                char_min_delta = self.config['Global'].get(
+                    'early_stopping_char_min_delta', 0.002)
                 improved, self.epochs_without_improvement = update_early_stopping(
                     val_accuracy=val_accuracy,
                     previous_best=previous_best,
@@ -2162,6 +2181,9 @@ class VINFineTuner:
                     val_loss=val_loss,
                     best_val_loss=previous_best_loss,
                     loss_min_delta=loss_min_delta,
+                    val_char_accuracy=val_char_accuracy,
+                    best_val_char_accuracy=previous_best_char,
+                    char_min_delta=char_min_delta,
                 )
                 if improved:
                     print(f"  📈 Improvement detected (accuracy or val_loss)")
@@ -2205,8 +2227,10 @@ class VINFineTuner:
                         'train_loss': train_loss,
                         'val_loss': val_loss,
                         'val_exact_match': val_accuracy,
+                        'val_char_accuracy': val_char_accuracy,
                         'learning_rate': current_lr,
                         'best_val_loss': self.best_val_loss,
+                        'best_val_char_accuracy': self.best_val_char_accuracy,
                     })
                 except Exception as hook_error:
                     logger.warning(

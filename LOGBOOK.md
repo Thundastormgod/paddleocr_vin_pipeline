@@ -49,6 +49,34 @@ Corrections on record, for anyone reading older documents:
 
 ## Entries
 
+### 2026-08-19 — REFUTED: checksum-constrained decoding at the current error rate
+
+**Hypothesis.** Position 9 is deterministic (read at 8%, computable at
+100%) and confusable glyphs (6<->5, 8<->6/0, B->A) are near-ties - so
+CTC prefix beam search + ISO-3779-constrained selection should convert
+near-misses into exact matches without retraining.
+
+**Runs.** Decode-only comparison on identical stage-3b epoch-44 weights,
+val-102 + test-40 (module: core/vin_decode.py, 10 golden tests).
+
+**Result.** Refuted, twice. Ungated constrained selection: val char
+accuracy 0.6661 -> 0.6436 (worse). Gated to edit distance <=1 from the
+top hypothesis: 0.6661 -> 0.6471 (still worse); test-40 mirrored it
+(0.6853 -> 0.6706). Diagnosis: the checksum informs about distance from
+the TRUTH; at the current mean ~5 errors/plate no beam hypothesis is
+near the truth, while ~9% of arbitrary 17-char strings validate - so
+checksum-driven substitutions are pure noise, and position-9 repair
+computes a digit from 16 wrong-ish characters.
+
+**Verdict.** The decoder is algorithmically sound (goldens prove the
+mechanics: it recovers seeded confusions and computes position 9
+correctly when the rest is right) but USELESS BELOW d<=2 - it is kept,
+documented with this limit, and wired into no default path. The
+sequencing is now measured fact: model quality first (GPU/pretrained
+warm start/resolution), constrained decoding after the histogram mass
+reaches d<=2. Checkpoint selection by val char accuracy lands with this
+entry (loss/accuracy decoupling was measured on stage-3b).
+
 ### 2026-08-19 — Stage-3b: 75.5% val char accuracy; val-loss selects the wrong checkpoint
 
 **Hypothesis.** Warm start from stage-1 at peak 3e-4 (evidence-based cap)

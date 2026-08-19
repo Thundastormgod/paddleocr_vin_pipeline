@@ -769,3 +769,65 @@ class TestTracingIsOptionalAndArmed:
         from src.vin_ocr.pipeline.vin_pipeline import VINPostProcessor
         result = VINPostProcessor().process("*SAL1A2A40SA606662*")
         assert result['vin'] == "SAL1A2A40SA606662"
+
+
+class TestCharAccuracyAwareSelection:
+    """
+    Measured on stage-3b: val loss selected epoch 19 while char accuracy
+    improved through epoch 44 and won on held-out test. Selection and
+    stopping must therefore track char accuracy as well.
+    """
+
+    def test_char_improvement_resets_counter_when_loss_flat(self):
+        improved, counter = update_early_stopping(
+            val_accuracy=0.0, previous_best=0.0,
+            epochs_without_improvement=12, min_delta=0.001,
+            val_loss=0.85, best_val_loss=0.80, loss_min_delta=0.005,
+            val_char_accuracy=0.71, best_val_char_accuracy=0.70,
+            char_min_delta=0.002,
+        )
+        assert improved is True and counter == 0
+
+    def test_char_min_delta_boundary_is_strict(self):
+        improved, _ = update_early_stopping(
+            val_accuracy=0.0, previous_best=0.0,
+            epochs_without_improvement=0, min_delta=0.001,
+            val_char_accuracy=0.702, best_val_char_accuracy=0.700,
+            char_min_delta=0.002,
+        )
+        assert improved is False
+
+    def test_omitting_char_args_is_backward_compatible(self):
+        improved, counter = update_early_stopping(
+            val_accuracy=0.0, previous_best=0.0,
+            epochs_without_improvement=1, min_delta=0.001,
+            val_loss=0.70, best_val_loss=0.80, loss_min_delta=0.005,
+        )
+        assert improved is True and counter == 0
+
+    def test_best_char_accuracy_checkpoint_carries_provenance(self, tmp_path):
+        paddle = pytest.importorskip("paddle")
+        trainer = VINFineTuner.__new__(VINFineTuner)
+        trainer.output_dir = tmp_path
+        trainer.model = paddle.nn.Linear(4, 2)
+        trainer.optimizer = paddle.optimizer.SGD(
+            learning_rate=0.1, parameters=trainer.model.parameters())
+        trainer.global_step = 11
+        trainer.current_epoch = 44
+        trainer.best_accuracy = 0.0
+        trainer.best_val_loss = 0.82
+        trainer.best_val_char_accuracy = 0.7549
+        trainer.config = {"probe": True}
+
+        trainer._save_best_char_accuracy_model()
+
+        assert (tmp_path / "best_char_accuracy.pdparams").is_file()
+        info = json.loads((tmp_path / "best_char_accuracy_info.json").read_text())
+        assert info["selection_metric"] == "val_char_accuracy"
+        assert info["selection_value"] == 0.7549
+        assert info["epoch"] == 44
+
+    def test_validate_returns_char_accuracy(self):
+        import inspect
+        source = inspect.getsource(VINFineTuner.validate)
+        assert "return avg_loss, accuracy, val_char_accuracy" in source

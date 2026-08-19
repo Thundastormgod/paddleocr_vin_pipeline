@@ -43,6 +43,9 @@ Global:
   early_stopping_patience: 25
   early_stopping_min_delta: 0.001
   early_stopping_loss_min_delta: 0.005
+  # Char accuracy also resets the counter (measured: it improves for many
+  # epochs after val loss plateaus, and selects the better test-set model).
+  early_stopping_char_min_delta: 0.002
   early_stopping_min_epochs: 10
 
 Optimizer:

@@ -1662,18 +1662,30 @@ class VINFineTuner:
                 # optimizer steps on 12 images never left the ln(34)=3.53
                 # blank plateau; with raw logits the same run overfits.
                 ctc_logits = logits.transpose([1, 0, 2])  # [T, B, C] for CTC
-                # Per-sample input lengths from content width: the loss must
-                # not demand emissions over the black padding (observed live:
-                # a 40-char digit tail decoded over the padded region).
-                input_lengths = paddle.to_tensor(
-                    ctc_input_lengths(
-                        [int(w) for w in batch['valid_width'].reshape([-1])],
-                        total_timesteps=logits.shape[1],
-                        image_width=self.config.get('Global', {}).get('image_width', 320),
-                        label_lengths=[int(l) for l in target_lengths],
-                    ),
-                    dtype='int64',
-                )
+                # CTC input lengths. Default is FULL length: with fixed-width
+                # inputs, supervising the padded timesteps teaches the model
+                # to emit blanks there - CTC's native mechanism - and keeps
+                # the inference contract width-free. Global.ctc_mask_padding
+                # switches to per-sample content-width lengths; measured
+                # consequence of masking: models trained under full-T anchor
+                # emissions anywhere (a legacy checkpoint emitted 10/17
+                # characters inside the padded region), so masking is
+                # incompatible with warm-starting them - its loss jumps to
+                # cold-start levels (~13) despite 201/201 weights loading.
+                if self.config.get('Global', {}).get('ctc_mask_padding', False):
+                    input_lengths = paddle.to_tensor(
+                        ctc_input_lengths(
+                            [int(w) for w in batch['valid_width'].reshape([-1])],
+                            total_timesteps=logits.shape[1],
+                            image_width=self.config.get('Global', {}).get('image_width', 320),
+                            label_lengths=[int(l) for l in target_lengths],
+                        ),
+                        dtype='int64',
+                    )
+                else:
+                    input_lengths = paddle.full(
+                        [logits.shape[0]], logits.shape[1], dtype='int64'
+                    )
                 loss = self.criterion(ctc_logits, labels, input_lengths, target_lengths)
             else:
                 labels = paddle.to_tensor(batch['label'], dtype='int64')  # CrossEntropyLoss needs int64
@@ -1748,16 +1760,21 @@ class VINFineTuner:
                 # RAW logits: warpctc applies softmax internally (see the
                 # training loop). log_softmax here collapsed the gradient.
                 ctc_logits = logits.transpose([1, 0, 2])
-                # Same per-sample input lengths as the training loop.
-                input_lengths = paddle.to_tensor(
-                    ctc_input_lengths(
-                        [int(w) for w in batch['valid_width'].reshape([-1])],
-                        total_timesteps=logits.shape[1],
-                        image_width=self.config.get('Global', {}).get('image_width', 320),
-                        label_lengths=[int(l) for l in target_lengths],
-                    ),
-                    dtype='int64',
-                )
+                # Same input-length policy as the training loop.
+                if self.config.get('Global', {}).get('ctc_mask_padding', False):
+                    input_lengths = paddle.to_tensor(
+                        ctc_input_lengths(
+                            [int(w) for w in batch['valid_width'].reshape([-1])],
+                            total_timesteps=logits.shape[1],
+                            image_width=self.config.get('Global', {}).get('image_width', 320),
+                            label_lengths=[int(l) for l in target_lengths],
+                        ),
+                        dtype='int64',
+                    )
+                else:
+                    input_lengths = paddle.full(
+                        [logits.shape[0]], logits.shape[1], dtype='int64'
+                    )
                 loss = self.criterion(ctc_logits, labels, input_lengths, target_lengths)
             else:
                 # Cross-Entropy Loss path
@@ -1775,8 +1792,10 @@ class VINFineTuner:
             )
             
             # Decode predictions
+            mask_pad = self.config.get('Global', {}).get('ctc_mask_padding', False)
             predictions = self._decode_predictions(
-                logits, [int(w) for w in batch['valid_width'].reshape([-1])]
+                logits,
+                [int(w) for w in batch['valid_width'].reshape([-1])] if mask_pad else None,
             )
             all_predictions.extend(predictions)
             all_targets.extend(targets)
@@ -2372,10 +2391,12 @@ class VINFineTuner:
                 # first-17-timesteps average reported the confidence of
                 # predicting nothing (92.6% for an all-blank model).
                 if self.use_ctc:
+                    mask_pad = self.config.get('Global', {}).get('ctc_mask_padding', False)
                     predictions, batch_conf = \
                         self._ctc_greedy_decode_with_confidence(
                             logits,
-                            [int(w) for w in batch['valid_width'].reshape([-1])],
+                            [int(w) for w in batch['valid_width'].reshape([-1])]
+                            if mask_pad else None,
                         )
                 else:
                     predictions = self._decode_predictions(logits)

@@ -131,12 +131,13 @@ class TestTrainLoopStructure:
             source = inspect.getsource(method)
             assert "paddle.to_tensor(batch['label'], dtype='int32')" in source, method
             assert "dtype='int64').reshape([-1])" in source, method
-            # The exact input_lengths construction (checked as the full
-            # assignment expression - comments also mention input_lengths).
-            assert (
-                "input_lengths = paddle.full([logits.shape[0]], "
-                "logits.shape[1], dtype='int64')" in source
-            ), method
+            # input_lengths are per-sample (content width), int64, via the
+            # pure helper - not a full-T paddle.full.
+            assert "ctc_input_lengths(" in source, method
+            assert "dtype='int64'" in source, method
+            assert "paddle.full([logits.shape[0]]" not in source, (
+                f"{method.__name__} regressed to full-length CTC inputs"
+            )
             ctc_branch = source.split("if self.use_ctc:")[1].split("else:")[0]
             assert "log_softmax(" not in ctc_branch, (
                 f"{method.__name__} feeds normalised probabilities to warpctc"
@@ -361,6 +362,7 @@ class TestDecodeConfidence:
         char_to_idx, idx_to_char = load_char_dict("configs/vin_dict.txt")
         trainer.idx_to_char = idx_to_char
         trainer.char_dict = char_to_idx
+        trainer.config = {}  # decoder reads Global.image_width with a default
         return trainer, char_to_idx
 
     def test_all_blank_output_has_zero_confidence(self, decoder):
@@ -521,3 +523,157 @@ class TestCharMetricsInvariantsSurviveOptimization:
         from src.vin_ocr.evaluation.evaluate import calculate_character_metrics
         with pytest.raises(ValueError):
             calculate_character_metrics(["ABC"], ["ABC", "DEF"])
+
+
+class TestCTCInputLengths:
+    """
+    Deep-dive fix: per-sample CTC input lengths from content width. Full-T
+    lengths force the loss to demand emissions over black padding - the
+    mechanism behind the observed 40-char digit tail over an 80-timestep
+    sequence.
+    """
+
+    def test_lengths_follow_content_width(self):
+        from src.vin_ocr.training.finetune_paddleocr import ctc_input_lengths
+        # stride = 320/80 = 4px per timestep
+        lengths = ctc_input_lengths(
+            valid_widths=[320, 160, 68, 4],
+            total_timesteps=80,
+            image_width=320,
+            label_lengths=[17, 17, 17, 17],
+        )
+        assert lengths == [80, 40, 17, 17]  # last two clamped up to label len
+
+    def test_never_exceeds_total_timesteps(self):
+        from src.vin_ocr.training.finetune_paddleocr import ctc_input_lengths
+        assert ctc_input_lengths([9999], 80, 320, [17]) == [80]
+
+    def test_never_below_label_length(self):
+        """CTC requires input_length >= label_length."""
+        from src.vin_ocr.training.finetune_paddleocr import ctc_input_lengths
+        assert ctc_input_lengths([1], 80, 320, [17]) == [17]
+
+    def test_mismatched_batch_raises(self):
+        from src.vin_ocr.training.finetune_paddleocr import ctc_input_lengths
+        with pytest.raises(ValueError):
+            ctc_input_lengths([320, 160], 80, 320, [17])
+
+    def test_dataset_emits_valid_width(self, tmp_path):
+        paddle = pytest.importorskip("paddle")
+        import numpy as np
+        import cv2
+        from src.vin_ocr.core.charset import load_char_dict
+        from src.vin_ocr.training.finetune_paddleocr import VINRecognitionDataset
+
+        char_to_idx, _ = load_char_dict("configs/vin_dict.txt")
+        img = np.full((96, 640, 3), 128, np.uint8)  # wide plate crop
+        cv2.imwrite(str(tmp_path / "a.jpg"), img)
+        (tmp_path / "labels.txt").write_text("a.jpg\tSAL1A2A40SA606662\n")
+        ds = VINRecognitionDataset(
+            data_dir=str(tmp_path), label_file=str(tmp_path / "labels.txt"),
+            char_dict=char_to_idx, is_training=False,
+        )
+        item = ds[0]
+        assert 'valid_width' in item
+        width = int(item['valid_width'][0])
+        assert 0 < width <= 320
+
+
+class TestBestValLossCheckpoint:
+    """Selection must not depend on exact-match becoming non-zero."""
+
+    def test_best_val_loss_checkpoint_written_with_provenance(self, tmp_path):
+        paddle = pytest.importorskip("paddle")
+        trainer = VINFineTuner.__new__(VINFineTuner)
+        trainer.output_dir = tmp_path
+        trainer.model = paddle.nn.Linear(4, 2)
+        trainer.optimizer = paddle.optimizer.SGD(
+            learning_rate=0.1, parameters=trainer.model.parameters())
+        trainer.global_step = 7
+        trainer.current_epoch = 3
+        trainer.best_accuracy = 0.0
+        trainer.best_val_loss = 0.862
+        trainer.config = {"probe": True}
+
+        trainer._save_best_val_loss_model()
+
+        assert (tmp_path / "best_val_loss.pdparams").is_file()
+        info = json.loads((tmp_path / "best_val_loss_info.json").read_text())
+        assert info["selection_metric"] == "val_loss"
+        assert info["selection_value"] == 0.862
+        assert info["epoch"] == 3
+
+    def test_best_accuracy_checkpoint_carries_provenance_too(self, tmp_path):
+        """The six-month-stale-best hazard: 'best' must say when/what."""
+        paddle = pytest.importorskip("paddle")
+        trainer = VINFineTuner.__new__(VINFineTuner)
+        trainer.output_dir = tmp_path
+        trainer.model = paddle.nn.Linear(4, 2)
+        trainer.optimizer = paddle.optimizer.SGD(
+            learning_rate=0.1, parameters=trainer.model.parameters())
+        trainer.global_step = 9
+        trainer.current_epoch = 5
+        trainer.best_accuracy = 0.25
+        trainer.best_val_loss = 1.0
+        trainer.config = {"probe": True}
+
+        trainer._save_best_model()
+
+        info = json.loads((tmp_path / "best_accuracy_info.json").read_text())
+        assert info["selection_metric"] == "val_exact_match_accuracy"
+        assert info["selection_value"] == 0.25
+
+
+class TestTrainerMetricsAreCanonical:
+    """
+    Deep-dive finding: _calculate_detailed_metrics - the producer of
+    training_metrics.json, which the Optuna tuner scores from - inlined one
+    more positional char loop with the invalid-char FP hole, plus a fifth
+    inline Levenshtein.
+    """
+
+    def _metrics(self, predictions, gts):
+        trainer = VINFineTuner.__new__(VINFineTuner)
+        return VINFineTuner._calculate_detailed_metrics(
+            trainer, predictions, gts, [0.9] * len(predictions)
+        )
+
+    def test_char_metrics_match_canonical(self):
+        pytest.importorskip("paddle")
+        from src.vin_ocr.core.char_metrics import char_level_metrics
+
+        gt = "SAL1A2A40SA606662"
+        preds = [gt[:5], "*" + gt[:-1], gt]
+        out = self._metrics(preds, [gt] * 3)
+        canonical = char_level_metrics([(p[:17], gt) for p in preds])
+        cl = out['character_level']
+        assert cl['f1_micro'] == pytest.approx(canonical.f1_micro)
+        assert cl['character_accuracy'] == pytest.approx(canonical.char_accuracy)
+        assert cl['micro_precision'] == pytest.approx(canonical.precision)
+
+    def test_shift_probe_no_longer_collapses(self):
+        pytest.importorskip("paddle")
+        gt = "SAL1A2A40SA606662"
+        out = self._metrics(["*" + gt[:-1]], [gt])
+        # positional scoring gave ~0.059 for this 94%-correct prediction
+        assert out['character_level']['character_accuracy'] > 0.8
+
+    def test_no_inline_levenshtein_remains(self):
+        source = TRAINER_PATH.read_text(encoding="utf-8")
+        assert "_levenshtein_distance" not in source
+
+    def test_no_debug_prints_in_metrics_path(self):
+        """AST check: comments legitimately DESCRIBE the removed hack."""
+        import inspect as _inspect
+        import textwrap
+        source = textwrap.dedent(
+            _inspect.getsource(VINFineTuner._calculate_comprehensive_metrics)
+        )
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                    and node.func.id == 'print':
+                pytest.fail(f"print() in the metrics path at line {node.lineno}")
+            if isinstance(node, ast.Attribute) and node.attr == 'path' \
+                    and isinstance(node.value, ast.Name) and node.value.id == 'sys':
+                pytest.fail(f"sys.path manipulation at line {node.lineno}")

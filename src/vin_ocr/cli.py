@@ -165,18 +165,23 @@ def main():
     
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
-    # Recognize command
+    # Recognize command. --model has NO phantom default: the old default
+    # pointed at output/onnx/final_test.onnx, a file that does not exist in
+    # this repository - the command failed out of the box while implying
+    # such an artifact ships with the project.
     recognize_parser = subparsers.add_parser('recognize', help='Recognize VIN from image')
     recognize_parser.add_argument('image', help='Path to image file')
-    recognize_parser.add_argument('--model', '-m', default='output/onnx/final_test.onnx',
-                                  help='Path to model (ONNX or Paddle inference dir)')
+    recognize_parser.add_argument('--model', '-m', required=True,
+                                  help='Path to model: .onnx file or Paddle inference dir '
+                                       '(a dir containing inference.json + inference.pdiparams; '
+                                       'see TRAINING_RUNBOOK.md section 9 for registered models)')
     recognize_parser.add_argument('--json', '-j', action='store_true', help='Output as JSON')
     
     # Batch command
     batch_parser = subparsers.add_parser('batch', help='Batch process folder')
     batch_parser.add_argument('folder', help='Path to folder with images')
-    batch_parser.add_argument('--model', '-m', default='output/onnx/final_test.onnx',
-                              help='Path to model')
+    batch_parser.add_argument('--model', '-m', required=True,
+                              help='Path to model (.onnx or Paddle inference dir)')
     batch_parser.add_argument('--output', '-o', help='Output JSON file')
     
     # Serve command

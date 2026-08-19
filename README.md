@@ -264,7 +264,7 @@ This installs all core dependencies including:
 ```bash
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"      # or ".[all]" for web + training + onnx
-pytest                        # 371 tests (358 run, 13 skipped), no GPU or model weights required
+pytest                        # full suite; no GPU or model weights required
 ```
 
 Copy `.env.example` to `.env` and fill in credentials (DagsHub tokens, device
@@ -563,7 +563,7 @@ paddleocr_vin_pipeline/
 │
 ├── configs/                  # Training configs + vin_dict.txt charset
 ├── scripts/                  # Standalone ONNX / data utilities
-├── tests/                    # 371 tests (no GPU or weights needed)
+├── tests/                    # regression suite (no GPU or weights needed)
 ├── docker/                   # CPU + GPU images, compose, entrypoint
 ├── .github/workflows/ci.yml  # Tests, lint, secrets scan, build
 │

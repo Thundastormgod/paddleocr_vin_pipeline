@@ -131,13 +131,12 @@ class TestTrainLoopStructure:
             source = inspect.getsource(method)
             assert "paddle.to_tensor(batch['label'], dtype='int32')" in source, method
             assert "dtype='int64').reshape([-1])" in source, method
-            # input_lengths are per-sample (content width), int64, via the
-            # pure helper - not a full-T paddle.full.
+            # input lengths are flag-gated: full-T by default (padding
+            # learns blanks; width-free inference contract), per-sample
+            # content-width lengths under Global.ctc_mask_padding.
+            assert "ctc_mask_padding" in source, method
             assert "ctc_input_lengths(" in source, method
             assert "dtype='int64'" in source, method
-            assert "paddle.full([logits.shape[0]]" not in source, (
-                f"{method.__name__} regressed to full-length CTC inputs"
-            )
             ctc_branch = source.split("if self.use_ctc:")[1].split("else:")[0]
             assert "log_softmax(" not in ctc_branch, (
                 f"{method.__name__} feeds normalised probabilities to warpctc"
@@ -677,3 +676,54 @@ class TestTrainerMetricsAreCanonical:
             if isinstance(node, ast.Attribute) and node.attr == 'path' \
                     and isinstance(node.value, ast.Name) and node.value.id == 'sys':
                 pytest.fail(f"sys.path manipulation at line {node.lineno}")
+
+
+class TestPaddingMaskIsOptInAndLegacyCompatible:
+    """
+    Measured on the legacy checkpoint: it emits 10/17 characters INSIDE the
+    padded region (timesteps 64-79 of 80 at valid_T=64) - full-T-trained
+    models anchor emissions anywhere. Masking must therefore be opt-in:
+    default full-T supervision keeps warm starts valid and teaches blanks
+    over padding; the mask flag exists for fresh anchored-emission runs.
+    """
+
+    def test_default_config_does_not_mask(self):
+        import yaml
+        config = yaml.safe_load(
+            (REPO_ROOT / "configs" / "vin_finetune_config.yml").read_text()
+        )
+        assert not config['Global'].get('ctc_mask_padding', False)
+
+    def test_decode_is_unmasked_when_widths_none(self):
+        paddle = pytest.importorskip("paddle")
+        import numpy as np
+        from src.vin_ocr.core.charset import load_char_dict
+
+        trainer = VINFineTuner.__new__(VINFineTuner)
+        char_to_idx, idx_to_char = load_char_dict("configs/vin_dict.txt")
+        trainer.idx_to_char = idx_to_char
+        trainer.config = {}
+        # emission at timestep 70 of 80 - inside would-be padding
+        logits = np.full((1, 80, 34), -10.0, dtype='float32')
+        logits[0, 70, char_to_idx['M']] = 10.0
+        texts, _ = trainer._ctc_greedy_decode_with_confidence(
+            paddle.to_tensor(logits), valid_widths=None
+        )
+        assert texts == ['M'], "unmasked decode must see late emissions"
+
+    def test_decode_masks_when_widths_given(self):
+        paddle = pytest.importorskip("paddle")
+        import numpy as np
+        from src.vin_ocr.core.charset import load_char_dict
+
+        trainer = VINFineTuner.__new__(VINFineTuner)
+        char_to_idx, idx_to_char = load_char_dict("configs/vin_dict.txt")
+        trainer.idx_to_char = idx_to_char
+        trainer.config = {}
+        logits = np.full((1, 80, 34), -10.0, dtype='float32')
+        logits[0, 70, char_to_idx['M']] = 10.0  # beyond valid_T=64
+        logits[0, 10, char_to_idx['S']] = 10.0  # inside content
+        texts, _ = trainer._ctc_greedy_decode_with_confidence(
+            paddle.to_tensor(logits), valid_widths=[253]  # ceil(253/4)=64
+        )
+        assert texts == ['S'], "masked decode must ignore pad-region emissions"

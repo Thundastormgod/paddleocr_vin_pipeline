@@ -49,6 +49,58 @@ Corrections on record, for anyone reading older documents:
 
 ## Entries
 
+### 2026-08-19 — Emission anchoring: why padding masks break warm starts
+
+**Hypothesis.** Per-sample CTC input lengths (mask the padded timesteps)
+are a strictly better training objective - the padded tail garbage
+observed at n=1 suggests the model wastes emissions there.
+
+**Result.** Refuted for warm starts, by direct measurement. The legacy
+checkpoint decodes a correct-format VIN yet places its emissions at
+timesteps [0,2,3,59..79] of 80 - 10 of 17 characters INSIDE the padded
+region (valid_T=64 for that sample). Full-T-trained CTC models anchor
+emissions anywhere; the transformer neck owes nothing to visual columns.
+Under the masked objective the same 201/201-loaded weights scored
+cold-start loss (13.18 vs 0.69 unmasked): the mask cuts off the very
+timesteps the model emits in, so no alignment exists.
+
+**Change.** `Global.ctc_mask_padding` flag, default FALSE: full-T
+supervision is the simpler-correct objective for fixed-width inputs
+(padding learns blanks - CTC's native mechanism - and the inference
+contract stays width-free). The mask remains available for fresh runs
+wanting anchored emissions; decode-time masking follows the same flag.
+Pinned by decode tests (late-emission visible unmasked, ignored masked).
+
+**Verdict.** Stage-3 relaunched unmasked from the stage-1 checkpoint at
+peak 3e-4 (run `7bac56fa8a8c443eb710fddb50e3a57a`): first-batch loss
+0.69 - warm start intact.
+
+### 2026-08-19 — Stage-2 continuation: warm start + high re-warmup is a mistake
+
+**Hypothesis.** Warm-starting from the epoch-26 checkpoint with a fresh
+120-epoch cosine (peak 1e-3) continues the val-loss descent.
+
+**Runs.** MLflow `914573dda4754abbaad6b272c9460c43`.
+
+**Result.** Refuted. Epochs 1-2 (LR ramping 2e-4 -> 4e-4) improved val
+loss 0.853 -> 0.847; the ramp to 1e-3 then knocked the model out of its
+basin (val loss 1.2-1.7) and it never returned below the epoch-11 best of
+0.8309. The loss-aware stopper (shipped mid-stage-1) worked exactly as
+designed: stop at epoch 36 after 25 genuinely non-improving epochs.
+Final eval at the perturbed epoch-36 weights: char accuracy 44.52%
+(vs 52.19% at stage-1's kill point). The run predates the
+best_val_loss checkpoint, so the epoch-11 state was not saved
+(save_epoch_step=5; nearest artifacts epoch_10/epoch_15).
+
+**Verdict.** Continuation runs need a LOW peak LR: the evidence is the
+improvement under 2-4e-4 and the destruction at 1e-3. Stage-3 launched
+from the stage-1 checkpoint at peak 3e-4 (warmup 2, cosine 60,
+loss-aware stopper, min_epochs 10) - and under the fixed trainer it
+saves best-by-val-loss checkpoints and streams per-epoch curves to
+MLflow. Also observed: paddle.jit static-graph export failed inside
+both long training processes while succeeding in short probes; exports
+without the graph file are now labelled INCOMPLETE instead of ✅.
+
 ### 2026-08-18 — First tracked training run on the real dataset (n=2,387)
 
 **Hypothesis.** With the trainer fixed (CTC contract, checkpoints) and the

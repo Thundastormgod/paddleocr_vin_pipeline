@@ -111,3 +111,4 @@ mlflow.db
 mlflow.db-journal
 mlartifacts/
 mlruns/
+/finetune_data

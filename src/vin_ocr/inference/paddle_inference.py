@@ -81,9 +81,14 @@ class VINInference:
         return char_to_idx
     
     def _load_model(self):
-        """Load the Paddle inference model."""
-        from paddle import inference
-        
+        """
+        Load the Paddle inference model.
+
+        File-existence checks run BEFORE the paddle import: a wrong path
+        must surface as FileNotFoundError, not as an ImportError about a
+        runtime the caller may already have (same contract as the ONNX
+        backend).
+        """
         # Find model files
         model_file = None
         params_file = self.model_dir / "inference.pdiparams"
@@ -98,6 +103,8 @@ class VINInference:
         
         if not params_file.exists():
             raise FileNotFoundError(f"Params file not found: {params_file}")
+        
+        from paddle import inference
         
         # Create config
         config = inference.Config(str(model_file), str(params_file))

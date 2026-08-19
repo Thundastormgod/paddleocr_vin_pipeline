@@ -727,3 +727,45 @@ class TestPaddingMaskIsOptInAndLegacyCompatible:
             paddle.to_tensor(logits), valid_widths=[253]  # ceil(253/4)=64
         )
         assert texts == ['S'], "masked decode must ignore pad-region emissions"
+
+
+class TestTracingIsOptionalAndArmed:
+    """Tracing must be a no-op without enable_tracing(), loud when broken."""
+
+    def test_traced_is_passthrough_when_disabled(self):
+        from src.vin_ocr.tracking import tracing
+        tracing.disable_tracing()
+
+        calls = {}
+
+        @tracing.traced(name="probe", span_type="CHAIN")
+        def fn(x):
+            calls['ran'] = True
+            return x + 1
+
+        assert fn(1) == 2 and calls['ran']
+        assert not tracing.is_enabled()
+
+    def test_enable_tracing_reports_failure_not_crash(self, monkeypatch):
+        import builtins
+        from src.vin_ocr.tracking import tracing
+        tracing.disable_tracing()
+
+        real_import = builtins.__import__
+
+        def no_mlflow(name, *args, **kwargs):
+            if name == 'mlflow' or name.startswith('mlflow.'):
+                raise ImportError('mlflow not installed')
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, '__import__', no_mlflow)
+        assert tracing.enable_tracing() is False
+        assert not tracing.is_enabled()
+
+    def test_pipeline_imports_without_tracing_enabled(self):
+        """The decorated pipeline must work untraced (mlflow-free path)."""
+        from src.vin_ocr.tracking import tracing
+        tracing.disable_tracing()
+        from src.vin_ocr.pipeline.vin_pipeline import VINPostProcessor
+        result = VINPostProcessor().process("*SAL1A2A40SA606662*")
+        assert result['vin'] == "SAL1A2A40SA606662"

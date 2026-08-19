@@ -176,6 +176,11 @@ INVALID_CHAR_FIXES: Dict[str, str] = {
 # survived its first fix - it was corrected in this file and left live in the
 # corrector. See the commentary next to the definitions in core/vin_utils.py.
 from ..core.vin_utils import ARTIFACT_CHARS, NON_VIN_RUN as _NON_VIN_RUN
+# Optional MLflow tracing (no-op until tracking.tracing.enable_tracing()):
+# root recognition = CHAIN, engine call = TOOL, postprocess = PARSER, per
+# MLflow's instrumentation skill. The pipeline stays importable and fast
+# without mlflow installed.
+from ..tracking.tracing import traced
 
 # Position-based character confusion (for ambiguous cases).
 # Positions 12-17 hold the sequential production number, which is *usually*
@@ -385,6 +390,7 @@ class VINPostProcessor:
         """
         self.verbose = verbose
     
+    @traced(name="VINPostProcessor.process", span_type="PARSER")
     def process(self, raw_text: str, confidence: float = 0.0) -> Dict[str, Any]:
         """
         Process raw OCR output to extract and correct VIN.
@@ -679,6 +685,7 @@ class VINOCRPipeline:
         if self.verbose:
             print("Pipeline initialized.")
     
+    @traced(name="VINOCRPipeline.recognize", span_type="CHAIN")
     def recognize(self, image_path: Union[str, Path, np.ndarray]) -> Dict[str, Any]:
         """
         Recognize VIN from an image.
@@ -752,10 +759,7 @@ class VINOCRPipeline:
         if self.verbose:
             print("Running OCR...")
             
-        try:
-            result = self.ocr.predict(processed)
-        except Exception as e:
-            raise OCREngineError(f"OCR prediction failed: {e}") from e
+        result = self._run_ocr_engine(processed)
         
         # Extract text and confidence
         raw_text, confidence = self._extract_ocr_result(result)
@@ -840,6 +844,14 @@ class VINOCRPipeline:
             
         return results
     
+    @traced(name="PaddleOCR.predict", span_type="TOOL")
+    def _run_ocr_engine(self, processed: np.ndarray):
+        """Invoke the PaddleOCR engine (traced as an external tool call)."""
+        try:
+            return self.ocr.predict(processed)
+        except Exception as e:
+            raise OCREngineError(f"OCR prediction failed: {e}") from e
+
     def _extract_ocr_result(self, result: Any) -> Tuple[str, float]:
         """
         Extract text and confidence from PaddleOCR result.

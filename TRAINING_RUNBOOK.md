@@ -109,3 +109,28 @@ bottom of the logbook). Numbers without a run ID do not exist.
 ```bash
 vin-reproduce <run_id>          # or python -m src.vin_ocr.tracking.reproduce <run_id>
 ```
+
+## 9. Model versions and traces (MLflow 3)
+
+**Registry** — every promotable checkpoint becomes a version of the
+registered model `vin-recognizer` (UI → Models tab). A version is a
+pyfunc carrying checkpoint + config + charset + canonical decode - the
+deployable unit, not a bare state dict. Metrics are MEASURED at
+registration on a named dataset (never transcribed):
+
+```python
+from src.vin_ocr.tracking.model_registry import register_checkpoint_version
+register_checkpoint_version(
+    "output/vin_rec_finetune_stage3/best_val_loss.pdparams",
+    stage_label="stage-3b-best-val-loss",
+    source_run_id="<training run id>",
+)
+```
+
+**Traces** — `vin-ocr recognize|batch` arms MLflow tracing automatically
+when the [tracking] extra is installed (`--no-trace` to disable;
+`MLFLOW_TRACKING_URI` honoured, else the repo SQLite store). Spans:
+recognize (CHAIN) -> PaddleOCR.predict (TOOL) -> postprocess (PARSER).
+Checkpoint-path tracing: `tracking.model_registry.traced_recognize()`
+(preprocess/forward/decode/validate spans). View: UI -> vin_finetune ->
+Traces tab.

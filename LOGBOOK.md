@@ -49,6 +49,36 @@ Corrections on record, for anyone reading older documents:
 
 ## Entries
 
+### 2026-08-19 — Stage-3b: 75.5% val char accuracy; val-loss selects the wrong checkpoint
+
+**Hypothesis.** Warm start from stage-1 at peak 3e-4 (evidence-based cap)
+continues the descent that 1e-3 destroyed.
+
+**Runs.** MLflow `7bac56fa8a8c443eb710fddb50e3a57a`; registry versions
+v2 (epoch-19 best-val-loss) and v3 (epoch-44 final).
+
+**Result.** Confirmed. Early-stopped at epoch 44 (loss-aware, honest:
+25 epochs past the epoch-19 val-loss best of 0.7782). Final val
+(n=102): **char accuracy 75.49%, F1 0.786**, exact 0/102 - versus
+stage-1's 52.19% (positional) / 59.98% (canonical, same weights).
+Held-out TEST (n=40, VIN-disjoint): epoch-44 weights **68.53% char /
+F1 0.7491**, beating the epoch-19 best-val-loss checkpoint (66.91% /
+0.7357) - **validation LOSS kept selecting epoch 19 while char accuracy
+kept improving through 44**. Loss/accuracy decoupling is now a measured
+fact of this setup; checkpoint selection should track val char accuracy
+directly (open item).
+
+**Also observed at run end.** jit.save failed AFTER writing
+inference.json; the weights-only fallback then overwrote pdiparams,
+producing a mixed-format directory that failed deserialization - caught
+by the inference test the moment the graph file appeared. Fallback now
+removes partial jit output first (fixed in 73b96a4).
+
+**Verdict.** Third confirmation of the continuation schedule; the
+per-char ceiling is now the rare-pattern-family tail and CPU epoch
+budget. Next lever: GPU + rare-family oversampling, and a val-char-acc
+selection metric.
+
 ### 2026-08-19 — Emission anchoring: why padding masks break warm starts
 
 **Hypothesis.** Per-sample CTC input lengths (mask the padded timesteps)

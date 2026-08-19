@@ -2765,6 +2765,19 @@ class VINFineTuner:
             # jit.save failed, the fallback wrote inference.pdiparams, and
             # the "exported" claim shipped an inference dir that
             # FileNotFoundError'd at load time.
+            #
+            # CRITICAL: remove any PARTIAL jit output first. Observed live
+            # (stage-3b): jit.save failed after writing inference.json, the
+            # fallback then overwrote inference.pdiparams with a raw state
+            # dict, and the resulting MIXED artifact (jit graph + state-dict
+            # params) failed deserialization at load time - a corrupt dir
+            # that looked servable to any graph-file existence check.
+            for stale in ('inference.json', 'inference.pdmodel',
+                          'inference.pdiparams', 'inference.pdiparams.info'):
+                stale_path = inference_dir / stale
+                if stale_path.exists():
+                    stale_path.unlink()
+                    logger.warning(f"Removed partial jit output: {stale}")
             logger.warning(
                 "Static-graph export FAILED; writing weights-only fallback. "
                 "This directory canNOT serve inference (VINInference needs "

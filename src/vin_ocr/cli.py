@@ -156,6 +156,12 @@ def main():
         description='VIN OCR Pipeline - Recognize Vehicle Identification Numbers from images',
     )
     parser.add_argument('--version', action='version', version='%(prog)s 1.0.0')
+    parser.add_argument(
+        '--no-trace', action='store_true',
+        help='Disable MLflow tracing (on by default when the tracking '
+             'extra is installed; traces land in experiment "vin_finetune" '
+             'at MLFLOW_TRACKING_URI or the repo SQLite store)',
+    )
     
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
@@ -189,6 +195,14 @@ def main():
     if args.command is None:
         parser.print_help()
         return 0
+    
+    # Entry-point tracing (MLflow instrumentation-skill pattern for custom
+    # code: no autolog exists for a paddle inference stack, so the pipeline
+    # carries @mlflow.trace spans armed here). Loud no-op when the tracking
+    # extra is absent; the recognizer never depends on it.
+    if args.command in ('recognize', 'batch') and not args.no_trace:
+        from src.vin_ocr.tracking.tracing import enable_tracing
+        enable_tracing()
     
     commands = {
         'recognize': cmd_recognize,

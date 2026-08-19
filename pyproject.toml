@@ -68,8 +68,9 @@ tracking = [
     # answer "what code and what data produced this number" never depends on
     # an optional package being present.
     #
-    # >=2.9 for mlflow.artifacts.download_artifacts, used by the reproduce CLI.
-    "mlflow>=2.9",
+    # >=3.1 for the LoggedModel entity, model_id-linked metrics and
+    # tracing spans (traces + model registry both require MLflow 3).
+    "mlflow>=3.1",
 ]
 onnx = [
     "onnx>=1.15.0",

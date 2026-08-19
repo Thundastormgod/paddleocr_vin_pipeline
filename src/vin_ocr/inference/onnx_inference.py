@@ -100,6 +100,13 @@ class ONNXVINRecognizer:
             char_dict_path: Optional path to character dictionary file
         """
         self.model_path = Path(model_path)
+        # Contract: a missing model file is FileNotFoundError, checked
+        # BEFORE anything else. The previous order imported onnxruntime
+        # first, so on a machine without the runtime a simple wrong path
+        # surfaced as ImportError - misdirecting the caller to install a
+        # dependency they may already have, for a file that isn't there.
+        if not self.model_path.is_file():
+            raise FileNotFoundError(f"ONNX model not found: {self.model_path}")
         self.config = config or ONNXInferenceConfig()
         self.session = None
         self.input_name = None

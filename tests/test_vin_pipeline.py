@@ -372,12 +372,19 @@ class TestVINPostProcessor:
 class TestVINOCRPipelineIntegration:
     """Integration tests for the full pipeline."""
     
-    @pytest.mark.skipif(
-        not Path(__file__).parent.parent.joinpath('vin_pipeline.py').exists(),
-        reason="Pipeline module not found"
-    )
     def test_pipeline_initialization(self):
-        """Test that pipeline initializes without error."""
+        """
+        Test that pipeline initializes without error.
+
+        This test carried a skipif guard checking that ROOT-LEVEL
+        ``vin_pipeline.py`` exists - the pre-restructure module path. After
+        the move to src/vin_ocr/pipeline/, the guard was permanently true
+        and this integration test was silently skipped forever: quiet
+        happy-path erosion. Capability-based skipping (the
+        ConfigurationError below) is the only skip mechanism allowed here;
+        a hygiene test now bans source-path-based skip conditions in the
+        whole suite.
+        """
         try:
             pipeline = VINOCRPipeline(preprocess_mode='none')
             assert pipeline is not None

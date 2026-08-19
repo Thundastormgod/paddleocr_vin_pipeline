@@ -246,3 +246,85 @@ class TestBatchInference:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestErrorContractOrdering:
+    """
+    A wrong model path must surface as FileNotFoundError - never as an
+    ImportError about a runtime the caller may already have. Proven with
+    the runtime import BLOCKED, so the ordering is what's under test.
+    """
+
+    def _block(self, monkeypatch, module_prefix):
+        import builtins
+        real_import = builtins.__import__
+
+        def blocked(name, *args, **kwargs):
+            if name == module_prefix or name.startswith(module_prefix + "."):
+                raise ImportError(f"{module_prefix} not installed")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", blocked)
+
+    def test_onnx_missing_file_is_filenotfound_even_without_runtime(
+        self, monkeypatch, tmp_path
+    ):
+        from src.vin_ocr.inference.onnx_inference import ONNXVINRecognizer
+
+        self._block(monkeypatch, "onnxruntime")
+        with pytest.raises(FileNotFoundError):
+            ONNXVINRecognizer(str(tmp_path / "no_such_model.onnx"))
+
+    def test_paddle_missing_files_are_filenotfound_even_without_paddle(
+        self, monkeypatch, tmp_path
+    ):
+        from src.vin_ocr.inference.paddle_inference import VINInference
+
+        (tmp_path / "vin_dict.txt").write_text(
+            "<blank>\n" + "\n".join("0123456789ABCDEFGHJKLMNPRSTUVWXYZ") + "\n"
+        )
+        self._block(monkeypatch, "paddle")
+        with pytest.raises(FileNotFoundError) as excinfo:
+            VINInference(str(tmp_path))
+        assert "No model file found" in str(excinfo.value)
+
+
+class TestNoSourcePathSkipGuards:
+    """
+    Suite hygiene: a skipif condition referencing a SOURCE-FILE path rots
+    when files move - test_pipeline_initialization was silently skipped
+    forever because its guard checked the pre-restructure root-level
+    vin_pipeline.py. Skip conditions must be capability-based (imports,
+    ConfigurationError), never file-layout-based.
+    """
+
+    def test_no_skipif_condition_references_a_py_path(self):
+        import ast
+
+        offenders = []
+        for test_file in Path(__file__).parent.glob("test_*.py"):
+            tree = ast.parse(test_file.read_text(encoding="utf-8"))
+            source = test_file.read_text(encoding="utf-8")
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                    continue
+                for deco in node.decorator_list:
+                    if not (
+                        isinstance(deco, ast.Call)
+                        and isinstance(deco.func, ast.Attribute)
+                        and deco.func.attr == "skipif"
+                    ):
+                        continue
+                    segment = ast.get_source_segment(source, deco) or ""
+                    for const in ast.walk(deco):
+                        if (
+                            isinstance(const, ast.Constant)
+                            and isinstance(const.value, str)
+                            and const.value.endswith(".py")
+                        ):
+                            offenders.append(
+                                f"{test_file.name}:{deco.lineno} -> {segment[:80]}"
+                            )
+        assert offenders == [], (
+            f"source-path-based skip guards rot on restructure: {offenders}"
+        )

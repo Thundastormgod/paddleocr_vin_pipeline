@@ -390,6 +390,43 @@ never indistinguishable from a provenanced one.
 **Effect on model metrics.** None. This changes what is recorded, not what is
 computed. No baseline number should move as a result of this entry.
 
+### 2026-08-19 — Head-to-head: stock PaddleOCR pipeline vs fine-tuned v3
+
+**Hypothesis.** After the full dependency install, the stock pretrained engine
+(PP-OCRv3 mobile det+rec inside `VINOCRPipeline`, engraved preprocessing,
+postprocessor on) scored an exact match at 0.98 confidence on the bundled
+plate; if that generalises, the from-scratch fine-tune is not the production
+path.
+
+**Change.** No code change — a measurement. Same val-102/test-40 splits, same
+canonical `char_level_metrics`, prediction = pipeline `vin` field.
+
+**Runs.** `15525c804771492c91a0b47bd6a83067` (head2head-stock-pipeline) vs
+stage-3b `7bac56fa` (registry `vin-recognizer` v3).
+
+**Result.**
+
+| metric | stock, val-102 | v3, val-102 | stock, test-40 | v3, test-40 |
+|---|---|---|---|---|
+| exact match | **25.5%** (26) | 0% | **37.5%** (15) | 0% |
+| char accuracy | **82.70%** | 66.61% | **87.79%** | 68.53% |
+| F1 (micro) | **0.857** | ~0.69 | **0.905** | 0.749 |
+| CER | **0.173** | 0.334 | **0.122** | 0.315 |
+
+Throughput ~0.18 s/image on CPU (dedup cache off, n=142, errors=0).
+
+**Verdict.** Decisive: the stock pretrained engine beats the from-scratch
+fine-tune by +16-19 points char accuracy and 26/142 → 41/142 exact matches vs
+zero. Training from random init on 2,387 crops was never competitive with
+weights pretrained on millions of text lines — improvement-ladder #2
+(pretrained warm start) is hereby promoted from "next candidate" to the only
+sanctioned training path. Practical consequences: (1) production default
+today is the stock engine + this repo's pre/post-processing; (2) all future
+fine-tunes start from `en_PP-OCRv3` rec weights and must beat THIS baseline
+(82.70% val char, 25.5% val exact), not the from-scratch numbers; (3) the
+from-scratch v1-v3 registry entries remain as the honest record of that
+refuted route.
+
 ### Template for the next entry
 
 ```

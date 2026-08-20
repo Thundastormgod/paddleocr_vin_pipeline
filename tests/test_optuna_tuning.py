@@ -4,9 +4,10 @@ Regression tests for the Optuna hyperparameter search.
 The defect these principally pin is a fabrication mechanism, not a style
 problem: a trial whose training crashed was scored from the PREVIOUS trial's
 metrics file and that number was returned to Optuna as a genuine observation.
-Since ``optuna_results/`` is the only machine-measured corpus this project has
-- and the source of its 41.86% (18/43) baseline - any trial in it that crashed
-silently carries a neighbour's accuracy under its own hyperparameters.
+The pre-audit trial corpus this produced (removed from the repo 2026-08-20;
+in git history only) could therefore carry a neighbour's accuracy under a
+crashed trial's own hyperparameters - which is why no number from it is
+citable and the fixed tuner fails loudly instead of guessing.
 """
 
 import json

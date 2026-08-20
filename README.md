@@ -1,245 +1,53 @@
 # PaddleOCR VIN Recognition Pipeline
 
-A complete OCR pipeline for Vehicle Identification Number (VIN) recognition 
-from engraved metal plates, using PaddleOCR with specialized preprocessing 
-and postprocessing.
+A complete OCR pipeline for Vehicle Identification Number (VIN) recognition
+from engraved metal plates: PaddleOCR engine + VIN-specific preprocessing,
+postprocessing (artifact stripping, charset fixes, ISO-3779 checksum),
+training, tracked evaluation, and a web UI.
 
 ---
 
-## Key Metrics (Current Performance)
+## Measured Performance (2026-08-20)
 
-Rule-based pipeline (PaddleOCR + preprocessing + postprocessing).
-**Measured on n=20 images**, not the full 381-image set — see the correction below.
+Every number below was measured by a tracked MLflow run in experiment
+`model_comparison` (one run per model, identical VIN-disjoint splits,
+canonical character metrics, single-image basis). No other performance
+numbers in this repository's history are citable; see `LOGBOOK.md` for the
+full measurement record and the removal of the fabrication-era documents.
 
-| Metric                   | Value | Baseline | Improvement |
-|--------------------------|-------|----------|-------------|
-| **Character-Level F1**   | 55.3% | 43%      | +29%        |
-| **Exact Match Rate**     | 25%   | 5%       | 1/20 → 5/20 |
+| Model | val-102 char / exact | test-40 char / exact |
+|---|---|---|
+| **PP-OCRv3-mobile + pipeline (production default)** | **82.70% / 25.5%** | **87.79% / 37.5%** |
+| PP-OCRv3-mobile + pipeline, postprocessor OFF | 77.51% / 8.8% | 81.03% / 5.0% |
+| LCNetV3-SVTR-CTC-ep44 +postproc | 68.28% / 0% | 68.38% / 0% |
+| LCNetV3-SVTR-CTC-ep44 (registry v3, alias `best`) | 66.61% / 0% | 68.53% / 0% |
+| LCNetV3-SVTR-CTC-ep19 best-val-loss (v2) | 64.13% / 0% | 66.91% / 0% |
+| LCNetV3-SVTR-CTC-ep25 (v1) | 59.98% / 0% | 60.88% / 0% |
+| LCNetV3-SVTR-CTC-ep36 warm-restart (refuted) | 38.06% / 0% | 42.94% / 0% |
 
-Pipeline precision/recall were **not numerically recorded** — the source
-artifact (`results/experiment_summary.json`) stores them as the string
-`"improved"`. Baseline (raw PaddleOCR) precision/recall from
-`results/detailed_metrics.json`: **41.7% / 44.4%**.
+Reading the table:
 
-> **Note:** Industry target is 95%+ exact match and 98%+ F1.
-> This pipeline establishes a baseline for further development.
->
-> **Statistical caveat:** at n=20 the 95% CI on the 25% figure is [0.11, 0.47].
-> The most recent recorded run of this pipeline
-> (`results/batch_evaluation_20260203_150634.json`, n=5, PP-OCRv5) scored
-> **0/5 exact match, 31.8% character accuracy**. None of these sample sizes
-> support the headline numbers. A full 382-image evaluation has not been run.
+- **Production default** is the stock PaddleOCR `PP-OCRv3_mobile_det` +
+  `en_PP-OCRv3_mobile_rec` engine wrapped in this repo's preprocessing and
+  postprocessing. The postprocessor alone contributes +16.7pp (val) /
+  +32.5pp (test) exact match.
+- **LCNetV3-SVTR-CTC** is the custom from-scratch model family (3.23M
+  params). It is a refuted route - kept in the MLflow registry
+  (`vin-lcnetv3-svtr-ctc`) as the honest record - because 2,387 training
+  crops cannot compete with industrial-scale pretraining.
+- Industry target for this domain is ~95%+ exact match; nothing here is
+  production-ready yet. The measured improvement ladder (GPU + pretrained
+  warm start + input resolution) lives in `LOGBOOK.md`.
+- Dataset: 2,529 crops from DagsHub `Thundastormgod/jlr-vin-ocr`,
+  VIN-grouped splits 2,387/102/40, 100% checksum-valid labels, pinned by
+  `finetune_data.dvc`.
 
-### ⚠️ Status of the fine-tuned model numbers
+Reproduce the table:
 
-Three different figures for the *fine-tuned* model circulate in this repo and
-they do not agree. Read this before quoting any of them:
-
-| Source | Exact match | Provenance |
-|--------|-------------|------------|
-| `VIN_OCR_Architecture_Performance.md` | 46.51% | Labelled "~0.5 hours (**simulated**)" — not measured |
-| `optuna_results/trial_0_results.json` | 2.3% | Real Optuna trial |
-| `results/multi_model_evaluation.json` | **0.0%** | Real evaluation, 50 images |
-| `results/batch_evaluation_*.json` | **0.0%** | Real evaluation, empty prediction strings |
-
-The recorded 0.0% runs are explained by a **character-index off-by-one between
-training and inference** (training mapped `<blank>`→0, inference mapped
-`<blank>`→1 and shifted every character up by one). A correctly-trained model
-decoded `SAL1A2A40SA606662` as `R9K09193…`, and low indices were dropped
-entirely — producing the empty strings.
-
-That bug is fixed (see `src/vin_ocr/core/charset.py`, now the single source of
-truth for the mapping), **but the model has not been retrained and re-evaluated
-since**. Treat all fine-tuned numbers above as unverified until a fresh
-training + evaluation run is recorded.
-
-The 25% / 55% rule-based figures at the top are unaffected by this bug — they
-come from the PaddleOCR pipeline, which does not use that char map.
-
----
-
-## Table of Contents
-
-1. [Experiment Summary](#experiment-summary)
-2. [CLI Testing Results](#cli-testing-results)
-3. [Installation](#installation)
-4. [Quick Start](#quick-start)
-5. [Web UI](#web-ui)
-6. [Multi-Model Evaluation](#multi-model-evaluation)
-7. [Training & Fine-Tuning](#training--fine-tuning)
-8. [Pipeline Architecture](#pipeline-architecture)
-9. [Configuration](#configuration)
-10. [Character Confusion Handling](#character-confusion-handling)
-11. [VIN Format Reference](#vin-format-reference)
-12. [Documentation](#documentation)
-13. [For the Team](#for-the-team)
-14. [License](#license)
-
----
-
-## Experiment Summary
-
-### Dataset
-
-| Property       | Value                                    |
-|----------------|------------------------------------------|
-| Total Images   | 381 VIN plate images (`results/experiment_summary.json`) |
-| Source         | DagsHub bucket (JRL-VIN project)         |
-| Image Type     | Engraved metal VIN plates from vehicles  |
-| Ground Truth   | Manual annotations with verified VINs    |
-
-### Industry Metrics Achieved
-
-> **⚠️ Sample size correction.** This table previously reported the exact match
-> rate as `5% (19/382)` → `25% (96/382)`, implying 382 images were scored. The
-> provenance file `results/experiment_summary.json` records
-> `"sample_size_for_metrics": 20`. The measurement is therefore **1/20 → 5/20**,
-> and the 19/382 and 96/382 counts were extrapolations, never observed.
-> The 95% CI on 5/20 is **[0.11, 0.47]** — consistent with anything from "no
-> improvement" to "large improvement". Treat as a pilot, not a result.
-
-| Metric              | Baseline       | With Pipeline  | Improvement | Industry Target |
-|---------------------|----------------|----------------|-------------|-----------------|
-| Exact Match Rate    | 5% (1/20)      | 25% (5/20)     | +4 images   | 95%+            |
-| Character-Level F1  | 43%            | 55.3%          | +29%        | 98%+            |
-| Precision           | 41.7%          | not recorded   | --          | 98%+            |
-| Recall              | 44.4%          | not recorded   | --          | 98%+            |
-| Avg Processing Time | not recorded   | 3.3s/image (3306 ms) | --    | <5s             |
-
-> "Detection Rate 99.7%" appeared in earlier versions of this table; no code
-> path in this repository computes a detection rate and the figure exists
-> only as a hand-entered value in `results/detailed_metrics.json`. Pipeline
-> precision/recall and baseline timing were never numerically recorded.
-
-### Additional Metrics to Explore
-
-| Metric                      | Formula                                       | Status          |
-|-----------------------------|-----------------------------------------------|-----------------|
-| CER (Character Error Rate)  | (S + D + I) / N                               | To calculate    |
-| NED (Normalized Edit Dist)  | edit_distance / max(len_pred, len_gt)         | To calculate    |
-| Word Error Rate (WER)       | Errors at VIN level                           | Have (1-exact)  |
-| Per-Position Accuracy       | Accuracy at each of 17 positions              | To calculate    |
-| Levenshtein Distance (Avg)  | Mean edits needed to correct                  | To calculate    |
-
-### Why These Results Matter
-
-**1. Baseline Performance Gap**
-
-Raw PaddleOCR achieves only 5% exact match on engraved plates due to:
-- Metal surface reflections and lighting variations
-- Character confusions (O/0, I/1, S/5) common on stamped text
-- Artifact characters from plate borders and stamps
-
-**2. Pipeline Improvements**
-
-Our preprocessing + postprocessing pipeline achieves 5x improvement:
-- CLAHE contrast enhancement handles lighting variations
-- Artifact removal strips border characters (*, #, X prefixes)
-- Invalid character correction (I→1, O→0, Q→0 per VIN standard)
-- Position-based correction (digits in sequential section)
-
-**3. Gap to Production**
-
-Current 25% exact match is NOT production-ready (industry requires 95%+).
-This baseline establishes:
-- A validated preprocessing approach for engraved plates
-- Identified failure modes for targeted improvements
-- A foundation for the team to build upon
-
-### Recommended Next Steps (Not Yet Implemented)
-
-| Priority | Action                                     | Expected Impact     | Status      |
-|----------|--------------------------------------------|---------------------|-------------|
-| High     | Fine-tune detection model on VIN plates    | +20-30% exact match | Not started |
-| High     | Train custom recognition model on charset  | +15-25% exact match | Not started |
-| Medium   | Implement confidence-weighted voting       | +5-10% exact match  | Not started |
-| Medium   | Add manufacturer-specific WMI validation   | +3-5% exact match   | Not started |
-| Low      | Multi-angle image capture                  | +5-10% exact match  | Not started |
-
----
-
-## CLI Testing Results (January 2026)
-
-### Test Environment
-
-| Component            | Value                            |
-|----------------------|----------------------------------|
-| PaddleOCR Version    | 3.x (PP-OCRv5)                   |
-| Preprocessing Mode   | engraved (CLAHE + bilateral)     |
-| Python               | 3.12                             |
-| Platform             | macOS (Apple Silicon)            |
-
-### Images Tested
-
-1. `1-VIN_-_SAL119E90SA606112_.jpg`
-2. `10-VIN_-_SAL1A2A40SA606645_.jpg`
-3. `1000-VIN_-_SAL1P9EU2SA606633_.jpg`
-4. `1001-VIN_-_SAL1P9EU2SA606664_.jpg`
-
-### Preprocessing Pipeline
-
-| Step | Operation                                              |
-|------|--------------------------------------------------------|
-| 1    | Load image (BGR format)                                |
-| 2    | Convert to grayscale                                   |
-| 3    | Apply CLAHE (clip_limit=2.0, tile_size=8x8)            |
-| 4    | Bilateral filter (d=5, sigmaColor=50, sigmaSpace=50)   |
-| 5    | Convert back to BGR (3-channel) for PaddleOCR          |
-
-### Model Configuration
-
-| Parameter            | Value                  |
-|----------------------|------------------------|
-| Detection Model      | PP-OCRv5_server_det    |
-| Recognition Model    | en_PP-OCRv5_mobile_rec |
-| Language             | English                |
-| text_det_box_thresh  | 0.3                    |
-
-### Test Results
-
-| Image                             | Expected VIN        | Predicted VIN          | Conf | Match |
-|-----------------------------------|---------------------|------------------------|------|-------|
-| 1-VIN_-_SAL119E90SA606112_.jpg    | SAL119E90SA606112   | 2ESAL119E90SA606112    | 55%  | No    |
-| 10-VIN_-_SAL1A2A40SA606645_.jpg   | SAL1A2A40SA606645   | SAL1A2K40SR606E45M     | 69%  | No    |
-| 1000-VIN_-_SAL1P9EU2SA606633_.jpg | SAL1P9EU2SA606633   | 1401SA10EH/SA5066331   | 33%  | No    |
-| 1001-VIN_-_SAL1P9EU2SA606664_.jpg | SAL1P9EU2SA606664   | SAL1P9EU2SA606664      | 96%  | Yes   |
-
-**Summary:** 1/4 exact matches (25%) on these four examples. No full-dataset run exists to compare against (n=20 is the largest recorded evaluation).
-
-### Errors Encountered During Development
-
-**1. Deprecated Parameter Error**
+```bash
+python scripts/compare_models.py            # ~6 min CPU, logs to MLflow
+mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5001
 ```
-Error: DeprecationWarning: det_db_box_thresh has been deprecated
-Fix:   Changed to text_det_box_thresh in PaddleOCR 3.x
-```
-
-**2. Invalid Parameter Error**
-```
-Error: ValueError: Unknown argument: rec_thresh
-Fix:   Removed rec_thresh parameter (no longer supported in PaddleOCR 3.x)
-```
-
-**3. Image Dimension Error**
-```
-Error: ValueError: not enough values to unpack (expected 3, got 2)
-Cause: PaddleOCR expects 3-channel BGR images, preprocessing returned grayscale
-Fix:   Added cv2.cvtColor(image, cv2.COLOR_GRAY2BGR) after preprocessing
-```
-
-**4. OCR Artifact Characters**
-```
-Issue:   Raw OCR output contains *, #, X, / characters from plate borders
-Example: "*SAL1P9EU2SA606664" -> "SAL1P9EU2SA606664"
-Note:    "/" character not yet filtered (seen in test image 1000)
-```
-
-### Observed Failure Modes
-
-- **Prefix artifacts:** "2E*", "I" prepended to VIN
-- **Character confusion:** A↔K, 6↔E, 9↔0
-- **Slash insertion:** "/" appearing mid-VIN from scratches/reflections
-- **Low confidence:** (<50%) correlates with incorrect predictions
 
 ---
 
@@ -360,7 +168,7 @@ python -m src.vin_ocr.evaluation.multi_model_evaluation --max-images 100
 python -m src.vin_ocr.evaluation.multi_model_evaluation --image-folder ./my_images --max-images 50
 
 # Output to specific directory
-python -m src.vin_ocr.evaluation.multi_model_evaluation --output-dir ./results/experiment1
+python -m src.vin_ocr.evaluation.multi_model_evaluation --model paddleocr_v3 --output-dir ./eval_runs/experiment1
 ```
 
 ### Available Models
@@ -519,7 +327,7 @@ Examples:
 | **Per-position** | Accuracy at each of 17 VIN positions |
 
 See [Pipeline Architecture](#pipeline-architecture) below and
-[docs/MODELS.md](docs/MODELS.md) for detailed pipeline documentation.
+[docs/SYSTEM_MAPS.md](docs/SYSTEM_MAPS.md) for the generated architecture maps.
 
 ---
 
@@ -574,7 +382,7 @@ paddleocr_vin_pipeline/
 │
 ├── data/                     # VIN images (DVC-managed, gitignored)
 ├── output/                   # Checkpoints (gitignored)
-└── results/                  # Evaluation artifacts
+└── eval_runs/                # Evaluation outputs (created on demand)
 ```
 
 ---
@@ -621,18 +429,18 @@ Position:  1  2  3  | 4  5  6  7  8 | 9 | 10 | 11 | 12 13 14 15 16 17
 
 | Document | Contents |
 |----------|----------|
-| [docs/MODELS.md](docs/MODELS.md) | Model zoo, checkpoints, ONNX export |
-| [dev-docs/fine-tuning-techniques.md](dev-docs/fine-tuning-techniques.md) | Fine-tuning strategies and adaptation |
-| [TRAINING_IMPROVEMENTS.md](TRAINING_IMPROVEMENTS.md) | Training changes and rationale |
-| [VIN_OCR_Architecture_Performance.md](VIN_OCR_Architecture_Performance.md) | Architecture comparison results |
+| [LOGBOOK.md](LOGBOOK.md) | The measurement record: every number with its run ID and basis |
+| [TRAINING_RUNBOOK.md](TRAINING_RUNBOOK.md) | How to run tracked training, resume, register checkpoints |
+| [ENTERPRISE_TRAINING_READINESS.md](ENTERPRISE_TRAINING_READINESS.md) | Trainer readiness audit and its fixes |
+| [docs/SYSTEM_MAPS.md](docs/SYSTEM_MAPS.md) | Generated architecture/dependency maps (`make maps` regenerates) |
 | [DAGSHUB_SETUP.md](DAGSHUB_SETUP.md) | DagsHub + DVC data setup |
 | [docker/README.md](docker/README.md) | Container build and deployment |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution workflow |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 
-> Earlier revisions of this README linked to a `dev/` documentation tree and to
-> `INSTALLATION.md` / `ARCHITECTURE.md`. Those files are not present in this
-> repository; the table above lists what actually exists.
+> The fabrication-era documents (simulated architecture benchmarks, status
+> summaries, extrapolated results) were removed on 2026-08-20; they exist in
+> git history only. Nothing in this repository cites them as evidence.
 
 ---
 
@@ -649,12 +457,14 @@ pytest tests/test_vin_pipeline.py -v
 
 ### Data Access
 
-The test images (381 per `results/experiment_summary.json`) are in DagsHub: `Thundastormgod/core-vin`  
-Path: `data/paddleocr_sample/`
+Recognition crops (2,529 images; VIN-grouped splits 2,387/102/40) come from
+the DagsHub datasource `Thundastormgod/jlr-vin-ocr`; the staged copy is
+pinned by `finetune_data.dvc`. See DAGSHUB_SETUP.md for credentials.
 
 ### Known Limitations
 
-- **NOT PRODUCTION-READY:** 25% vs 95% industry target
+- **NOT PRODUCTION-READY:** best measured exact match is 37.5% (test-40,
+  stock engine + pipeline) vs the ~95% industry target
 - **ENGRAVED PLATES ONLY:** Not for printed labels
 - **SINGLE VIN PER IMAGE**
 

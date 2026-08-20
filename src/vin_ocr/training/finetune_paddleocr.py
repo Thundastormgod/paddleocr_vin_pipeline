@@ -606,10 +606,14 @@ class DepthwiseSeparableConv(nn.Layer):
 
 class PPLCNetV3Backbone(nn.Layer):
     """
-    PPLCNetV3 backbone - EXACT architecture matching PP-OCRv4.
-    
-    This ensures trained weights are compatible with production inference.
-    Architecture based on: https://github.com/PaddlePaddle/PaddleOCR/blob/release/2.7/ppocr/modeling/backbones/rec_lcnetv3.py
+    PPLCNetV3-style backbone (depthwise-separable convs + SE blocks).
+
+    Honesty note: previously claimed to be the "EXACT architecture matching
+    PP-OCRv4" with weights "compatible with production inference" - false:
+    checkpoints of this class do not load into PaddleOCR. It is an
+    independent implementation INSPIRED by
+    https://github.com/PaddlePaddle/PaddleOCR/blob/release/2.7/ppocr/modeling/backbones/rec_lcnetv3.py
+    with per-stage strides tuned for 48x320 VIN crops (width kept at /4).
     """
     
     # PPLCNetV3 configuration for text recognition

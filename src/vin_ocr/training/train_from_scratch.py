@@ -99,7 +99,7 @@ class PaddleOCRScratchConfig:
     # Model architecture
     # Options: PP-OCRv5, CRNN, SVTR_LCNet, SVTR_Tiny
     architecture: str = "PP-OCRv5"  # Default to latest v5
-    backbone: str = "PPLCNetV3"  # Options: MobileNetV3, PPLCNetV3, ResNet
+    backbone: str = "PPLCNetV3"  # Only PPLCNetV3-style is implemented here; no other backbone option exists in this legacy trainer
     
     # Input configuration
     image_height: int = 48

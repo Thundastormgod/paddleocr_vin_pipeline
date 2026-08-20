@@ -59,20 +59,18 @@ longer a baseline for anything: it was produced under the early-stop
 guillotine (every trial truncated at ~patience+1 epochs), scored through
 since-replaced metric implementations on a 43-image corpus under a leaky
 split policy, and the fixed tuner showed crashed trials could inherit a
-neighbour's score. It remains in `optuna_results/` as history only.
+neighbour's score. Its trial corpus was removed from the repo on 2026-08-20
+(git history only).
 
-Corrections on record, for anyone reading older documents:
-
-- **46.51% / 94.39% were never measured.** They are literals in
-  `validate_architectures.py`, which imports only `yaml`, `json` and
-  `pathlib` — it loads no model, dataset or checkpoint.
-  `architecture_summary.json` now carries `measured: false`.
-- **"5% (19/382)" and "25% (96/382)" were extrapolations.** The source record,
-  `results/experiment_summary.json`, has `sample_size_for_metrics = 20`. The
-  real measurements are 1/20 and 5/20. The `/382` denominators were never
-  observed.
-- **"Rosetta" is not implemented in this codebase.** It appears in
-  documentation only.
+**Fabrication-era documents: removed (2026-08-20).** Every document that
+carried unmeasured or extrapolated numbers - the simulated architecture
+"benchmark" and its summary JSON, the hardcoded-metrics pipeline script, the
+pre-audit results corpus (evaluations made with the wrong-blank decoder and
+n=20 extrapolations presented as /382), the truncated-training Optuna trial
+corpus, and the fabrication-era summary/status/improvement documents - was
+deleted from the working tree in one sweep (90 files). Git history retains
+them; nothing in this repository cites them as evidence any more. The rule
+survives the cleanup: a number without a run ID is not a measurement.
 
 ---
 
@@ -315,8 +313,8 @@ valid check digits) and catalogue every failure.
    counter never reset, and **every run died after exactly patience+1
    epochs regardless of progress**. Every historical Optuna trial
    (patience 3-20) trained under this guillotine — no historical run was
-   allowed past ~21 epochs. The optuna_results/ corpus measures
-   truncated training.
+   allowed past ~21 epochs. The pre-audit trial corpus (removed
+   2026-08-20) measures truncated training.
 4. `latest` checkpoints: not refreshed every epoch, no resume info
    (resume-from-latest restarted the epoch counter and warmup),
    non-atomic writes.
@@ -339,8 +337,8 @@ ENTERPRISE_TRAINING_READINESS.md.
 ### 2026-08-18 — n=1 validation: the fine-tuned checkpoint reads VINs
 
 **Hypothesis.** The recorded 0.0% for
-`output/vin_rec_finetune/best_accuracy.pdparams`
-(`results/multi_model_evaluation.json`, 50 images) was produced by the
+`output/vin_rec_finetune/best_accuracy.pdparams` (pre-audit multi-model
+results, 50 images; file removed 2026-08-20) was produced by the
 wrong-blank ONNX decoder (blank=33 against a blank=0 model) and measures
 the decoder, not the model. If so, decoding the same checkpoint through
 the canonical charset should produce VIN-like text, not garbage.
@@ -413,10 +411,10 @@ models under `not_evaluated` - never as 0% rows. Non-finite losses now
 raise at all four accumulation sites. 57 new regression tests.
 
 **Effect on model metrics.** Definitions changed; numbers move.
-- Historical `multi_model_evaluation.json` results are NOT comparable to
-  new runs: the old character metrics were positional and '_'-padded, and
-  every old ONNX row was decoded with the wrong blank index. In
-  particular, **the recorded 0.0% for `output/vin_rec_finetune` measured
+- Historical multi-model evaluation results (file removed 2026-08-20) are
+  NOT comparable to new runs: the old character metrics were positional and
+  '_'-padded, and every old ONNX row was decoded with the wrong blank index.
+  In particular, **the recorded 0.0% for `output/vin_rec_finetune` measured
   the broken decoder, not the model** - that checkpoint has no valid
   evaluation on record and must be re-run.
 - The 41.86% (18/43) Optuna baseline is unaffected (it comes from the
@@ -465,11 +463,11 @@ including an AST guard that no except handler in either tuner returns a
 numeric literal.
 
 **Effect on model metrics.** None yet — this changes what can be *recorded*,
-not what is computed. The standing 41.86% (18/43) baseline came from the
-root tuner's `optuna_results/` corpus; any trial in that corpus whose
-training crashed may carry a neighbour's accuracy under its own
-hyperparameters, so per-trial hyperparameter conclusions drawn from it are
-suspect until re-measured under the fixed tuner.
+not what is computed. The then-standing 41.86% (18/43) baseline came from the
+root tuner's pre-audit trial corpus (removed 2026-08-20); any trial in it
+whose training crashed may carry a neighbour's accuracy under its own
+hyperparameters, so per-trial hyperparameter conclusions drawn from it were
+suspect and no number from it is citable.
 
 ### 2026-08-17 — Experiment tracking with mandatory provenance
 
@@ -478,7 +476,7 @@ the code that produced them: a hardcoded 46.51%, `# Simulated` training results
 returned without calling `train()`, and sample sizes extrapolated by a factor
 of 19. The common cause was structural, not careless — repo-wide, **zero** files
 recorded a commit SHA alongside a metric, so no result could be checked against
-the code that produced it. The 63 files in `optuna_results/` carry
+the code that produced it. The 63 files of the pre-audit trial corpus (removed 2026-08-20) carried
 hyperparameters and accuracies with no commit, no data hash and no timestamp.
 
 **Change.** Added `src/vin_ocr/tracking/`. Every run opened with `start_run()`

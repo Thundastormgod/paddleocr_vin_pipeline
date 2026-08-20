@@ -14,5 +14,5 @@ before citing any number here.
 
 Current measured results live in MLflow (`sqlite:///mlflow.db`,
 experiments `vin_finetune` / `checkpoint_validation`, registry
-`vin-recognizer-scratch`) with full provenance; replay any run with
+`vin-lcnetv3-svtr-ctc`) with full provenance; replay any run with
 `vin-reproduce <run_id>`.

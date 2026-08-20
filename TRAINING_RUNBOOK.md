@@ -113,7 +113,7 @@ vin-reproduce <run_id>          # or python -m src.vin_ocr.tracking.reproduce <r
 ## 9. Model versions and traces (MLflow 3)
 
 **Registry** — every promotable checkpoint becomes a version of the
-registered model `vin-recognizer-scratch` (UI → Models tab). A version is a
+registered model `vin-lcnetv3-svtr-ctc` (UI → Models tab). A version is a
 pyfunc carrying checkpoint + config + charset + canonical decode - the
 deployable unit, not a bare state dict. Metrics are MEASURED at
 registration on a named dataset (never transcribed):

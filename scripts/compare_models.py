@@ -143,7 +143,7 @@ def _ckpt_spec(name: str, checkpoint: str, postprocess: bool) -> ModelSpec:
 
     return ModelSpec(
         name=name,
-        family="from-scratch (refuted route)",
+        family="LCNetV3-SVTR-CTC 3.23M (from-scratch, refuted route)",
         semantics="legacy-batch-axis-attention",
         evaluator=lambda label_file: eval_checkpoint_on_split(
             checkpoint, label_file, postprocess),
@@ -167,7 +167,7 @@ def _stock_spec(name: str, postprocess: bool) -> ModelSpec:
 
     return ModelSpec(
         name=name,
-        family="stock-pretrained (production default)",
+        family="PP-OCRv3-mobile det+rec (stock pretrained, production default)",
         semantics="batch-independent by engine design",
         evaluator=lambda label_file: eval_stock_pipeline_on_split(
             label_file, postprocess),
@@ -183,18 +183,21 @@ def _stock_spec(name: str, postprocess: bool) -> ModelSpec:
 
 def build_specs() -> List[ModelSpec]:
     return [
-        _stock_spec("stock-ppocrv3-pipeline", postprocess=True),
-        _stock_spec("stock-ppocrv3-pipeline-nopost", postprocess=False),
-        _ckpt_spec("scratch-stage1",
+        # Real model names. Stock = official PaddleOCR zoo identifiers;
+        # custom family = its actual composition (LCNetV3-SVTR-CTC, 3.23M
+        # params), versioned by training epoch. Stage labels live in params.
+        _stock_spec("PP-OCRv3-mobile+pipeline", postprocess=True),
+        _stock_spec("PP-OCRv3-mobile+pipeline-nopostproc", postprocess=False),
+        _ckpt_spec("LCNetV3-SVTR-CTC-ep25",
                    "output/vin_rec_finetune/latest.pdparams", postprocess=False),
-        _ckpt_spec("scratch-stage2-warmrestart",
+        _ckpt_spec("LCNetV3-SVTR-CTC-ep36-warmrestart",
                    "output/vin_rec_finetune_stage2/latest.pdparams", postprocess=False),
-        _ckpt_spec("scratch-stage3b-bestvalloss",
+        _ckpt_spec("LCNetV3-SVTR-CTC-ep19",
                    "output/vin_rec_finetune_stage3/best_val_loss.pdparams",
                    postprocess=False),
-        _ckpt_spec("scratch-stage3b-final",
+        _ckpt_spec("LCNetV3-SVTR-CTC-ep44",
                    "output/vin_rec_finetune_stage3/latest.pdparams", postprocess=False),
-        _ckpt_spec("scratch-stage3b-final-postproc",
+        _ckpt_spec("LCNetV3-SVTR-CTC-ep44+postproc",
                    "output/vin_rec_finetune_stage3/latest.pdparams", postprocess=True),
     ]
 

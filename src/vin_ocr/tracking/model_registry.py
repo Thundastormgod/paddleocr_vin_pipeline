@@ -40,10 +40,12 @@ import numpy as np
 import mlflow
 import mlflow.pyfunc
 
-#: Registry name of the from-scratch checkpoint family (v1-v3, refuted
-#: route - see LOGBOOK 2026-08-19/20). New model families (e.g. pretrained
-#: warm starts) must register under their OWN name, passed explicitly.
-REGISTERED_MODEL_NAME = "vin-recognizer-scratch"
+#: Registry name of the custom from-scratch family, named for what the
+#: model actually is: PPLCNetV3-style backbone -> SVTR encoder -> CTC head,
+#: 3.23M parameters (v1-v3, refuted route - see LOGBOOK 2026-08-19/20).
+#: New model families (e.g. pretrained warm starts) must register under
+#: their OWN name, passed explicitly.
+REGISTERED_MODEL_NAME = "vin-lcnetv3-svtr-ctc"
 
 
 # =============================================================================
@@ -320,7 +322,8 @@ def register_checkpoint_version(
         mlflow.log_input(eval_dataset, context="evaluation")
 
         model_info = mlflow.pyfunc.log_model(
-            name=f"vin-recognizer-{stage_label}" if stage_label else "vin-recognizer",
+            name=(f"vin-lcnetv3-svtr-ctc-{stage_label}"
+                  if stage_label else "vin-lcnetv3-svtr-ctc"),
             python_model=VINRecognizerPyfunc(),
             artifacts={
                 "checkpoint": checkpoint_path,

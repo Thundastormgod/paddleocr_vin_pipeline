@@ -32,13 +32,22 @@ legacy semantics they were trained with (see the 2026-08-20 entry).
 
 | Model | val-102 char / exact | test-40 char / exact |
 |---|---|---|
-| **stock PP-OCRv3 + pipeline (production default)** | **82.70% / 25.5%** | **87.79% / 37.5%** |
-| stock PP-OCRv3, postprocessor OFF | 77.51% / 8.8% | 81.03% / 5.0% |
-| scratch stage-3b ep44 (+postproc) | 68.28% / 0% | 68.38% / 0% |
-| scratch stage-3b ep44 (registry v3, `scratch-best`) | 66.61% / 0% | 68.53% / 0% |
-| scratch stage-3b ep19 best-val-loss (v2) | 64.13% / 0% | 66.91% / 0% |
-| scratch stage-1 ep25 (v1) | 59.98% / 0% | 60.88% / 0% |
-| scratch stage-2 warm-restart (refuted) | 38.06% / 0% | 42.94% / 0% |
+| **PP-OCRv3-mobile + pipeline (production default)** | **82.70% / 25.5%** | **87.79% / 37.5%** |
+| PP-OCRv3-mobile + pipeline, postprocessor OFF | 77.51% / 8.8% | 81.03% / 5.0% |
+| LCNetV3-SVTR-CTC-ep44 +postproc | 68.28% / 0% | 68.38% / 0% |
+| LCNetV3-SVTR-CTC-ep44 (registry v3, alias `best`) | 66.61% / 0% | 68.53% / 0% |
+| LCNetV3-SVTR-CTC-ep19 best-val-loss (v2) | 64.13% / 0% | 66.91% / 0% |
+| LCNetV3-SVTR-CTC-ep25 (v1) | 59.98% / 0% | 60.88% / 0% |
+| LCNetV3-SVTR-CTC-ep36 warm-restart (refuted) | 38.06% / 0% | 42.94% / 0% |
+
+Model naming (2026-08-20): names state what the artifacts ARE.
+`LCNetV3-SVTR-CTC` = the custom model's real composition (PPLCNetV3-style
+backbone -> SVTR encoder -> CTC head; 3,226,498 params measured; 48x320
+input), versioned by training epoch - its class had falsely described
+itself as "EXACT PP-OCRv4" (docstring corrected). `PP-OCRv3-mobile` = the
+official zoo pair PP-OCRv3_mobile_det + en_PP-OCRv3_mobile_rec. Registry:
+`vin-recognizer` -> `vin-recognizer-scratch` -> **`vin-lcnetv3-svtr-ctc`**
+(alias `best` = v3/ep44); run names updated in place, metrics untouched.
 
 The postprocessor alone is worth +5.2pp char / +16.7pp exact (val) and
 +6.8pp / +32.5pp (test) to the stock engine. Repeat-eval noise floor on

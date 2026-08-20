@@ -857,15 +857,21 @@ class CTCHead(nn.Layer):
 
 class VINRecognitionModel(nn.Layer):
     """
-    VIN Recognition Model using PRODUCTION PP-OCRv4 architecture.
-    
-    Architecture:
-    - Backbone: PPLCNetV3 (depthwise separable convolutions + SE blocks)
-    - Neck: SVTR Transformer encoder (sequence modeling)
-    - Head: CTC output layer
-    
-    This matches the EXACT architecture used by PaddleOCR inference,
-    ensuring trained weights are compatible with production deployment.
+    LCNetV3-SVTR-CTC: this repository's custom recognition model.
+
+    Real name and measured spec (2026-08-20): PPLCNetV3-style backbone
+    (depthwise-separable convs + SE blocks, 512 out channels) -> SVTR
+    transformer encoder (hidden 256, 2 layers, 8 heads by repo config) ->
+    CTC head. 3,226,498 parameters (3.23M) at 34 classes, input 48x320.
+
+    Honesty note: this class previously described itself as "PRODUCTION
+    PP-OCRv4 architecture ... the EXACT architecture used by PaddleOCR
+    inference". That was false - it is a from-scratch re-implementation
+    INSPIRED by PP-OCRv4; its checkpoints do not load into PaddleOCR and
+    its geometry/semantics have differed from the real SVTR_LCNet in
+    measured ways (32x width downsampling defect, fixed ee523b9; batch-axis
+    attention defect, fixed f198c8b). Its trained family is registered as
+    `vin-lcnetv3-svtr-ctc` (refuted route - see LOGBOOK 2026-08-19/20).
     """
     
     def __init__(self, config: Dict, num_classes: int,
@@ -1067,17 +1073,14 @@ class PPHGNetV2Backbone(nn.Layer):
 
 class PPOCRv5RecognitionModel(nn.Layer):
     """
-    PP-OCRv5 Recognition Model - State-of-the-art (2024).
-    
-    Architecture:
-    - Backbone: PPHGNetV2-inspired with SE attention
-    - Neck: Enhanced SVTR Transformer encoder (4 layers, 8 heads)
-    - Head: CTC output with LayerNorm
-    
-    Improvements over PP-OCRv4:
-    - More powerful backbone (HGNet-style vs LCNet)
-    - Deeper transformer encoder (4 vs 2 layers)
-    - Better feature extraction with SE attention
+    HGNetV2-SVTR-CTC: alternative custom recognition model (never trained).
+
+    Real name: HGNetV2-style backbone with SE attention -> 4-layer/8-head
+    transformer encoder -> LayerNorm + CTC head. This is a from-scratch
+    re-implementation INSPIRED by PP-OCRv5, not PP-OCRv5 itself (the
+    previous docstring's "State-of-the-art (2024)" branding was
+    aspirational). No checkpoint of this class exists; it has never been
+    selected by any config in this repository's recorded runs.
     """
     
     def __init__(self, config: Dict, num_classes: int):

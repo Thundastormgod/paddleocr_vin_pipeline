@@ -85,11 +85,19 @@ def convert_all_models(output_base: str = "output", onnx_dir: str = "output/onnx
                 # Load our custom model architecture
                 from src.vin_ocr.training.finetune_paddleocr import VINRecognitionModel
                 
-                # Create model with default config
+                # Create model with default config.
+                # legacy_batch_axis_attention=True: every stranded
+                # .pdiparams this tool can re-export was trained BEFORE the
+                # 2026-08-20 batch-first fix; exporting those weights under
+                # the fixed forward would produce a model measured at
+                # 0.1113 val char accuracy instead of the semantics they
+                # were trained with (see SVTREncoder docstring).
                 config = {
                     'Architecture': {'Neck': {'hidden_dim': 256}},
                 }
-                model = VINRecognitionModel(config, num_classes=34)
+                model = VINRecognitionModel(
+                    config, num_classes=34, legacy_batch_axis_attention=True,
+                )
                 
                 # Load weights
                 state_dict = paddle.load(str(pdiparams_path))

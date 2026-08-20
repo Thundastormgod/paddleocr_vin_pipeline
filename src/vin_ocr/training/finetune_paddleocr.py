@@ -658,6 +658,19 @@ class SVTREncoder(nn.Layer):
     
     Implements the transformer-based encoder from PP-OCRv4 for better
     sequence modeling. This is the key difference from simple CNN models.
+
+    Layout contract (measured defect, 2026-08-20): paddle's
+    ``nn.TransformerEncoder`` consumes ``[batch, seq, dim]`` - unlike
+    PyTorch's default. This encoder previously transposed to ``[T, B, C]``
+    (the PyTorch convention), which made self-attention run ACROSS BATCH
+    SAMPLES at each timestep: logits for one image changed by up to 7.4
+    depending on its batch companions (97/102 val predictions differed
+    between batch-1 and batch-16 on identical weights), and at batch-1 the
+    encoder degenerated to a per-timestep MLP. Checkpoints trained under
+    that defect are only meaningful under it; construct with
+    ``legacy_batch_axis_attention=True`` to evaluate them. Every new model
+    must keep the default (False), which this class asserts is
+    batch-independent (pinned by TestBatchIndependence).
     """
     
     def __init__(
@@ -666,7 +679,8 @@ class SVTREncoder(nn.Layer):
         hidden_dim: int = 256,
         num_heads: int = None,  # From config
         num_layers: int = None,  # From config
-        dropout: float = None    # From config
+        dropout: float = None,   # From config
+        legacy_batch_axis_attention: bool = False,
     ):
         super().__init__()
         
@@ -686,9 +700,16 @@ class SVTREncoder(nn.Layer):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
         
+        #: Defect-compatibility mode: reproduces the pre-2026-08-20
+        #: batch-axis attention so checkpoints trained under it remain
+        #: executable and their recorded metrics remain reproducible.
+        #: NEVER enable for new training or new evaluation baselines.
+        self.legacy_batch_axis_attention = legacy_batch_axis_attention
+        
         self.out_channels = hidden_dim
     
     def forward(self, x: paddle.Tensor) -> paddle.Tensor:
+        assert x.ndim == 4, f"SVTREncoder expects [B, C, H, W], got rank {x.ndim}"
         # Pool height dimension: [B, C, H, W] -> [B, C, 1, W]
         x = self.pool(x)
         # Reshape: [B, C, 1, W] -> [B, W, C]
@@ -699,13 +720,19 @@ class SVTREncoder(nn.Layer):
         
         # Add positional encoding
         T = x.shape[1]
+        assert T <= 200, f"sequence length {T} exceeds positional table (200)"
         positions = paddle.arange(T).unsqueeze(0).expand([x.shape[0], -1])
         x = x + self.pos_embed(positions)
         
-        # Transformer encoding (expects [T, B, C])
-        x = x.transpose([1, 0, 2])
-        x = self.transformer(x)
-        x = x.transpose([1, 0, 2])  # Back to [B, T, C]
+        if self.legacy_batch_axis_attention:
+            # Defect reproduction: feed [T, B, C] so paddle attends across
+            # the batch axis - required to evaluate pre-fix checkpoints.
+            x = x.transpose([1, 0, 2])
+            x = self.transformer(x)
+            x = x.transpose([1, 0, 2])
+        else:
+            # paddle is batch-first: [B, T, C] in, [B, T, C] out.
+            x = self.transformer(x)
         
         return x
 
@@ -841,7 +868,8 @@ class VINRecognitionModel(nn.Layer):
     ensuring trained weights are compatible with production deployment.
     """
     
-    def __init__(self, config: Dict, num_classes: int):
+    def __init__(self, config: Dict, num_classes: int,
+                 legacy_batch_axis_attention: bool = False):
         super().__init__()
         
         self.num_classes = num_classes
@@ -860,7 +888,8 @@ class VINRecognitionModel(nn.Layer):
             hidden_dim=hidden_dim,
             num_heads=transformer_config.get('num_heads', 8),
             num_layers=transformer_config.get('num_layers', 2),
-            dropout=transformer_config.get('dropout', 0.1)
+            dropout=transformer_config.get('dropout', 0.1),
+            legacy_batch_axis_attention=legacy_batch_axis_attention,
         )
         
         # CTC head
@@ -1125,10 +1154,11 @@ class PPOCRv5RecognitionModel(nn.Layer):
         features = features.squeeze(2)  # [B, C, W']
         features = features.transpose([0, 2, 1])  # [B, W', C]
         
-        # Transformer encoding (expects [T, B, C])
-        features = features.transpose([1, 0, 2])
+        # paddle transformers are batch-first ([B, T, C] in and out).
+        # The previous [T, B, C] transpose here attended across batch
+        # samples (see SVTREncoder docstring); no checkpoint of this class
+        # exists, so it is fixed without a compatibility mode.
         features = self.transformer(features)
-        features = features.transpose([1, 0, 2])  # [B, T, C]
         
         # Layer normalization
         features = self.norm(features)

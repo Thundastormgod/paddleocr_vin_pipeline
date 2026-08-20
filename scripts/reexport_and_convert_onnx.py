@@ -26,133 +26,26 @@ import numpy as np
 
 
 def create_vin_model():
-    """Create VIN recognition model architecture."""
-    
-    class HardSwish(nn.Layer):
-        def forward(self, x):
-            return x * nn.functional.relu6(x + 3) / 6
-    
-    class SEBlock(nn.Layer):
-        def __init__(self, channels, reduction=4):
-            super().__init__()
-            mid_channels = channels // reduction
-            self.pool = nn.AdaptiveAvgPool2D(1)
-            self.fc1 = nn.Conv2D(channels, mid_channels, 1)
-            self.fc2 = nn.Conv2D(mid_channels, channels, 1)
-        
-        def forward(self, x):
-            identity = x
-            x = self.pool(x)
-            x = nn.functional.relu(self.fc1(x))
-            x = nn.functional.hardsigmoid(self.fc2(x))
-            return identity * x
-    
-    class DepthwiseSeparableConv(nn.Layer):
-        def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, use_se=False):
-            super().__init__()
-            padding = kernel_size // 2
-            self.depthwise = nn.Conv2D(in_channels, in_channels, kernel_size,
-                                       stride=stride, padding=padding, groups=in_channels)
-            self.bn1 = nn.BatchNorm2D(in_channels)
-            self.pointwise = nn.Conv2D(in_channels, out_channels, 1)
-            self.bn2 = nn.BatchNorm2D(out_channels)
-            self.act = HardSwish()
-            self.use_se = use_se
-            if use_se:
-                self.se = SEBlock(out_channels)
-        
-        def forward(self, x):
-            x = self.act(self.bn1(self.depthwise(x)))
-            x = self.bn2(self.pointwise(x))
-            if self.use_se:
-                x = self.se(x)
-            return self.act(x)
-    
-    class PPLCNetV3Backbone(nn.Layer):
-        NET_CONFIG = [
-            [3, 16, 32, 1, False],
-            [3, 32, 64, 2, False],
-            [3, 64, 64, 1, False],
-            [3, 64, 128, (2, 1), False],
-            [3, 128, 128, 1, True],
-            [3, 128, 256, (2, 1), False],
-            [5, 256, 256, 1, True],
-            [5, 256, 256, 1, True],
-            [3, 256, 512, (2, 1), True],
-            [5, 512, 512, 1, True],
-            [5, 512, 512, 1, True],
-        ]
-        
-        def __init__(self, in_channels=3):
-            super().__init__()
-            self.stem = nn.Sequential(
-                nn.Conv2D(in_channels, 16, 3, stride=2, padding=1),
-                nn.BatchNorm2D(16),
-                HardSwish()
-            )
-            layers = []
-            for k, in_c, out_c, s, se in self.NET_CONFIG:
-                layers.append(DepthwiseSeparableConv(in_c, out_c, k, s, se))
-            self.stages = nn.Sequential(*layers)
-            self.out_channels = 512
-        
-        def forward(self, x):
-            x = self.stem(x)
-            x = self.stages(x)
-            return x
-    
-    class SVTREncoder(nn.Layer):
-        def __init__(self, in_channels=512, hidden_dim=256, num_heads=8, num_layers=2, dropout=0.1):
-            super().__init__()
-            self.pool = nn.AdaptiveAvgPool2D((1, None))
-            self.proj = nn.Linear(in_channels, hidden_dim)
-            self.pos_embed = nn.Embedding(200, hidden_dim)
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=hidden_dim, nhead=num_heads,
-                dim_feedforward=hidden_dim * 4, dropout=dropout, activation='gelu'
-            )
-            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
-            self.out_channels = hidden_dim
-        
-        def forward(self, x):
-            x = self.pool(x)
-            x = x.squeeze(2).transpose([0, 2, 1])
-            x = self.proj(x)
-            T = x.shape[1]
-            positions = paddle.arange(T).unsqueeze(0).expand([x.shape[0], -1])
-            x = x + self.pos_embed(positions)
-            x = x.transpose([1, 0, 2])
-            x = self.transformer(x)
-            x = x.transpose([1, 0, 2])
-            return x
-    
-    class CTCHead(nn.Layer):
-        def __init__(self, in_channels, num_classes, dropout=0.1):
-            super().__init__()
-            self.fc1 = nn.Linear(in_channels, in_channels)
-            self.dropout = nn.Dropout(dropout)
-            self.fc2 = nn.Linear(in_channels, num_classes)
-        
-        def forward(self, x):
-            x = nn.functional.relu(self.fc1(x))
-            x = self.dropout(x)
-            x = self.fc2(x)
-            return x
-    
-    class VINRecognitionModel(nn.Layer):
-        def __init__(self, num_classes=34):
-            super().__init__()
-            self.backbone = PPLCNetV3Backbone(in_channels=3)
-            self.neck = SVTREncoder(in_channels=512, hidden_dim=256, num_heads=8, num_layers=2)
-            self.head = CTCHead(in_channels=256, num_classes=num_classes)
-        
-        def forward(self, x):
-            features = self.backbone(x)
-            sequence = self.neck(features)
-            logits = self.head(sequence)
-            return logits
-    
-    return VINRecognitionModel(num_classes=34)
+    """
+    Build the canonical recognition model for re-export.
+
+    This function previously re-declared the whole architecture inline; the
+    copy had drifted and carried the batch-axis attention defect (paddle
+    transformers are batch-first; feeding [T, B, C] attends across batch
+    samples - see SVTREncoder in finetune_paddleocr.py). Architecture now
+    has exactly one definition, imported here.
+
+    legacy_batch_axis_attention=True because the stranded .pdiparams files
+    this tool exists to re-export were all trained before the 2026-08-20
+    fix; under the fixed forward those weights score 0.1113 val char
+    accuracy instead of the semantics they were trained with (measured).
+    """
+    from src.vin_ocr.training.finetune_paddleocr import VINRecognitionModel
+
+    config = {'Architecture': {'Neck': {'hidden_dim': 256}}}
+    return VINRecognitionModel(
+        config, num_classes=34, legacy_batch_axis_attention=True,
+    )
 
 
 def export_model_to_onnx(pdiparams_path: str, output_dir: str):

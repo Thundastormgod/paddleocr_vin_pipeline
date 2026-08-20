@@ -168,6 +168,45 @@ def _ckpt_spec(name: str, checkpoint: str, postprocess: bool,
     )
 
 
+def _torch_ckpt_spec(name: str, checkpoint: str, postprocess: bool,
+                     config_path: str = "configs/vin_rosetta_torch_config.yml") -> ModelSpec:
+    """torch/MPS-trained checkpoint row: canonical metrics via
+    evaluate_torch_checkpoint (same keys, same single-image basis)."""
+    def available() -> Optional[str]:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            return "torch not installed"
+        if not Path(checkpoint).is_file():
+            return f"checkpoint missing: {checkpoint}"
+        return None
+
+    def evaluator(label_file: str) -> Dict[str, float]:
+        from src.vin_ocr.training.finetune_torch import evaluate_torch_checkpoint
+        started = time.time()
+        measured = evaluate_torch_checkpoint(
+            checkpoint, label_file, config_path=config_path,
+            postprocess=postprocess)
+        measured["errors"] = 0.0
+        measured["seconds"] = round(time.time() - started, 1)
+        return measured
+
+    return ModelSpec(
+        name=name,
+        family="Rosetta-ResNet34-torch 21.3M (ImageNet-1k warm start, MPS-trained)",
+        semantics="batch-first (torch, batch-independent)",
+        evaluator=evaluator,
+        params={
+            "weights": checkpoint,
+            "epoch": None,
+            "postprocess": postprocess,
+            "config": config_path,
+            "input": "pre-cropped plate, VINRecognitionDataset preprocessing",
+        },
+        available=available,
+    )
+
+
 def _stock_spec(name: str, postprocess: bool) -> ModelSpec:
     def available() -> Optional[str]:
         try:
@@ -220,6 +259,12 @@ def build_specs() -> List[ModelSpec]:
                    family="Rosetta-ResNet34vd 21.3M (from-scratch)",
                    legacy=False,
                    config_path="configs/vin_rosetta_config.yml"),
+        _torch_ckpt_spec("Rosetta-ResNet34-IN1K",
+                         "output/vin_rosetta_torch_in1k/best_char_accuracy.pt",
+                         postprocess=False),
+        _torch_ckpt_spec("Rosetta-ResNet34-IN1K+postproc",
+                         "output/vin_rosetta_torch_in1k/best_char_accuracy.pt",
+                         postprocess=True),
     ]
 
 

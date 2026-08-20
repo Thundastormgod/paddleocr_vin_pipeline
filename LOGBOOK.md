@@ -32,12 +32,15 @@ legacy semantics they were trained with (see the 2026-08-20 entry).
 
 | Model | val-102 char / exact | test-40 char / exact |
 |---|---|---|
-| **PP-OCRv3-mobile + pipeline (production default)** | **82.70% / 25.5%** | **87.79% / 37.5%** |
+| **Rosetta-ResNet34-IN1K (torch/MPS; production candidate)** | **98.73% / 85.3%** | **99.26% / 90.0%** |
+| Rosetta-ResNet34-IN1K + postproc | 95.73% / 85.3% | 98.38% / 90.0% |
+| **PP-OCRv3-mobile + pipeline (deployed production default)** | 82.70% / 25.5% | 87.79% / 37.5% |
 | PP-OCRv3-mobile + pipeline, postprocessor OFF | 77.51% / 8.8% | 81.03% / 5.0% |
 | LCNetV3-SVTR-CTC-ep44 +postproc | 68.28% / 0% | 68.38% / 0% |
 | LCNetV3-SVTR-CTC-ep44 (registry v3, alias `best`) | 66.61% / 0% | 68.53% / 0% |
 | LCNetV3-SVTR-CTC-ep19 best-val-loss (v2) | 64.13% / 0% | 66.91% / 0% |
 | LCNetV3-SVTR-CTC-ep25 (v1) | 59.98% / 0% | 60.88% / 0% |
+| Rosetta-ResNet34vd (paddle, scratch) | 63.15% / 0% | 64.56% / 0% |
 | LCNetV3-SVTR-CTC-ep36 warm-restart (refuted) | 38.06% / 0% | 42.94% / 0% |
 
 Model naming (2026-08-20): names state what the artifacts ARE.
@@ -75,6 +78,65 @@ survives the cleanup: a number without a run ID is not a measurement.
 ---
 
 ## Entries
+
+### 2026-08-20 — Apple-GPU training stack: warm-started Rosetta hits 90% exact on test
+
+**Hypothesis.** Long-term training must run on this Apple machine; paddle
+has no Metal backend and its CPU build is pinned at ~1.1 of 8 cores
+(measured: 4.82/4.40/4.41 s/step at OMP 1/4/8). A torch/MPS port plus the
+#1 measured lever (pretrained warm start) should finally produce a custom
+model that beats the stock engine.
+
+**Change.** New training stack: `torch_rosetta.py` (torchvision ResNet-34,
+ImageNet-1k weights, height-only stride surgery, per-column CTC head - no
+sequence module, batch-independent by construction) +
+`finetune_torch.py` (MPS loop importing the SAME single-source pieces:
+VINRecognitionDataset preprocessing, ctc_input_lengths,
+update_early_stopping, canonical decode/metrics, tracked runs, MLflow 3
+LoggedModel workflow on completion). MPS facts measured first:
+`aten::_ctc_loss` unimplemented on MPS -> CPU-bridge loss (log-probs to
+CPU, autograd bridges devices); train step batch-16: MPS 0.264s vs
+torch-CPU 2.451s (9.3x) vs paddle-CPU 4.40s (16.7x). Cross-stack CTC
+parity pinned (torch vs paddle per-sample losses, rtol 1e-3). 14 new
+tests.
+
+**Runs.** `train/Rosetta-ResNet34-torch-in1k` (`3e340663`, curves +
+finals; post-training pt2 export crashed on the then-missing
+input_example - fixed in code - so the LoggedModel + registry step was
+completed by `register/Rosetta-ResNet34-IN1K`, metrics measured in-run).
+Comparison rows in `model_comparison`. Registry:
+`vin-rosetta-resnet34-torch` v1, alias `production-candidate`.
+
+**Result (canonical, single-image).**
+
+| split | char accuracy | exact match |
+|---|---|---|
+| val-102 | **98.73%** | **85.3%** (87/102) |
+| test-40 | **99.26%** | **90.0%** (36/40) |
+
+30 epochs in **52 minutes** on MPS (~100-125s/epoch incl. validation) vs
+the paddle-CPU Rosetta's 3.75h for 63.15%/0%. Stock engine surpassed at
+epoch 7 (char) and epoch 12 (exact). Wilson 95% CI on 36/40 is
+[0.77, 0.96]: consistent with but not yet proof of the ~95% industry
+target - a larger held-out set is the next measurement.
+
+**Also measured.**
+- Paddle-Rosetta (scratch, same data): val 63.15%/0, test 64.56%/0 - the
+  fabricated "46.51% exact" claim is now empirically bounded: the real
+  architecture from scratch achieves zero exact matches.
+- The postprocessor HURTS this model (val char 98.73 -> 95.73, exact
+  unchanged): at this accuracy its extraction/correction can only damage
+  already-correct reads. Deployment should use it for checksum GATING
+  only, not correction.
+- ImageNet download corrupted in-flight once (hash mismatch crash);
+  manual fetch verified sha256 b627a593 and cached.
+
+**Verdict.** The from-scratch era is closed twice over. Production
+candidate registered; remaining before it becomes the production DEFAULT:
+torch inference integration into VINOCRPipeline (the deployed pipeline is
+paddle-based), plus a larger test set for the 95% claim. Training on this
+machine is now 16.7x faster than the paddle-CPU baseline it replaces.
+
 
 ### 2026-08-20 — Rosetta + ResNet34_vd: the fiction is now a real, measured candidate
 

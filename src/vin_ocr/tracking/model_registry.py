@@ -40,7 +40,10 @@ import numpy as np
 import mlflow
 import mlflow.pyfunc
 
-REGISTERED_MODEL_NAME = "vin-recognizer"
+#: Registry name of the from-scratch checkpoint family (v1-v3, refuted
+#: route - see LOGBOOK 2026-08-19/20). New model families (e.g. pretrained
+#: warm starts) must register under their OWN name, passed explicitly.
+REGISTERED_MODEL_NAME = "vin-recognizer-scratch"
 
 
 # =============================================================================
@@ -172,6 +175,7 @@ def evaluate_checkpoint(
     dict_path: str = "configs/vin_dict.txt",
     max_samples: Optional[int] = None,
     legacy_batch_axis_attention: bool = False,
+    postprocess: bool = False,
 ) -> Dict[str, float]:
     """
     Evaluate a checkpoint on a label file with the canonical metrics.
@@ -182,6 +186,12 @@ def evaluate_checkpoint(
     batched evaluation (batch independence is a tested model invariant).
     Set legacy_batch_axis_attention=True only for checkpoints trained
     before the 2026-08-20 fix - see _load_recognizer.
+
+    Args:
+        postprocess: Score the deployable variant - each decoded string is
+            run through VINPostProcessor (artifact stripping, charset
+            fixes, VIN extraction) before comparison, exactly as the
+            pipeline serves it. Default False scores the bare decode.
 
     Returns:
         exact_match, char_accuracy, f1_micro, precision, recall, cer,
@@ -205,13 +215,21 @@ def evaluate_checkpoint(
     )
     n = len(dataset) if max_samples is None else min(max_samples, len(dataset))
 
+    post = None
+    if postprocess:
+        from src.vin_ocr.pipeline.vin_pipeline import VINPostProcessor
+        post = VINPostProcessor()
+
     pairs, checksum_ok = [], 0
     with paddle.no_grad():
         for i in range(n):
             item = dataset[i]
             logits = model(paddle.to_tensor(item['image'][None])).numpy()[0]
             text, _ = ctc_greedy_decode(logits.argmax(-1), idx_to_char)
-            pred = text[:17]
+            if post is not None:
+                pred = post.process(text)["vin"] or ""
+            else:
+                pred = text[:17]
             pairs.append((pred, item['text']))
             checksum_ok += validate_vin(pred).checksum_valid
 

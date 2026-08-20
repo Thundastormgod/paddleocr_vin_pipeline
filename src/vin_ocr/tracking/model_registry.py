@@ -27,6 +27,8 @@ Requires the [tracking] extra plus paddle at load/serve time.
 
 from __future__ import annotations
 
+import json
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -45,9 +47,18 @@ REGISTERED_MODEL_NAME = "vin-recognizer"
 # PYFUNC MODEL - the versioned, deployable unit
 # =============================================================================
 
-def _load_recognizer(checkpoint_path: str, config_path: str, dict_path: str):
+def _load_recognizer(checkpoint_path: str, config_path: str, dict_path: str,
+                     legacy_batch_axis_attention: bool = False):
     """
     Build the recognition model and its decode context from a checkpoint.
+
+    Args:
+        legacy_batch_axis_attention: Load under the pre-2026-08-20 defect
+            semantics (transformer attends across the batch axis). Required
+            for checkpoints TRAINED under that defect: under the fixed
+            forward the same weights score 0.1113 val char accuracy vs
+            0.6661 under the semantics they were trained with (measured,
+            stage-3b epoch 44, val-102). Never use for new checkpoints.
 
     Returns:
         (model, idx_to_char, config) with the model in eval mode.
@@ -71,7 +82,10 @@ def _load_recognizer(checkpoint_path: str, config_path: str, dict_path: str):
     config = yaml.safe_load(Path(config_path).read_text())
     char_to_idx, idx_to_char = load_char_dict(dict_path)
 
-    model = VINRecognitionModel(config, num_classes(char_to_idx))
+    model = VINRecognitionModel(
+        config, num_classes(char_to_idx),
+        legacy_batch_axis_attention=legacy_batch_axis_attention,
+    )
     state = paddle.load(checkpoint_path)
 
     model_keys = set(model.state_dict().keys())
@@ -97,10 +111,22 @@ class VINRecognizerPyfunc(mlflow.pyfunc.PythonModel):
     """
 
     def load_context(self, context) -> None:
+        # Semantics basis: a "semantics.json" artifact records which forward
+        # the checkpoint was trained/measured under. Its ABSENCE means the
+        # model was logged before the batch-axis attention fix (2026-08-20),
+        # so it must load under the legacy semantics it was measured with -
+        # under the fixed forward those weights score 0.1113 vs 0.6661 val
+        # char accuracy (measured). New registrations write the file.
+        legacy = True
+        semantics_path = context.artifacts.get("semantics")
+        if semantics_path and Path(semantics_path).is_file():
+            semantics = json.loads(Path(semantics_path).read_text())
+            legacy = bool(semantics["legacy_batch_axis_attention"])
         self.model, self.idx_to_char, self.config = _load_recognizer(
             context.artifacts["checkpoint"],
             context.artifacts["config"],
             context.artifacts["char_dict"],
+            legacy_batch_axis_attention=legacy,
         )
 
     def predict(self, context, model_input, params=None) -> List[Dict[str, Any]]:
@@ -145,9 +171,17 @@ def evaluate_checkpoint(
     config_path: str = "configs/vin_finetune_config.yml",
     dict_path: str = "configs/vin_dict.txt",
     max_samples: Optional[int] = None,
+    legacy_batch_axis_attention: bool = False,
 ) -> Dict[str, float]:
     """
     Evaluate a checkpoint on a label file with the canonical metrics.
+
+    Every image is decoded one at a time (batch size 1): the number this
+    returns is the deployment-relevant single-image score by construction,
+    and under the fixed batch-first forward it is provably identical to any
+    batched evaluation (batch independence is a tested model invariant).
+    Set legacy_batch_axis_attention=True only for checkpoints trained
+    before the 2026-08-20 fix - see _load_recognizer.
 
     Returns:
         exact_match, char_accuracy, f1_micro, precision, recall, cer,
@@ -160,7 +194,10 @@ def evaluate_checkpoint(
     from src.vin_ocr.core.vin_utils import validate_vin
     from src.vin_ocr.training.finetune_paddleocr import VINRecognitionDataset
 
-    model, idx_to_char, _ = _load_recognizer(checkpoint_path, config_path, dict_path)
+    model, idx_to_char, _ = _load_recognizer(
+        checkpoint_path, config_path, dict_path,
+        legacy_batch_axis_attention=legacy_batch_axis_attention,
+    )
     char_to_idx, _ = load_char_dict(dict_path)
     dataset = VINRecognitionDataset(
         data_dir=data_dir, label_file=label_file,
@@ -206,6 +243,7 @@ def register_checkpoint_version(
     dict_path: str = "configs/vin_dict.txt",
     experiment: str = "vin_finetune",
     max_eval_samples: Optional[int] = None,
+    legacy_batch_axis_attention: bool = False,
 ) -> Dict[str, Any]:
     """
     Log a checkpoint as an MLflow LoggedModel, attach MEASURED metrics
@@ -234,7 +272,21 @@ def register_checkpoint_version(
         checkpoint_path, label_file,
         config_path=config_path, dict_path=dict_path,
         max_samples=max_eval_samples,
+        legacy_batch_axis_attention=legacy_batch_axis_attention,
     )
+
+    # The semantics the metrics were measured under travel WITH the model:
+    # the pyfunc reads this artifact at load time, so a legacy checkpoint
+    # can never silently serve under the fixed forward (or vice versa).
+    semantics_path = Path(tempfile.mkdtemp(prefix="vin_semantics_")) / "semantics.json"
+    semantics_path.write_text(json.dumps({
+        "legacy_batch_axis_attention": legacy_batch_axis_attention,
+        "forward_contract": (
+            "pre-2026-08-20 batch-axis attention (defect reproduction)"
+            if legacy_batch_axis_attention else
+            "batch-first [B, T, C]; batch-independent (fixed 2026-08-20)"
+        ),
+    }, indent=1))
 
     info_path = Path(checkpoint_path).with_name(
         Path(checkpoint_path).stem + "_info.json"
@@ -256,12 +308,14 @@ def register_checkpoint_version(
                 "checkpoint": checkpoint_path,
                 "config": config_path,
                 "char_dict": dict_path,
+                "semantics": str(semantics_path),
             },
             params={
                 "architecture": "PP-OCRv4 (PPLCNetV3 + SVTR + CTC)",
                 "checkpoint": str(checkpoint_path),
                 "stage": stage_label,
                 "decode": "core.charset.ctc_greedy_decode (blank=0)",
+                "legacy_batch_axis_attention": str(legacy_batch_axis_attention),
             },
             registered_model_name=registered_name,
         )
@@ -282,6 +336,10 @@ def register_checkpoint_version(
             "stage": stage_label,
             "eval_label_file": label_file,
             "eval_n": str(int(measured["n"])),
+            "semantics": (
+                "legacy-batch-axis-attention"
+                if legacy_batch_axis_attention else "batch-first-fixed"
+            ),
         }
         if source_run_id:
             tags["source_training_run"] = source_run_id
@@ -309,6 +367,7 @@ def traced_recognize(
     config_path: str = "configs/vin_finetune_config.yml",
     dict_path: str = "configs/vin_dict.txt",
     experiment: str = "vin_finetune",
+    legacy_batch_axis_attention: bool = False,
 ) -> Dict[str, Any]:
     """
     Recognize one image with an MLflow trace: preprocess -> forward ->
@@ -323,7 +382,10 @@ def traced_recognize(
     from src.vin_ocr.training.finetune_paddleocr import VINRecognitionDataset
 
     mlflow.set_experiment(experiment)
-    model, idx_to_char, _ = _load_recognizer(checkpoint_path, config_path, dict_path)
+    model, idx_to_char, _ = _load_recognizer(
+        checkpoint_path, config_path, dict_path,
+        legacy_batch_axis_attention=legacy_batch_axis_attention,
+    )
     char_to_idx, _ = load_char_dict(dict_path)
 
     with mlflow.start_span(name="vin_recognition") as root:

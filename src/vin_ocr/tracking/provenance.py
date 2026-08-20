@@ -79,9 +79,10 @@ class Provenance:
         data: DVC hashes and dataset fingerprints.
         logbook: Narrative entry, or None when LOGBOOK.md is absent.
         captured_at: UTC timestamp, ISO 8601, of capture - a real clock read,
-            not a placeholder. (``architecture_summary.json`` previously
+            not a placeholder. (A fabrication-era summary artifact previously
             carried a hardcoded timestamp that made a re-run byte-identical
-            and therefore indistinguishable from a measurement.)
+            and therefore indistinguishable from a measurement; removed
+            2026-08-20.)
     """
 
     git: GitState

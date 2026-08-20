@@ -6,14 +6,15 @@ Why this package exists
 This repository has shipped numbers that could not be traced to the code that
 produced them:
 
-* ``validate_architectures.py`` emitted a 46.51% accuracy figure while
-  importing only ``yaml``, ``json`` and ``pathlib`` - it loaded no model, no
-  dataset and no checkpoint.
-* ``zenml_vin_pipeline.run_training_experiment`` returned hardcoded metrics
-  marked ``# Simulated`` without ever calling ``train()``, and downstream steps
-  derived a "performance tier" and "recommendations" from them.
+* A validation script emitted a 46.51% accuracy figure while importing only
+  ``yaml``, ``json`` and ``pathlib`` - it loaded no model, no dataset and no
+  checkpoint. (Removed 2026-08-20 with the rest of the fabrication-era
+  documents; git history retains them.)
+* A pipeline script returned hardcoded metrics marked ``# Simulated`` without
+  ever calling ``train()``, and downstream steps derived a "performance tier"
+  and "recommendations" from them. (Removed with the same sweep.)
 * The README reported exact-match accuracy as ``19/382`` when the underlying
-  record showed ``sample_size_for_metrics = 20``.
+  record showed ``sample_size_for_metrics = 20``. (Rewritten.)
 
 Each was found by reading the code. None could have been caught by reading the
 results, because a result was just a number in a JSON file with no link to

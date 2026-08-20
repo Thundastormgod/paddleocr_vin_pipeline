@@ -1,2 +1,0 @@
-Model,Total Images,With Ground Truth,Exact Matches,Exact Match Acc,Char Acc,F1 Micro,F1 Macro,Avg Confidence,Avg Time
-🎯 Fine-tuned: vin_rec_finetune/epoch_25,50,50,0,0.0,0.0,0.0,0.0,0.0,0.005419783592224121

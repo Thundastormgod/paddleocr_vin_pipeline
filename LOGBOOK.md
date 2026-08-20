@@ -76,6 +76,42 @@ survives the cleanup: a number without a run ID is not a measurement.
 
 ## Entries
 
+### 2026-08-20 — Rosetta + ResNet34_vd: the fiction is now a real, measured candidate
+
+**Context.** Fabrication-era documents (removed earlier today) DESCRIBED a
+"Rosetta + ResNet34_vd" scoring 46.51% exact match while no such
+architecture existed anywhere in code. Ordered follow-up: implement it for
+real as a comparison candidate. Nothing carries over from those numbers.
+
+**Change.** `RosettaRecognitionModel` - faithful to Borisyuk, Gordo &
+Sivakumar (KDD 2018): ResNet34-vd backbone (deep 3-conv stem, [3,4,6,3]
+BasicBlockVd stages, avg-pool downsample shortcuts, height-only strides in
+late stages) -> height pool -> per-column Linear -> CTC. NO sequence
+module - every timestep predicted from its receptive field alone, so the
+model is batch-independent by construction. 21,338,498 params (measured;
+6.6x LCNetV3-SVTR-CTC). Geometry: 48x320 -> [B, 512, 3, 80] -> T=80 =
+width/4, same timestep axis as the SVTR path and above the 2*17+1 CTC
+bound. Wired through trainer dispatch (`algorithm: Rosetta`), registry
+loader (rejects legacy mode: this class postdates the batch-axis fix),
+`configs/vin_rosetta_config.yml`, and two comparison specs (bare and
++postproc) that skip with a reason until a checkpoint exists. Six new
+invariant tests (geometry, full-model batch independence WITH verified
+discriminating power - residual paths keep random-init features alive,
+unlike the LCNet backbone - parameter budget, no-sequence-module,
+both dispatches).
+
+**Measured before launch.** LR sensitivity on the synthetic micro-set:
+at the stage-1 recipe's 1e-3 peak the 21.3M ResNet DIVERGED
+(13.23 -> 19.21); 3e-4 marginal; 1e-4 fell monotonically (13.23 -> 9.10
+over 6 epochs). Real run launched at peak 2e-4, warmup 5, cosine 30 -
+the one recorded recipe deviation from stage-1, chosen from measurement.
+
+**Runs.** `train/Rosetta-ResNet34vd-stage1` (`0c1e13dc...`), 2,387-crop
+train split, CPU, ~7.5 min/epoch, in progress at entry time. Comparison
+numbers will be added to `model_comparison` ONLY when measured; this entry
+records the implementation, not a result.
+
+
 ### 2026-08-20 — Batch-axis attention: the metrics were measuring batch composition
 
 **Hypothesis (audit trigger).** The trainer recorded 75.49% val char

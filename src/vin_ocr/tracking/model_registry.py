@@ -78,7 +78,10 @@ def _load_recognizer(checkpoint_path: str, config_path: str, dict_path: str,
     import yaml
 
     from src.vin_ocr.core.charset import load_char_dict, num_classes
-    from src.vin_ocr.training.finetune_paddleocr import VINRecognitionModel
+    from src.vin_ocr.training.finetune_paddleocr import (
+        RosettaRecognitionModel,
+        VINRecognitionModel,
+    )
 
     for path in (checkpoint_path, config_path):
         if not Path(path).is_file():
@@ -87,10 +90,21 @@ def _load_recognizer(checkpoint_path: str, config_path: str, dict_path: str,
     config = yaml.safe_load(Path(config_path).read_text())
     char_to_idx, idx_to_char = load_char_dict(dict_path)
 
-    model = VINRecognitionModel(
-        config, num_classes(char_to_idx),
-        legacy_batch_axis_attention=legacy_batch_axis_attention,
-    )
+    # The config's algorithm selects the network, exactly as in the trainer.
+    algorithm = str(config.get('Architecture', {}).get('algorithm', 'PP-OCRv4'))
+    arch_key = algorithm.replace('_', '-').lower()
+    if arch_key == 'rosetta':
+        if legacy_batch_axis_attention:
+            raise ValueError(
+                "Rosetta-ResNet34vd has no legacy mode: it postdates the "
+                "batch-axis attention fix and contains no sequence module"
+            )
+        model = RosettaRecognitionModel(config, num_classes(char_to_idx))
+    else:
+        model = VINRecognitionModel(
+            config, num_classes(char_to_idx),
+            legacy_batch_axis_attention=legacy_batch_axis_attention,
+        )
     state = paddle.load(checkpoint_path)
 
     model_keys = set(model.state_dict().keys())

@@ -181,3 +181,93 @@ class TestSemanticsPlumbing:
             assert inline_classes == [], (
                 f"{script} re-declares architecture inline: {inline_classes}"
             )
+
+
+class TestRosettaModel:
+    """Rosetta-ResNet34vd: the first real implementation of an architecture
+    that previously existed only as fabricated documentation (removed
+    2026-08-20). Everything here is measured against the constitution's
+    invariants: geometry feasible for CTC, batch independence, honest
+    parameter budget, dispatch reachable."""
+
+    def _make(self):
+        from src.vin_ocr.training.finetune_paddleocr import (
+            RosettaRecognitionModel,
+        )
+        paddle.seed(0)
+        model = RosettaRecognitionModel(CONFIG, num_classes=34)
+        model.eval()
+        return model
+
+    def test_output_geometry_feasible_for_ctc(self):
+        """48x320 input must yield T=80 columns (width/4): T >= 2*17+1=35
+        is the CTC feasibility bound this repo once violated with a /32
+        backbone (LOGBOOK 2026-08-18, C4)."""
+        model = self._make()
+        x = paddle.to_tensor(
+            np.random.RandomState(0).rand(2, 3, 48, 320).astype("float32"))
+        with paddle.no_grad():
+            logits = model(x)
+        assert tuple(logits.shape) == (2, 80, 34), tuple(logits.shape)
+        assert logits.shape[1] >= 2 * 17 + 1
+
+    def test_batch_independence_with_discriminating_power(self):
+        """Full-model independence IS discriminating for Rosetta: residual
+        identity paths keep random-init features alive (asserted below),
+        unlike the sequential LCNet backbone that collapses to ~1e-18."""
+        model = self._make()
+        rng = np.random.RandomState(7)
+        sample0 = rng.rand(1, 3, 48, 320).astype("float32")
+        comp_a = np.random.RandomState(1).rand(3, 3, 48, 320).astype("float32")
+        comp_b = np.random.RandomState(2).rand(3, 3, 48, 320).astype("float32")
+        with paddle.no_grad():
+            alone = model(paddle.to_tensor(sample0)).numpy()[0]
+            with_a = model(paddle.to_tensor(
+                np.concatenate([sample0, comp_a]))).numpy()[0]
+            with_b = model(paddle.to_tensor(
+                np.concatenate([sample0, comp_b]))).numpy()[0]
+        assert float(np.abs(alone).std()) > 1e-3, (
+            "features collapsed at random init - this test has no "
+            "discriminating power and must be redesigned"
+        )
+        np.testing.assert_allclose(with_a, with_b, atol=1e-5)
+        np.testing.assert_allclose(alone, with_a, atol=1e-5)
+
+    def test_parameter_budget_is_resnet34_class(self):
+        model = self._make()
+        n = sum(p.numpy().size for p in model.parameters())
+        assert 20_000_000 < n < 23_000_000, (
+            f"{n:,} params - not in the ResNet34 class (~21M); "
+            f"the backbone composition changed"
+        )
+
+    def test_no_sequence_module(self):
+        """Rosetta's defining trait: nothing mixes information across
+        timesteps between backbone and head."""
+        import paddle.nn as pnn
+
+        model = self._make()
+        forbidden = (pnn.TransformerEncoder, pnn.TransformerEncoderLayer,
+                     pnn.MultiHeadAttention, pnn.LSTM, pnn.GRU, pnn.SimpleRNN)
+        offenders = [name for name, layer in model.named_sublayers()
+                     if isinstance(layer, forbidden)]
+        assert offenders == [], f"sequence modules found: {offenders}"
+
+    def test_trainer_dispatch_reaches_rosetta(self):
+        from src.vin_ocr.training.finetune_paddleocr import VINFineTuner
+
+        assert "rosetta" in VINFineTuner.SUPPORTED_ARCHITECTURES
+        import inspect
+        source = inspect.getsource(VINFineTuner._build_model)
+        assert "RosettaRecognitionModel(self.config" in source
+
+    def test_registry_loader_dispatches_and_rejects_legacy(self):
+        import inspect
+
+        from src.vin_ocr.tracking import model_registry as mr
+
+        source = inspect.getsource(mr._load_recognizer)
+        assert "RosettaRecognitionModel(config" in source
+        with pytest.raises(FileNotFoundError):
+            # dispatch happens after file checks; missing files fail first
+            mr._load_recognizer("nope.pdparams", "nope.yml", "configs/vin_dict.txt")

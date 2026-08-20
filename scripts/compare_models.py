@@ -58,14 +58,16 @@ def _read_epoch(checkpoint: str) -> Optional[int]:
 
 
 def eval_checkpoint_on_split(checkpoint: str, label_file: str,
-                             postprocess: bool) -> Dict[str, float]:
+                             postprocess: bool, legacy: bool,
+                             config_path: str) -> Dict[str, float]:
     """Canonical single-image evaluation (see evaluate_checkpoint)."""
     from src.vin_ocr.tracking.model_registry import evaluate_checkpoint
 
     started = time.time()
     measured = evaluate_checkpoint(
         checkpoint, label_file,
-        legacy_batch_axis_attention=True,   # basis of every scratch checkpoint
+        config_path=config_path,
+        legacy_batch_axis_attention=legacy,
         postprocess=postprocess,
     )
     measured["errors"] = 0.0  # decode path is total: every image scores
@@ -135,7 +137,14 @@ class ModelSpec:
         self.available = available  # returns skip reason or None
 
 
-def _ckpt_spec(name: str, checkpoint: str, postprocess: bool) -> ModelSpec:
+def _ckpt_spec(name: str, checkpoint: str, postprocess: bool,
+               family: str = "LCNetV3-SVTR-CTC 3.23M (from-scratch, refuted route)",
+               legacy: bool = True,
+               config_path: str = "configs/vin_finetune_config.yml") -> ModelSpec:
+    """Checkpoint row. `legacy`/`config_path` MUST match the checkpoint's
+    training basis: LCNetV3-SVTR-CTC checkpoints predate the batch-axis fix
+    (legacy=True, finetune config); Rosetta postdates it (legacy=False,
+    rosetta config selects the architecture via its algorithm key)."""
     def available() -> Optional[str]:
         if not Path(checkpoint).is_file():
             return f"checkpoint missing: {checkpoint}"
@@ -143,14 +152,16 @@ def _ckpt_spec(name: str, checkpoint: str, postprocess: bool) -> ModelSpec:
 
     return ModelSpec(
         name=name,
-        family="LCNetV3-SVTR-CTC 3.23M (from-scratch, refuted route)",
-        semantics="legacy-batch-axis-attention",
+        family=family,
+        semantics=("legacy-batch-axis-attention" if legacy
+                   else "batch-first (post-fix, batch-independent)"),
         evaluator=lambda label_file: eval_checkpoint_on_split(
-            checkpoint, label_file, postprocess),
+            checkpoint, label_file, postprocess, legacy, config_path),
         params={
             "weights": checkpoint,
             "epoch": _read_epoch(checkpoint),
             "postprocess": postprocess,
+            "config": config_path,
             "input": "pre-cropped plate, VINRecognitionDataset preprocessing",
         },
         available=available,
@@ -199,6 +210,16 @@ def build_specs() -> List[ModelSpec]:
                    "output/vin_rec_finetune_stage3/latest.pdparams", postprocess=False),
         _ckpt_spec("LCNetV3-SVTR-CTC-ep44+postproc",
                    "output/vin_rec_finetune_stage3/latest.pdparams", postprocess=True),
+        _ckpt_spec("Rosetta-ResNet34vd",
+                   "output/vin_rosetta/latest.pdparams", postprocess=False,
+                   family="Rosetta-ResNet34vd 21.3M (from-scratch)",
+                   legacy=False,
+                   config_path="configs/vin_rosetta_config.yml"),
+        _ckpt_spec("Rosetta-ResNet34vd+postproc",
+                   "output/vin_rosetta/latest.pdparams", postprocess=True,
+                   family="Rosetta-ResNet34vd 21.3M (from-scratch)",
+                   legacy=False,
+                   config_path="configs/vin_rosetta_config.yml"),
     ]
 
 

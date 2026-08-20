@@ -1185,6 +1185,142 @@ class PPOCRv5RecognitionModel(nn.Layer):
         logger.info(f"PP-OCRv5 model exported for inference: {save_path}")
 
 
+class BasicBlockVd(nn.Layer):
+    """
+    ResNet-D basic block (He et al. 2015 block + the 'vd' downsampling trick).
+
+    Main path: conv3x3(stride) -> BN -> ReLU -> conv3x3 -> BN.
+    Shortcut: identity when shape is preserved; otherwise AvgPool(stride)
+    followed by conv1x1(stride 1) + BN - the ResNet-vd variant, which keeps
+    the information a strided 1x1 conv would discard.
+    Output: ReLU(main + shortcut). Strides may be (h, w) tuples so text
+    backbones can downsample height faster than width.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, stride=1):
+        super().__init__()
+        stride_hw = stride if isinstance(stride, (tuple, list)) else (stride, stride)
+
+        self.conv1 = nn.Conv2D(in_channels, out_channels, 3,
+                               stride=stride_hw, padding=1, bias_attr=False)
+        self.bn1 = nn.BatchNorm2D(out_channels)
+        self.conv2 = nn.Conv2D(out_channels, out_channels, 3,
+                               stride=1, padding=1, bias_attr=False)
+        self.bn2 = nn.BatchNorm2D(out_channels)
+
+        if stride_hw != (1, 1) or in_channels != out_channels:
+            shortcut_layers = []
+            if stride_hw != (1, 1):
+                shortcut_layers.append(nn.AvgPool2D(
+                    kernel_size=stride_hw, stride=stride_hw,
+                    padding=0, ceil_mode=True))
+            shortcut_layers.extend([
+                nn.Conv2D(in_channels, out_channels, 1, stride=1,
+                          bias_attr=False),
+                nn.BatchNorm2D(out_channels),
+            ])
+            self.shortcut = nn.Sequential(*shortcut_layers)
+        else:
+            self.shortcut = None
+
+    def forward(self, x: paddle.Tensor) -> paddle.Tensor:
+        identity = self.shortcut(x) if self.shortcut is not None else x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return F.relu(out + identity)
+
+
+class ResNet34vdBackbone(nn.Layer):
+    """
+    ResNet34-vd feature extractor tuned for 48x320 text-line crops.
+
+    Deep stem (vd): three 3x3 convs (32, 32, 64) at stride 1, then 3x3
+    max-pool stride 2. Stages follow ResNet-34's [3, 4, 6, 3] BasicBlock
+    layout at [64, 128, 256, 512] channels; later stages downsample height
+    only (stride (2, 1)), so a 48x320 input yields [B, 512, 3, 80] - the
+    width axis keeps 80 columns (width/4), the same timestep geometry as
+    the LCNetV3-SVTR path (T=80 >= 2*17+1, the CTC feasibility bound this
+    repo once violated with a /32 backbone).
+    """
+
+    STAGES = [
+        # (blocks, out_channels, first_stride)
+        (3, 64, (1, 1)),
+        (4, 128, (2, 2)),
+        (6, 256, (2, 1)),
+        (3, 512, (2, 1)),
+    ]
+
+    def __init__(self, in_channels: int = 3):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2D(in_channels, 32, 3, stride=1, padding=1, bias_attr=False),
+            nn.BatchNorm2D(32), nn.ReLU(),
+            nn.Conv2D(32, 32, 3, stride=1, padding=1, bias_attr=False),
+            nn.BatchNorm2D(32), nn.ReLU(),
+            nn.Conv2D(32, 64, 3, stride=1, padding=1, bias_attr=False),
+            nn.BatchNorm2D(64), nn.ReLU(),
+        )
+        self.pool = nn.MaxPool2D(kernel_size=3, stride=2, padding=1)
+
+        stages = []
+        channels = 64
+        for blocks, out_channels, first_stride in self.STAGES:
+            for block_index in range(blocks):
+                stride = first_stride if block_index == 0 else (1, 1)
+                stages.append(BasicBlockVd(channels, out_channels, stride))
+                channels = out_channels
+        self.stages = nn.Sequential(*stages)
+        self.out_channels = channels
+
+    def forward(self, x: paddle.Tensor) -> paddle.Tensor:
+        x = self.pool(self.stem(x))
+        return self.stages(x)
+
+
+class RosettaRecognitionModel(nn.Layer):
+    """
+    Rosetta-ResNet34vd: fully-convolutional CTC recognizer.
+
+    Faithful to the Rosetta design (Borisyuk, Gordo & Sivakumar, KDD 2018):
+    a convolutional backbone whose column features feed CTC DIRECTLY - no
+    recurrent, transformer or any other sequence module between backbone
+    and head, so every timestep is predicted from its receptive field
+    alone. Composition here: ResNet34-vd backbone -> height average-pool
+    -> per-column Linear head. Batch-independent by construction (no
+    cross-sample or cross-timestep mixing anywhere; pinned by
+    TestRosettaModel).
+
+    Provenance note: fabrication-era documents in this repository DESCRIBED
+    a "Rosetta + ResNet34_vd" achieving 46.51% exact match while no such
+    architecture existed in code (those documents were removed 2026-08-20).
+    This class is the first real implementation - added 2026-08-20 as a
+    comparison candidate - and it inherits nothing from those numbers:
+    its metrics exist only where a tracked MLflow run measured them.
+
+    Geometry: [B, 3, 48, 320] -> backbone [B, 512, 3, 80] -> pool
+    [B, 512, 1, 80] -> [B, 80, 512] -> head -> logits [B, 80, num_classes].
+    """
+
+    def __init__(self, config: Dict, num_classes: int):
+        super().__init__()
+        assert num_classes >= 2, f"CTC needs blank + alphabet, got {num_classes}"
+        self.num_classes = num_classes
+        self.backbone = ResNet34vdBackbone(in_channels=3)
+        self.pool = nn.AdaptiveAvgPool2D((1, None))
+        head_config = config.get('Architecture', {}).get('Head', {})
+        self.dropout = nn.Dropout(head_config.get('dropout', 0.1))
+        self.head = nn.Linear(self.backbone.out_channels, num_classes)
+
+    def forward(self, x: paddle.Tensor) -> paddle.Tensor:
+        assert x.ndim == 4, f"expected [B, C, H, W], got rank {x.ndim}"
+        features = self.backbone(x)             # [B, 512, H', W']
+        features = self.pool(features)          # [B, 512, 1, W']
+        features = features.squeeze(2)          # [B, 512, W']
+        features = features.transpose([0, 2, 1])  # [B, T, 512]
+        return self.head(self.dropout(features))  # [B, T, num_classes]
+
+
 # =============================================================================
 # TRAINING LOOP
 # =============================================================================
@@ -1374,6 +1510,7 @@ class VINFineTuner:
     SUPPORTED_ARCHITECTURES = {
         'pp-ocrv4': 'PPLCNetV3 backbone + SVTR encoder + CTC head',
         'pp-ocrv5': 'PPHGNetV2 backbone + SVTR encoder + CTC head',
+        'rosetta': 'ResNet34-vd backbone + per-column CTC (no sequence module)',
     }
 
     def _build_model(self) -> nn.Layer:
@@ -1405,7 +1542,9 @@ class VINFineTuner:
                 f"Architecture.algorithm={architecture!r} is not implemented by "
                 f"finetune_paddleocr.py.\n"
                 f"This trainer builds its own paddle.nn networks; it does not load "
-                f"PaddleOCR's model zoo (Rosetta, CRNN, SVTR, ABINet, ...).\n"
+                f"PaddleOCR's model zoo (CRNN, ABINet, zoo-SVTR, ...). The "
+                f"'Rosetta' value selects this repo's own Rosetta-ResNet34vd "
+                f"implementation, not the zoo model.\n"
                 f"Supported values:\n{supported}\n"
                 f"To train a PaddleOCR model-zoo architecture, use PaddleOCR's own "
                 f"tools/train.py with that config instead."
@@ -1414,6 +1553,9 @@ class VINFineTuner:
         if arch_key == 'pp-ocrv5':
             logger.info("Architecture: PP-OCRv5 (PPHGNetV2 + SVTR + CTC head)")
             model = PPOCRv5RecognitionModel(self.config, self.num_classes)
+        elif arch_key == 'rosetta':
+            logger.info("Architecture: Rosetta (ResNet34-vd + per-column CTC)")
+            model = RosettaRecognitionModel(self.config, self.num_classes)
         else:
             logger.info("Architecture: PP-OCRv4 (PPLCNetV3 + SVTR + CTC head)")
             model = VINRecognitionModel(self.config, self.num_classes)

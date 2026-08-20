@@ -1,0 +1,141 @@
+# Rosetta-ResNet34vd training config. Derived from vin_finetune_config.yml;
+# only algorithm and save_model_dir differ - same data, schedule and gates,
+# so comparisons against the LCNetV3-SVTR-CTC runs hold the recipe constant.
+# =============================================================================
+# VIN Recognition Fine-Tuning Config
+# =============================================================================
+# Consumed by: src/vin_ocr/training/finetune_paddleocr.py
+#
+# IMPORTANT - scope of this file:
+#   This trainer builds its own paddle.nn networks (see VINRecognitionModel /
+#   PPOCRv5RecognitionModel). It does NOT drive PaddleOCR's tools/train.py and
+#   does NOT load PaddleOCR's model zoo. Only the keys documented below are
+#   read; anything else is ignored.
+#
+#   In particular there is no `transforms:` pipeline here — image
+#   preprocessing and augmentation are implemented in code, in
+#   VINRecognitionDataset._preprocess_image() and ._augment().
+#
+# Architecture / Loss / PostProcess must stay mutually consistent. The trainer
+# validates this at startup and raises if they disagree.
+# =============================================================================
+
+Global:
+  debug: false
+  # Requested device. Actual device is confirmed by HardwareDetector at runtime;
+  # if no CUDA GPU is present this silently falls back to CPU.
+  use_gpu: false          # paddle key, unused by the torch trainer
+  # Apple-GPU training (torch/MPS). 'cpu' allowed for tests and smoke.
+  device: mps
+  epoch_num: 30
+  print_batch_step: 10
+  save_model_dir: ./output/vin_rosetta_torch_in1k
+  save_epoch_step: 5
+  # Path prefix WITHOUT the .pdparams suffix, e.g. ./output/vin_rec_finetune/best_accuracy
+  pretrained_model: null
+  # 34 entries: '<blank>' at index 0 (CTC blank) + 33 valid VIN characters.
+  character_dict_path: ./configs/vin_dict.txt
+  max_text_length: 17
+  use_amp: false
+  # Early stopping. Loss-aware: the patience counter resets when EITHER
+  # validation exact-match accuracy improves by min_delta OR validation
+  # loss falls by loss_min_delta. Accuracy alone is a defective stopping
+  # signal for CTC: it sits at exactly 0 through the whole blank-collapse
+  # phase (observed live: val_loss fell 13.6 -> 0.91 over 17 epochs while
+  # exact-match stayed 0.0). min_epochs is a floor below which the stopper
+  # never fires.
+  early_stopping: true
+  early_stopping_patience: 25
+  early_stopping_min_delta: 0.001
+  early_stopping_loss_min_delta: 0.005
+  # Char accuracy also resets the counter (measured: it improves for many
+  # epochs after val loss plateaus, and selects the better test-set model).
+  early_stopping_char_min_delta: 0.002
+  early_stopping_min_epochs: 10
+
+Optimizer:
+  # Supported: Adam | AdamW | Momentum (alias SGD)
+  name: Adam
+  beta1: 0.9
+  beta2: 0.999
+  lr:
+    # Supported: Cosine | Step | Piecewise | Const
+    name: Cosine
+    # Warm-started backbone + fresh head: peak 2e-4 with 3-epoch warmup.
+    # The paddle-Rosetta micro-set LR sensitivity (1e-3 diverges) informed
+    # the same conservative peak here; smoke-verified before launch.
+    learning_rate: 0.0002
+    T_max: 30                 # cosine period, in epochs
+    eta_min: 0.0
+    # Linear warmup ramps warmup_start_lr -> learning_rate over warmup_epoch
+    # epochs. warmup_start_lr is absolute, NOT a fraction of learning_rate.
+    warmup_epoch: 3
+    warmup_start_lr: 1.0e-06
+  regularizer:
+    name: L2
+    factor: 0.00001
+
+Architecture:
+  # PaddleOCR task type. Informational only for this trainer.
+  model_type: rec
+  # THE selector - the only Architecture key that changes the network.
+  # Supported: PP-OCRv4 | PP-OCRv5
+  #   PP-OCRv4 -> PPLCNetV3 backbone + SVTR encoder + CTC head
+  #   PP-OCRv5 -> PPHGNetV2 backbone + SVTR encoder + CTC head
+  # The backbone is implied by `algorithm`; there is no separate Backbone key,
+  # because nothing reads one (declaring `Backbone.name: ResNet34_vd` would be
+  # silently ignored, which is how the previous config misled).
+  # Rosetta for torch/MPS: torchvision ResNet-34 backbone with height-only
+  # stride surgery + per-column CTC head (torch_rosetta.py). ImageNet-1k
+  # warm start ON: pretrained warm starts are the #1 measured lever
+  # (from-scratch refuted 82.70 vs 66.61 val char).
+  algorithm: RosettaTorch
+  pretrained_backbone: true
+  Neck:
+    # Only Neck.hidden_dim and Neck.Transformer.* are read.
+    hidden_dim: 256
+    Transformer:
+      num_heads: 8
+      num_layers: 2
+      dropout: 0.1
+  Head:
+    # Only Head.dropout is read; the head type is fixed by `algorithm`.
+    dropout: 0.1
+
+Loss:
+  # Supported: CTCLoss | CrossEntropyLoss
+  # CTCLoss is the default: it handles sequence alignment natively and is the
+  # better performer on this dataset. Must pair with PostProcess CTCLabelDecode.
+  name: CTCLoss
+
+PostProcess:
+  # CTCLabelDecode  <-> Loss: CTCLoss
+  # SARLabelDecode  <-> Loss: CrossEntropyLoss
+  name: CTCLabelDecode
+  character_dict_path: ./configs/vin_dict.txt
+
+
+Train:
+  dataset:
+    name: SimpleDataSet
+    data_dir: ./finetune_data/
+    label_file_list:
+      - ./finetune_data/train_labels.txt
+  loader:
+    shuffle: true
+    batch_size_per_card: 16
+    drop_last: true
+    num_workers: 0
+
+Eval:
+  dataset:
+    name: SimpleDataSet
+    data_dir: ./finetune_data/
+    label_file_list:
+      - ./finetune_data/val_labels.txt
+  loader:
+    shuffle: false
+    drop_last: false
+    batch_size_per_card: 16
+    num_workers: 0
+

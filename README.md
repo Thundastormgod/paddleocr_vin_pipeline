@@ -17,7 +17,8 @@ full measurement record and the removal of the fabrication-era documents.
 
 | Model | val-102 char / exact | test-40 char / exact |
 |---|---|---|
-| **PP-OCRv3-mobile + pipeline (production default)** | **82.70% / 25.5%** | **87.79% / 37.5%** |
+| **Rosetta-ResNet34-IN1K (torch/MPS; production candidate)** | **98.73% / 85.3%** | **99.26% / 90.0%** |
+| **PP-OCRv3-mobile + pipeline (deployed production default)** | 82.70% / 25.5% | 87.79% / 37.5% |
 | PP-OCRv3-mobile + pipeline, postprocessor OFF | 77.51% / 8.8% | 81.03% / 5.0% |
 | LCNetV3-SVTR-CTC-ep44 +postproc | 68.28% / 0% | 68.38% / 0% |
 | LCNetV3-SVTR-CTC-ep44 (registry v3, alias `best`) | 66.61% / 0% | 68.53% / 0% |
@@ -35,9 +36,11 @@ Reading the table:
   params). It is a refuted route - kept in the MLflow registry
   (`vin-lcnetv3-svtr-ctc`) as the honest record - because 2,387 training
   crops cannot compete with industrial-scale pretraining.
-- Industry target for this domain is ~95%+ exact match; nothing here is
-  production-ready yet. The measured improvement ladder (GPU + pretrained
-  warm start + input resolution) lives in `LOGBOOK.md`.
+- Industry target is ~95%+ exact match. The warm-started torch/MPS model
+  reaches 90.0% on test-40 (Wilson 95% CI [0.77, 0.96] at n=40) - the
+  target is within reach but not yet demonstrated at scale; the deployed
+  pipeline still runs the stock engine until torch inference is
+  integrated. History and levers: `LOGBOOK.md`.
 - Dataset: 2,529 crops from DagsHub `Thundastormgod/jlr-vin-ocr`,
   VIN-grouped splits 2,387/102/40, 100% checksum-valid labels, pinned by
   `finetune_data.dvc`.

@@ -25,12 +25,32 @@ rather than reconstructed afterwards.
 
 ## Current measured baseline
 
-Established from the 30 genuine Optuna trials in `optuna_results/`:
+Measured 2026-08-20 in experiment `model_comparison` (one run per model,
+identical splits, canonical metrics, every number measured in the run that
+reports it). Basis: single-image inference; scratch checkpoints under the
+legacy semantics they were trained with (see the 2026-08-20 entry).
 
-| Metric | Value | Sample |
+| Model | val-102 char / exact | test-40 char / exact |
 |---|---|---|
-| Exact match (best trial) | 41.86% | 18/43 |
-| Character accuracy (best trial) | 90.15% | 43 images |
+| **stock PP-OCRv3 + pipeline (production default)** | **82.70% / 25.5%** | **87.79% / 37.5%** |
+| stock PP-OCRv3, postprocessor OFF | 77.51% / 8.8% | 81.03% / 5.0% |
+| scratch stage-3b ep44 (+postproc) | 68.28% / 0% | 68.38% / 0% |
+| scratch stage-3b ep44 (registry v3, `scratch-best`) | 66.61% / 0% | 68.53% / 0% |
+| scratch stage-3b ep19 best-val-loss (v2) | 64.13% / 0% | 66.91% / 0% |
+| scratch stage-1 ep25 (v1) | 59.98% / 0% | 60.88% / 0% |
+| scratch stage-2 warm-restart (refuted) | 38.06% / 0% | 42.94% / 0% |
+
+The postprocessor alone is worth +5.2pp char / +16.7pp exact (val) and
++6.8pp / +32.5pp (test) to the stock engine. Repeat-eval noise floor on
+these checkpoints is ~0.1pp char (CPU-thread nondeterminism: v2 re-measured
+64.13% vs 64.24% at registration).
+
+The historical Optuna headline - 41.86% exact (18/43), 90.15% char - is no
+longer a baseline for anything: it was produced under the early-stop
+guillotine (every trial truncated at ~patience+1 epochs), scored through
+since-replaced metric implementations on a 43-image corpus under a leaky
+split policy, and the fixed tuner showed crashed trials could inherit a
+neighbour's score. It remains in `optuna_results/` as history only.
 
 Corrections on record, for anyone reading older documents:
 
@@ -49,6 +69,62 @@ Corrections on record, for anyone reading older documents:
 
 ## Entries
 
+### 2026-08-20 — Batch-axis attention: the metrics were measuring batch composition
+
+**Hypothesis (audit trigger).** The trainer recorded 75.49% val char
+accuracy for stage-3b epoch-44 while the registry recorded 66.61% for the
+same checkpoint, same split, same canonical metrics - both cannot be the
+model's score.
+
+**Investigation (all executed).** Diffing the two eval paths per sample:
+97/102 predictions differed between batch-16 and batch-1 on identical
+weights. Companion test: one image's logits moved by max|diff| 5.06 when
+its batch companions changed, 7.43 vs alone - in eval mode. Layer
+bisection with forward hooks: backbone clean, first leak at the neck.
+Cause: paddle's `TransformerEncoder` is **batch-first** (`[batch, seq,
+dim]` per its own docstring); both encoders transposed to `[T, B, C]` -
+the PyTorch convention - so self-attention ran across the batch axis at
+every timestep. At batch-1 the encoder degenerated to a per-timestep MLP
+(no sequence modeling at all).
+
+**Change (commit f198c8b).** Encoders now feed `[B, T, C]`. Fixed forward
+measured batch-independent (max|diff| 0.0; pinned at the neck level by
+`tests/test_model_batch_independence.py` - full-model tests cannot
+discriminate because an untrained backbone collapses inputs to ~1e-18
+features, itself measured). Checkpoints trained under the defect are only
+meaningful under it: the same epoch-44 weights score **0.1113** val char
+accuracy under the fixed forward. They stay executable via
+`legacy_batch_axis_attention=True`, which reproduces the registry number
+**exactly (0.6661, all four decimals)**. Semantics travel with artifacts
+(semantics.json in logged models; absence = legacy; registry version tags).
+ONNX re-export tools had a 130-line drifted inline copy of the
+architecture carrying the same defect - replaced with the canonical import
+under legacy semantics.
+
+**Runs.** Experiment `model_comparison`, one run per model, identical
+splits and metric keys, every number measured in-run (2026-08-20). Table
+now lives in "Current measured baseline" above. Key facts: stock engine
+margins confirmed on the uniform basis; the postprocessor contributes
++16.7pp (val) / +32.5pp (test) exact match to the stock engine; scratch
+stage-3b + postprocessor gains +1.7pp char on val but -0.15pp on test;
+repeat-eval noise floor ~0.1pp char (CPU threading).
+
+**Also in this entry (registry/run hygiene).** `vin-recognizer` renamed to
+`vin-recognizer-scratch` (family-accurate; alias `scratch-best` -> v3);
+version tags record semantics + measurement basis; anonymous
+`finetune-PP-OCRv4` runs renamed to what they were: `train/stage1-scratch`,
+`train/stage2-scratch-warmrestart-REFUTED`, `train/stage3a-scratch-aborted`,
+`train/stage3b-scratch-final`, `probe/{tracked,deepfix,charsel}-micro-6ep`
+(none of them were PP-OCRv4, and none were fine-tunes). The ad-hoc
+head-to-head run is tagged superseded by `model_comparison`.
+
+**Verdict.** Every number in this logbook now carries its measurement
+basis; batched and single-image evaluation are provably identical for all
+future models (tested invariant); historical numbers remain reproducible
+under their recorded semantics. The from-scratch route stays refuted -
+now on a uniform basis.
+
+
 ### 2026-08-19 — REFUTED: checksum-constrained decoding at the current error rate
 
 **Hypothesis.** Position 9 is deterministic (read at 8%, computable at
@@ -58,6 +134,8 @@ near-misses into exact matches without retraining.
 
 **Runs.** Decode-only comparison on identical stage-3b epoch-44 weights,
 val-102 + test-40 (module: core/vin_decode.py, 10 golden tests).
+(Basis note, 2026-08-20: all numbers in this entry were single-image
+evaluations - unaffected by the batch-axis attention defect.)
 
 **Result.** Refuted, twice. Ungated constrained selection: val char
 accuracy 0.6661 -> 0.6436 (worse). Gated to edit distance <=1 from the
@@ -95,6 +173,18 @@ F1 0.7491**, beating the epoch-19 best-val-loss checkpoint (66.91% /
 kept improving through 44**. Loss/accuracy decoupling is now a measured
 fact of this setup; checkpoint selection should track val char accuracy
 directly (open item).
+
+> **[BASIS CORRECTION 2026-08-20.]** The 75.49%/0.786 figures came from the
+> trainer's BATCHED eval, which - under the batch-axis attention defect
+> found later - measured a different function than deployment: attention
+> mixed the 16 batch companions into each prediction. The deployment-honest
+> (single-image) score of the same epoch-44 weights is **66.61% char /
+> 0.7452 F1** (val-102), re-measured and reproduced exactly in
+> `model_comparison`. The TEST numbers in this entry (68.53 / 66.91) were
+> already single-image and stand as written; the loss-vs-char-accuracy
+> decoupling conclusion survives under the corrected basis. The stage-1
+> comparison mixes bases: 52.19 was trainer-positional-batched, 59.98 is
+> canonical single-image.
 
 **Also observed at run end.** jit.save failed AFTER writing
 inference.json; the weights-only fallback then overwrote pdiparams,
@@ -146,7 +236,12 @@ basin (val loss 1.2-1.7) and it never returned below the epoch-11 best of
 0.8309. The loss-aware stopper (shipped mid-stage-1) worked exactly as
 designed: stop at epoch 36 after 25 genuinely non-improving epochs.
 Final eval at the perturbed epoch-36 weights: char accuracy 44.52%
-(vs 52.19% at stage-1's kill point). The run predates the
+(vs 52.19% at stage-1's kill point).
+> **[BASIS CORRECTION 2026-08-20.]** Both figures were the trainer's
+> batched eval under the batch-axis attention defect (see the 2026-08-20
+> entry). Single-image re-measurement of the same stage-2 weights:
+> **38.06% val char** (`model_comparison`). The verdict is unchanged -
+> the warm restart destroyed the basin under every basis. The run predates the
 best_val_loss checkpoint, so the epoch-11 state was not saved
 (save_epoch_step=5; nearest artifacts epoch_10/epoch_15).
 
@@ -180,6 +275,11 @@ accuracy 52.19%, F1 0.5219**. Predictions are all well-formed
 `SAL1A2A??SA60????` Land Rover VINs: the model learned the dataset's
 shared structure (~11 of 17 characters are common across plates) but not
 yet the discriminating characters.
+> **[BASIS CORRECTION 2026-08-20.]** 52.19% was the then-current trainer
+> metric (positional), computed on a BATCHED eval under the batch-axis
+> attention defect. Canonical single-image score of the same weights:
+> **59.98% char / 0.6771 F1** (registry v1, re-confirmed in
+> `model_comparison`). The under-trained-but-learning verdict stands.
 
 **Verdict.** Pipeline proven end-to-end (data → tracked training →
 checkpoints → honest evaluation); model under-trained at 26 CPU epochs
@@ -410,8 +510,15 @@ stage-3b `7bac56fa` (registry `vin-recognizer` v3).
 |---|---|---|---|---|
 | exact match | **25.5%** (26) | 0% | **37.5%** (15) | 0% |
 | char accuracy | **82.70%** | 66.61% | **87.79%** | 68.53% |
-| F1 (micro) | **0.857** | ~0.69 | **0.905** | 0.749 |
+| F1 (micro) | **0.857** | 0.7452 | **0.905** | 0.749 |
 | CER | **0.173** | 0.334 | **0.122** | 0.315 |
+
+> **[CORRECTION 2026-08-20.]** The v3 val F1 originally read "~0.69" - an
+> estimate written where a measured value existed (registry run
+> `c689e775`: 0.7452, re-confirmed in `model_comparison`). Replaced. All
+> other cells were measured. Both columns are single-image basis, so the
+> comparison is deployment-honest; margins re-confirmed on the uniform
+> basis in `model_comparison` (2026-08-20).
 
 Throughput ~0.18 s/image on CPU (dedup cache off, n=142, errors=0).
 

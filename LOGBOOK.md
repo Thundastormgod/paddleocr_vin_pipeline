@@ -87,47 +87,90 @@ has no Metal backend and its CPU build is pinned at ~1.1 of 8 cores
 #1 measured lever (pretrained warm start) should finally produce a custom
 model that beats the stock engine.
 
-**Change.** New training stack: `torch_rosetta.py` (torchvision ResNet-34,
-ImageNet-1k weights, height-only stride surgery, per-column CTC head - no
-sequence module, batch-independent by construction) +
-`finetune_torch.py` (MPS loop importing the SAME single-source pieces:
-VINRecognitionDataset preprocessing, ctc_input_lengths,
-update_early_stopping, canonical decode/metrics, tracked runs, MLflow 3
-LoggedModel workflow on completion). MPS facts measured first:
+**Change.** New training stack (torch 2.13.0 + torchvision 0.28.0):
+`torch_rosetta.py` (torchvision ResNet-34, ImageNet-1k weights,
+height-only stride surgery - layer2/3/4 first-block stride (2,1) via
+conv1 + downsample - per-column CTC head, no sequence module,
+batch-independent by construction; 21,319,174 params measured. It keeps
+torchvision's 7x7 stem, so it is NOT the paddle twin's deep 3-conv vd
+stem - hence the distinct name Rosetta-ResNet34-IN1K vs the 21,338,498-param
+Rosetta-ResNet34vd) + `finetune_torch.py` (MPS loop importing the SAME
+single-source pieces: VINRecognitionDataset preprocessing,
+ctc_input_lengths, update_early_stopping, canonical decode/metrics,
+tracked runs, MLflow 3 LoggedModel workflow on completion; pure
+`lr_at_epoch` with the warmup off-by-one fixed: first post-warmup epoch =
+peak, final epoch = eta_min). MPS facts measured first:
 `aten::_ctc_loss` unimplemented on MPS -> CPU-bridge loss (log-probs to
 CPU, autograd bridges devices); train step batch-16: MPS 0.264s vs
 torch-CPU 2.451s (9.3x) vs paddle-CPU 4.40s (16.7x). Cross-stack CTC
 parity pinned (torch vs paddle per-sample losses, rtol 1e-3). 14 new
 tests.
 
-**Runs.** `train/Rosetta-ResNet34-torch-in1k` (`3e340663`, curves +
-finals; post-training pt2 export crashed on the then-missing
-input_example - fixed in code - so the LoggedModel + registry step was
-completed by `register/Rosetta-ResNet34-IN1K`, metrics measured in-run).
-Comparison rows in `model_comparison`. Registry:
-`vin-rosetta-resnet34-torch` v1, alias `production-candidate`.
+**Recipe** (`configs/vin_rosetta_torch_config.yml`): Adam (0.9/0.999),
+peak LR 2e-4 with 3-epoch linear warmup from 1e-6, cosine T_max 30 ->
+eta_min 0, L2 1e-5, batch 16 drop-last (149 steps/epoch, 4,470 total),
+30 epochs, same 2,387-crop train split / val-102 / test-40 and DVC-pinned
+`finetune_data` (dir hash `3d241fe8...`) as every comparison row.
+Loss-aware early stopping (patience 25, min_epochs 10) never fired. The
+2e-4 peak carries over the paddle-Rosetta micro-set LR sensitivity
+measurement (1e-3 diverged); warmup shortened 5 -> 3 because the backbone
+starts warm.
 
-**Result (canonical, single-image).**
+**Runs.** Training: `train/Rosetta-ResNet34-torch-in1k`
+(`3e3406636f464176a5f9fefd0890d79b`) - all 30 epochs of curves + finals
+logged. The run was originally stored FAILED because the post-training
+pt2 export crashed on the then-missing input_example (required by
+torch>=2.13 - measured, fixed in code; the training itself completed).
+Status corrected to FINISHED on 2026-08-21 - the training workload
+succeeded and the crashed export step was delivered by the register run -
+with the measured end_time preserved (51.49 min) and the transition
+recorded in the run's `status_history` tag alongside the existing `note`
+annotation. The LoggedModel + registry step was completed by
+`register/Rosetta-ResNet34-IN1K` (`367c1fd126f14035b57e07f07cb9d61f`),
+which re-measured val in-run: 98.73/85.29 - matches the training run's
+best. Comparison rows in `model_comparison`: `eval/Rosetta-ResNet34-IN1K`
+(`8412a357938344148bd4177ad456ab37`) and
+`eval/Rosetta-ResNet34-IN1K+postproc`
+(`e15d5b94250f458496df40e024430e12`). Registry:
+`vin-rosetta-resnet34-torch` v1 (READY), alias `production-candidate`,
+LoggedModel `m-833ab5cc431d4fe4919986912cfd7a73` with metrics linked to
+model_id + run_id + Dataset (`val_labels`, digest `b306e257`) per the
+MLflow 3 pattern; version tags carry semantics ("batch-first (torch,
+batch-independent)"), framework `torch-2.13.0`, device trained on,
+weights file, measurement basis, and the source training run ID.
 
-| split | char accuracy | exact match |
-|---|---|---|
-| val-102 | **98.73%** | **85.3%** (87/102) |
-| test-40 | **99.26%** | **90.0%** (36/40) |
+**Result (canonical, single-image).** Registered weights =
+`best_char_accuracy.pt`, epoch 22 of 30 (global step 3,278):
 
-30 epochs in **52 minutes** on MPS (~100-125s/epoch incl. validation) vs
-the paddle-CPU Rosetta's 3.75h for 63.15%/0%. Stock engine surpassed at
-epoch 7 (char) and epoch 12 (exact). Wilson 95% CI on 36/40 is
-[0.77, 0.96]: consistent with but not yet proof of the ~95% industry
-target - a larger held-out set is the next measurement.
+| split | char accuracy | exact match | checksum-valid |
+|---|---|---|---|
+| val-102 | **98.73%** | **85.3%** (87/102) | 87.3% |
+| test-40 | **99.26%** | **90.0%** (36/40) | 90.0% |
+
+30 epochs in **51.5 minutes** (measured run start->end) on MPS
+(~100-125s/epoch incl. validation) vs the paddle-CPU Rosetta's 3.75h for
+63.15%/0%. Stock-engine val figures surpassed at epoch 7 (char: 84.14% >
+82.70%) and epoch 11 (exact: 27.45% > 25.5%); by epoch 12 the val curve
+(46.1%) also cleared the stock engine's test-40 exact (37.5%).
+[CORRECTION: this entry originally said "epoch 12 (exact)" - that was the
+val-curve-vs-test-figure crossing; the like-for-like val crossing is
+epoch 11.] Checkpoint selection mattered again: the final epoch scores
+98.39/81.4 on val, so char-accuracy selection (ep22) is +3.9pp val exact
+over taking the last epoch; best-val-loss selection would have picked
+ep20 (98.44/83.3). Wilson 95% CI on 36/40 is [0.77, 0.96]: consistent
+with but not yet proof of the ~95% industry target - a larger held-out
+set is the next measurement.
 
 **Also measured.**
 - Paddle-Rosetta (scratch, same data): val 63.15%/0, test 64.56%/0 - the
   fabricated "46.51% exact" claim is now empirically bounded: the real
   architecture from scratch achieves zero exact matches.
-- The postprocessor HURTS this model (val char 98.73 -> 95.73, exact
-  unchanged): at this accuracy its extraction/correction can only damage
-  already-correct reads. Deployment should use it for checksum GATING
-  only, not correction.
+- The postprocessor HURTS this model on char accuracy (val 98.73 ->
+  95.73, test 99.26 -> 98.38; exact unchanged at 85.3/90.0): at this
+  accuracy its extraction/correction can only damage already-correct
+  reads. It does raise the checksum-valid rate (val 87.3% -> 94.1%, test
+  90.0% -> 92.5%), which is the one thing it should be kept for:
+  deployment uses it for checksum GATING only, not correction.
 - ImageNet download corrupted in-flight once (hash mismatch crash);
   manual fetch verified sha256 b627a593 and cached.
 

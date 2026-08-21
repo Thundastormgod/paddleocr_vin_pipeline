@@ -1,23 +1,43 @@
-# Session State — stage-3b live under the deep-dive fixes (2026-08-19)
+# Session State — headline shipped, logbook audited (2026-08-21)
 
-**STATUS: STAGE-3b TRAINING RUNNING.** HEAD `0b02a7e`. Suite: **412
-passed, 11 skipped**.
+**STATUS: PRODUCTION CANDIDATE REGISTERED.** Suite at HEAD `8093348`:
+**499 passed, 2 skipped, 7 deselected (e2e)**.
 
-## Session 14 (2026-08-19) — head-to-head verdict, C7/C8, DVC
+## Session 17 (2026-08-20) — Apple-GPU stack, 90% exact on test
 
-HEAD `2daa0b6`; suite 471 passed / 2 skipped / 7 deselected (e2e); ~32 commits ahead of origin (push prepared, awaiting go).
+HEAD `8093348`. Rosetta-ResNet34-IN1K (torch 2.13.0/MPS, ImageNet warm
+start, 21,319,174 params): **val-102 98.73% char / 85.3% exact (87/102);
+test-40 99.26% char / 90.0% exact (36/40)**, Wilson CI [0.77, 0.96].
+First custom model to beat the stock engine (2.4x its test exact).
+30 epochs in 51.49 min on MPS (16.7x paddle-CPU). Registered
+`vin-rosetta-resnet34-torch` v1, alias `production-candidate`, weights =
+ep22 `best_char_accuracy.pt`. Training run `3e340663...`; registration
+completed by `register/Rosetta-ResNet34-IN1K` (`367c1fd1...`).
 
-**The measurement that reframes the project** (run `15525c80...`, in LOGBOOK):
-stock PP-OCRv3 + pipeline vs from-scratch v3 on the same splits —
-val-102: 82.70% char / 25.5% exact vs 66.61% / 0%; test-40: 87.79% / 37.5%
-vs 68.53% / 0%. From-scratch training is refuted; production default is the
-stock engine + repo pre/post-processing; every future fine-tune warm-starts
-from pretrained weights and must beat the stock baseline.
+## Session 18 (2026-08-21) — logbook audit + run-status hygiene
 
-Also shipped: C7 interrupt tagging + zero-epoch-resume NameError fix
-(db4d899), executable training smoke `scripts/train_smoke_test.py` + weekly
-CI paddle-smoke job, DVC pointer for the staged dataset (d57be14).
+LOGBOOK headline entry audited against `mlflow.db` + checkpoints; every
+figure verified. One error corrected: stock val exact-match crossing is
+**epoch 11** (27.45% > 25.5%), not 12 (that was the val-vs-test-figure
+crossing). Entry enriched: recipe block, full run IDs, LoggedModel
+`m-833ab5cc...` + Dataset linkage, ep22/ep20/ep30 selection evidence
+(+3.9pp exact vs last epoch), checksum-valid rates (postproc = gate
+only: 87.3→94.1 val), 51.49-min measured duration, 7x7-stem vs vd-stem
+distinction. Training run status corrected FAILED→FINISHED via server
+API (training completed; only the pt2 export step crashed and the
+register run delivered it) — original end_time preserved, transition in
+`status_history` tag. MLflow server: `mlflow ui --backend-store-uri
+sqlite:///mlflow.db --port 5001` (running, PID 92304).
 
-**Next moves:** (1) re-evaluate shelved `vin_decode` ON STOCK-ENGINE outputs —
-test CER 0.122 ≈ 2 errors/plate, exactly its measured viability regime;
-(2) pretrained warm-start fine-tune vs stock baseline; (3) push on user go.
+## Next moves
+
+1. Torch inference integration into `VINOCRPipeline` (deployed pipeline
+   is paddle-based) — required before the candidate becomes DEFAULT.
+2. Larger held-out set for the 95%-target claim (n=40 CI too wide).
+3. Evidence-ranked paddle mirror: Rosetta-ResNet34vd + PaddleClas
+   ImageNet `ResNet34_vd_pretrained` warm start, same recipe (needs
+   backbone-weight loading in the paddle trainer; ~3.75h CPU). The
+   measured lever is initialization, not architecture.
+4. Postprocessor in deployment: checksum GATING only, never correction.
+
+Full details: Lumena chunks 58 (session 17), 59-60 (session 18).

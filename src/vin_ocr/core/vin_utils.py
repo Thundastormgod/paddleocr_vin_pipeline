@@ -11,6 +11,7 @@ Date: January 2026
 
 import re
 import logging
+from difflib import SequenceMatcher
 from typing import Optional, Dict, List, Tuple, FrozenSet
 from dataclasses import dataclass, field
 from enum import Enum
@@ -148,20 +149,29 @@ def extract_vin_from_filename(filename: str) -> Optional[str]:
             if _is_valid_vin_chars(vin):
                 return vin
     
-    # Fallback: find any 17-char sequence that could be a VIN
+    # Fallback: find any 17-char sequence that could be a VIN. The pattern's
+    # character class already excludes I/O/Q; the guard below re-checks with
+    # the canonical validator so a future regex edit cannot silently start
+    # emitting impossible ground truths.
     match = _FALLBACK_PATTERN.search(filename)
     if match:
         vin = match.group(1).upper()
-        # Verify no invalid characters
-        if not any(c in vin for c in VIN_INVALID_CHARS):
+        if _is_valid_vin_chars(vin):
             return vin
     
     return None
 
 
 def _is_valid_vin_chars(vin: str) -> bool:
-    """Check if all characters are valid VIN characters."""
-    return all(c in VIN_VALID_CHARS or c in VIN_INVALID_CHARS for c in vin.upper())
+    """
+    Check that every character is a valid VIN character.
+
+    I, O and Q are NOT valid. This previously tested membership in
+    VALID_CHARS | INVALID_CHARS - the union of both sets is every character
+    either set mentions - so I/O/Q passed and the filename patterns could
+    return ground-truth "VINs" that cannot exist.
+    """
+    return all(c in VIN_VALID_CHARS for c in vin.upper())
 
 
 # =============================================================================
@@ -260,8 +270,11 @@ def validate_vin(vin: str) -> VINValidationResult:
     
     is_valid_length = len(vin) == VIN_LENGTH
     
-    invalid_chars = [c for c in vin if c in VIN_INVALID_CHARS]
-    has_valid_chars = len(invalid_chars) == 0 and all(c in VIN_VALID_CHARS for c in vin)
+    # Every character that is not a valid VIN character is reported: I/O/Q,
+    # but also artifacts like '*' or '-'. Previously only I/O/Q were listed,
+    # so a '*' could set has_valid_chars=False while invalid_chars said [].
+    invalid_chars = [c for c in vin if c not in VIN_VALID_CHARS]
+    has_valid_chars = len(invalid_chars) == 0
     
     checksum_valid = False
     expected_check_digit = None
@@ -493,45 +506,49 @@ class RuleBasedCorrector:
     # inject mappings measured from data.
     GLOBAL_CONFUSION_RULES: Dict[str, str] = {}
     
-    # Position 12-17 (sequential number) should be digits
-    # These rules only apply to those positions
+    # Letter->digit confusions for the sequential-number positions.
+    # Uppercase keys only: correct() uppercases at step 1, so lowercase keys
+    # were unreachable dead entries. Application is checksum-gated in
+    # _apply_position_rules - these are hypotheses, not unconditional edits.
     SEQUENTIAL_POSITION_RULES: Dict[str, str] = {
-        'S': '5', 's': '5',
-        'G': '6', 'g': '6',
-        'B': '8', 'b': '8',
-        'A': '4', 'a': '4',
-        'L': '1', 'l': '1',
-        'Z': '2', 'z': '2',
-        'E': '3', 'e': '3',
-        'T': '7', 't': '7',
-        'D': '0', 'd': '0',
-        'O': '0', 'o': '0',
-        'I': '1', 'i': '1',
-        'C': '0', 'c': '0',  # C can look like 0
+        'S': '5',
+        'G': '6',
+        'B': '8',
+        'A': '4',
+        'L': '1',
+        'Z': '2',
+        'E': '3',
+        'T': '7',
+        'D': '0',
+        'O': '0',
+        'I': '1',
+        'C': '0',  # C can look like 0
     }
+    
+    # learn_from_errors acceptance thresholds: a mined rule a->b needs at
+    # least MIN_RULE_OBSERVATIONS aligned observations AND purity
+    # errors / (errors + correct reads of 'a') >= RULE_PURITY_THRESHOLD.
+    MIN_RULE_OBSERVATIONS: int = 2
+    RULE_PURITY_THRESHOLD: float = 0.8
     
     def __init__(self, learned_rules: Optional[Dict[str, str]] = None):
         """
         Initialize corrector with optional learned rules.
         
         Args:
-            learned_rules: Additional char->char mappings learned from data
+            learned_rules: Additional char->char mappings learned from data.
+                Copied on ingest: an empty dict and a non-empty dict get the
+                same treatment (the old ``learned_rules or {}`` aliased
+                non-empty dicts, so caller-side mutation silently changed
+                this corrector - including the module-global singleton).
         """
-        self.learned_rules = learned_rules or {}
-        self._build_combined_rules()
-    
-    def _build_combined_rules(self):
-        """Build combined rule set with priority ordering."""
-        # Priority: Invalid chars > Learned > Global confusions
-        self._global_rules = {}
-        self._global_rules.update(self.GLOBAL_CONFUSION_RULES)
-        self._global_rules.update(self.learned_rules)
-        self._global_rules.update(self.INVALID_CHAR_RULES)
+        self.learned_rules: Dict[str, str] = (
+            dict(learned_rules) if learned_rules is not None else {}
+        )
     
     def add_learned_rules(self, rules: Dict[str, str]):
-        """Add rules learned from training data."""
+        """Add rules learned from training data (pairs copied in, not aliased)."""
         self.learned_rules.update(rules)
-        self._build_combined_rules()
     
     def correct(self, raw_text: str, confidence: float = 0.0) -> Dict:
         """
@@ -540,10 +557,18 @@ class RuleBasedCorrector:
         Processing steps:
         1. Normalize (uppercase, strip whitespace)
         2. Remove artifacts
-        3. Apply global character substitutions
-        4. Extract best 17-char VIN candidate
-        5. Apply position-specific corrections
-        6. Validate result
+        3. Map invalid characters (I/O/Q -> 1/0/0; never legal in any VIN)
+        4. Extract best 17-char VIN candidate (canonical scoring path)
+        5. Apply learned character substitutions, checksum-gated
+        6. Apply position-specific corrections, checksum-gated
+        7. Validate result
+        
+        Steps 5 and 6 never touch a VIN whose ISO 3779 check digit is
+        already valid, and their rewrites are rolled back when they fail to
+        produce a checksum-valid VIN (see _apply_learned_rules and
+        _apply_position_rules). Ungated application corrupted correct reads:
+        the audited corrector turned the checksum-valid 5FNRL6H09LBB00001
+        into the invalid 5FNRL6H09LB800001.
         
         Args:
             raw_text: Raw OCR output
@@ -564,11 +589,11 @@ class RuleBasedCorrector:
         if text != original:
             corrections.append(f"Removed artifacts: '{original}' -> '{text}'")
         
-        # Step 3: Apply global substitutions
+        # Step 3: Map I/O/Q to 1/0/0 (always safe: they occur in no VIN)
         text_before = text
-        text = self._apply_global_rules(text)
+        text = self._apply_invalid_char_rules(text)
         if text != text_before:
-            corrections.append(f"Global corrections: '{text_before}' -> '{text}'")
+            corrections.append(f"Invalid-char corrections: '{text_before}' -> '{text}'")
         
         # Step 4: Extract 17-char VIN candidate
         text_before = text
@@ -576,13 +601,19 @@ class RuleBasedCorrector:
         if text != text_before:
             corrections.append(f"Extracted VIN: '{text_before}' -> '{text}'")
         
-        # Step 5: Position-specific corrections
+        # Step 5: Learned substitutions (checksum-gated)
+        text_before = text
+        text = self._apply_learned_rules(text)
+        if text != text_before:
+            corrections.append(f"Global corrections: '{text_before}' -> '{text}'")
+        
+        # Step 6: Position-specific corrections (checksum-gated)
         text_before = text
         text = self._apply_position_rules(text)
         if text != text_before:
             corrections.append(f"Position corrections: '{text_before}' -> '{text}'")
         
-        # Step 6: Validate
+        # Step 7: Validate
         validation = validate_vin(text)
         
         return {
@@ -607,122 +638,203 @@ class RuleBasedCorrector:
         (e.g. Volvo "YV1...") and returned a 16-character result.
 
         I/O/Q are intentionally preserved here - they are plausible OCR
-        output that _apply_global_rules maps to 1/0/0 via INVALID_CHAR_RULES.
+        output that _apply_invalid_char_rules maps to 1/0/0.
         """
         return NON_VIN_RUN.sub('', text)
     
-    def _apply_global_rules(self, text: str) -> str:
-        """Apply global character substitution rules."""
-        return ''.join(self._global_rules.get(c, c) for c in text)
+    def _apply_invalid_char_rules(self, text: str) -> str:
+        """
+        Map I/O/Q to 1/0/0 (INVALID_CHAR_RULES).
+
+        Unconditional by design: these characters occur in no VIN, so the
+        mapping can never damage a correct read. Running it before the
+        learned rules also preserves the old priority ordering - after this
+        step no I/O/Q remain for a conflicting learned rule to rewrite.
+        """
+        return ''.join(self.INVALID_CHAR_RULES.get(c, c) for c in text)
+    
+    def _apply_learned_rules(self, text: str) -> str:
+        """
+        Apply learned/global confusion substitutions, checksum-gated.
+
+        Learned rules are position-independent hypotheses mined from noisy
+        data; applied blindly they corrupt correct reads (the audited H5c
+        failure). Gating:
+
+        * text that is not 17 chars long is returned unchanged (there is no
+          check digit to verify a rewrite against);
+        * a VIN whose check digit is already valid is returned unchanged -
+          rules must never degrade a correct read;
+        * otherwise the rewrite is kept only if it produces a checksum-valid
+          VIN; anything less is rolled back.
+        """
+        rules = {**self.GLOBAL_CONFUSION_RULES, **self.learned_rules}
+        if not rules or len(text) != VIN_LENGTH:
+            return text
+        if validate_checksum(text):
+            return text  # never degrade an already-valid VIN
+        candidate = ''.join(rules.get(c, c) for c in text)
+        if candidate != text and validate_checksum(candidate):
+            return candidate
+        return text  # rollback on non-improvement
     
     def _extract_vin_candidate(self, text: str) -> str:
-        """Extract the best 17-character VIN candidate from text."""
-        if len(text) == VIN_LENGTH:
-            return text
-        
-        if len(text) < VIN_LENGTH:
-            return text  # Too short, return as-is
-        
-        # Strategy 1: Look for known WMI (World Manufacturer Identifier)
-        for wmi in VINConstants.COMMON_WMIS:
-            idx = text.find(wmi)
-            if idx != -1 and idx + VIN_LENGTH <= len(text):
-                candidate = text[idx:idx + VIN_LENGTH]
-                if self._score_candidate(candidate) > 10:
-                    return candidate
-        
-        # Strategy 2: Score all 17-char substrings
-        best_candidate = text[:VIN_LENGTH]
-        best_score = self._score_candidate(best_candidate)
-        
-        for i in range(1, len(text) - VIN_LENGTH + 1):
-            candidate = text[i:i + VIN_LENGTH]
-            score = self._score_candidate(candidate)
-            if score > best_score:
-                best_score = score
-                best_candidate = candidate
-        
-        return best_candidate
-    
-    def _score_candidate(self, candidate: str) -> int:
-        """Score a VIN candidate (higher = more likely valid)."""
-        score = 0
-        
-        # Valid VIN characters
-        score += sum(2 for c in candidate if c in VIN_VALID_CHARS)
-        
-        # Digits in sequential positions (12-17)
-        if len(candidate) >= VIN_LENGTH:
-            score += sum(3 for c in candidate[11:17] if c.isdigit())
-        
-        # Starts with known WMI
-        if candidate[:3] in VINConstants.COMMON_WMIS:
-            score += 10
-        
-        # Penalty for invalid chars
-        score -= sum(5 for c in candidate if c in VIN_INVALID_CHARS)
-        
-        return score
+        """
+        Extract the best 17-character VIN candidate from text.
+
+        Delegates to the module's canonical extract_vin_from_text so the
+        corrector and every other consumer share ONE extraction path. This
+        method previously carried a stale copy of the pre-fix algorithm the
+        canonical function's docstring documents as removed: first WMI match
+        won outright behind a `> 10` score guard that any 17 valid
+        characters already cleared (score >= 34), scored by a copy that
+        lacked the decisive +100 checksum bonus - so a checksum-invalid
+        window beat a checksum-valid VIN present in the same text.
+        """
+        return extract_vin_from_text(text)
     
     def _apply_position_rules(self, text: str) -> str:
-        """Apply position-specific correction rules."""
+        """
+        Apply position-specific correction rules, checksum-gated.
+
+        Positions 12-17 (indices 11-16) hold the sequential production
+        number. High-volume manufacturers use digits there, but 49 CFR 565
+        allows alphanumerics at positions 12-14 for small-volume
+        manufacturers - a letter there is NOT proof of an OCR error.
+
+        Gating:
+        * A VIN whose ISO 3779 check digit is already valid is returned
+          unchanged (this method previously rewrote 'B' at position 12 of
+          the valid 5FNRL6H09LBB00001, emitting a checksum-invalid string).
+        * Rules applied to an invalid VIN are kept when they make it
+          checksum-valid. Otherwise each rewrite is rolled back if the
+          original character was plausible where it stood: any valid VIN
+          character at positions 12-14. Rewrites of characters that could
+          not be correct (I/O/Q anywhere; letters at the digits-only
+          positions 15-17) are kept - the original was certainly wrong and
+          the rewrite at least restores the required format.
+        """
         if len(text) != VIN_LENGTH:
             return text
         
-        result = list(text)
+        if validate_checksum(text):
+            return text  # never degrade an already-valid VIN
         
-        # Positions 12-17 (indices 11-16) should be digits
+        result = list(text)
+        changed_indices: List[int] = []
         for idx in range(11, 17):
             char = result[idx]
             if char in self.SEQUENTIAL_POSITION_RULES:
                 result[idx] = self.SEQUENTIAL_POSITION_RULES[char]
+                changed_indices.append(idx)
         
+        if not changed_indices:
+            return text
+        
+        corrected = ''.join(result)
+        if validate_checksum(corrected):
+            return corrected  # the rules repaired the VIN
+        
+        # Rollback on non-improvement wherever the original was plausible.
+        for idx in changed_indices:
+            original_char = text[idx]
+            if original_char in VIN_INVALID_CHARS:
+                continue  # I/O/Q occur in no VIN: keep the rewrite
+            if idx <= 13:  # indices 11-13 = positions 12-14: letters legal
+                result[idx] = original_char
+            # indices 14-16 (positions 15-17) must be digits: keep the rewrite
         return ''.join(result)
     
     def learn_from_errors(self, predictions: List[Dict]) -> Dict[str, str]:
         """
         Learn correction rules from prediction errors.
         
-        Analyzes mismatches between predictions and ground truth
-        to discover new character confusion patterns.
+        Rules are mined by aligning each prediction to its ground truth with
+        difflib.SequenceMatcher opcodes, NOT by positional zip: a single
+        insertion or deletion misaligns every later position, and the
+        zip-mined "rules" corrupted perfect reads (audit H5c - two samples
+        with one leading artifact each turned a correct read into garbage).
+        
+        Mining discipline:
+        * Only 'replace' opcodes of EQUAL length yield per-position character
+          pairs; insertions, deletions and unequal-length replacements carry
+          no per-character evidence.
+        * Pairs harvested at the check digit (index 8 on either side) are
+          discarded: the check digit is a function of the other 16
+          characters, so confusions observed there do not generalise, and a
+          context-free rule learned from them rewrites that character
+          everywhere.
+        * 'equal' opcodes tally how often each character was read correctly
+          at aligned positions, feeding the purity test below.
+        
+        A rule ``a -> b`` is accepted only when:
+        * it was observed at least MIN_RULE_OBSERVATIONS (2) times, AND
+        * errors / (errors + correct reads of 'a') >= RULE_PURITY_THRESHOLD
+          (0.8) - a frequent-but-usually-correct character (e.g. the 'S' of
+          every 'SAL...' VIN) must not be globally rewritten because of a
+          handful of misreads, AND
+        * 'b' is a valid VIN character.
+        
+        Application of the learned rules stays checksum-gated in correct()
+        (see _apply_learned_rules), so even a rule that passes these gates
+        can never degrade a checksum-valid read.
         
         Args:
             predictions: List of dicts with 'ground_truth' and 'prediction' keys
             
         Returns:
-            Dict of learned char->char mappings
+            Dict of learned char->char mappings (also added to this instance)
         """
-        char_errors: Dict[str, Dict[str, int]] = {}
+        error_counts: Dict[str, Dict[str, int]] = {}
+        correct_counts: Dict[str, int] = {}
         
         for pred in predictions:
-            gt = pred.get('ground_truth', '')
-            pr = pred.get('prediction', '')
+            gt = str(pred.get('ground_truth', '') or '').upper().strip()
+            pr = str(pred.get('prediction', '') or '').upper().strip()
             
-            if gt == pr:
+            if not gt or not pr:
                 continue
             
-            # Analyze character-level differences
-            for i, (g, p) in enumerate(zip(gt, pr)):
-                if g != p:
-                    if p not in char_errors:
-                        char_errors[p] = {}
-                    char_errors[p][g] = char_errors[p].get(g, 0) + 1
+            matcher = SequenceMatcher(None, pr, gt, autojunk=False)
+            for tag, p0, p1, g0, g1 in matcher.get_opcodes():
+                if tag == 'equal':
+                    for offset in range(p1 - p0):
+                        ch = pr[p0 + offset]
+                        correct_counts[ch] = correct_counts.get(ch, 0) + 1
+                elif tag == 'replace' and (p1 - p0) == (g1 - g0):
+                    for offset in range(p1 - p0):
+                        p_idx = p0 + offset
+                        g_idx = g0 + offset
+                        if p_idx == 8 or g_idx == 8:
+                            continue  # never learn check-digit rewrites
+                        p_char = pr[p_idx]
+                        g_char = gt[g_idx]
+                        if p_char == g_char:
+                            continue
+                        bucket = error_counts.setdefault(p_char, {})
+                        bucket[g_char] = bucket.get(g_char, 0) + 1
         
-        # Build rules from most common corrections
-        new_rules = {}
-        for predicted_char, corrections in char_errors.items():
-            if corrections:
-                # Find most frequent correction
-                best_correction = max(corrections, key=corrections.get)
-                count = corrections[best_correction]
-                
-                # Only add rule if seen multiple times and target is valid
-                if count >= 2 and best_correction in VIN_VALID_CHARS:
-                    new_rules[predicted_char] = best_correction
-                    logger.info(
-                        f"Learned rule: '{predicted_char}' -> '{best_correction}' "
-                        f"(seen {count} times)"
-                    )
+        # Build rules from corrections that clear the count and purity gates
+        new_rules: Dict[str, str] = {}
+        for predicted_char, confusions in error_counts.items():
+            best_correction = max(confusions, key=confusions.get)
+            errors = confusions[best_correction]
+            
+            if errors < self.MIN_RULE_OBSERVATIONS:
+                continue
+            if best_correction not in VIN_VALID_CHARS:
+                continue
+            
+            correct_reads = correct_counts.get(predicted_char, 0)
+            purity = errors / (errors + correct_reads)
+            if purity < self.RULE_PURITY_THRESHOLD:
+                continue
+            
+            new_rules[predicted_char] = best_correction
+            logger.info(
+                f"Learned rule: '{predicted_char}' -> '{best_correction}' "
+                f"(seen {errors} times, purity {purity:.2f})"
+            )
         
         # Add to instance rules
         self.add_learned_rules(new_rules)
@@ -739,15 +851,23 @@ class RuleBasedCorrector:
         }
     
     def export_rules(self) -> Dict:
-        """Export rules for serialization."""
+        """
+        Export rules for serialization.
+
+        Returns a deep copy: keys and values are strings (immutable), so a
+        fresh dict fully detaches the export. Mutating the returned mapping
+        can no longer alter this corrector - the live dict was previously
+        returned, and editing an export silently rewired the module-global
+        singleton's rules.
+        """
         return {
-            'learned_rules': self.learned_rules,
+            'learned_rules': dict(self.learned_rules),
             'version': '1.0',
         }
     
     @classmethod
     def from_exported(cls, data: Dict) -> 'RuleBasedCorrector':
-        """Create corrector from exported rules."""
+        """Create corrector from exported rules (data is copied, not aliased)."""
         return cls(learned_rules=data.get('learned_rules', {}))
 
 

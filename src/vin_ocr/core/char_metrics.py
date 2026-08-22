@@ -47,7 +47,7 @@ with n, m the string lengths (VINs: 17). Pure stdlib; no optional imports.
 
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, Tuple
 
 from .vin_utils import levenshtein_distance
 
@@ -220,16 +220,22 @@ class CharLevelMetrics:
     per_class: Dict[str, Dict[str, float]]
 
 
-def char_level_metrics(pairs: List[Tuple[str, str]]) -> CharLevelMetrics:
+def char_level_metrics(pairs: Iterable[Tuple[str, str]]) -> CharLevelMetrics:
     """
     Compute the full canonical character-level metric set.
 
     Args:
-        pairs: (prediction, reference) tuples, predictions unpadded.
+        pairs: (prediction, reference) tuples, predictions unpadded. Any
+            iterable is accepted; it is materialized once on entry because
+            it is consumed twice (alignment counts, then corpus CER). A
+            generator previously fed the second pass an exhausted iterator,
+            silently reporting cer=0.0 / char_accuracy=1.0 alongside
+            fp/fn > 0 - self-contradictory metrics.
 
     Returns:
         CharLevelMetrics. For an empty corpus every rate is 0.0.
     """
+    pairs = list(pairs)
     totals = AlignmentCounts()
     for prediction, reference in pairs:
         totals.update(alignment_counts(prediction, reference))

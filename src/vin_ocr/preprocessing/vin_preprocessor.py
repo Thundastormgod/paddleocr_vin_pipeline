@@ -52,8 +52,12 @@ class PreprocessConfig:
     
     # Resizing parameters
     target_width: int = 1024  # Optimal width for OCR
-    min_height: int = 32      # Minimum height after resize
-    max_height: int = 512     # Maximum height after resize
+    # Output height for the fixed-dims (distorting) resize used when
+    # maintain_aspect=False. 48 is this project's canonical text-line
+    # height (recognition input contract [N, 3, 48, 320]).
+    target_height: int = 48
+    min_height: int = 32      # Minimum height after aspect-true resize
+    max_height: int = 512     # Maximum height after aspect-true resize
     maintain_aspect: bool = True
     
     # CLAHE parameters
@@ -148,17 +152,33 @@ class VINPreprocessor:
         Process image for OCR.
         
         Args:
-            image: Input image (BGR format)
+            image: Input image. BGR is the native format; 2-D or
+                single-channel grayscale and 4-channel BGRA inputs are
+                converted to BGR on entry.
             strategy: Override strategy for this call
             
         Returns:
             Preprocessed image (BGR format, compatible with PaddleOCR)
             
         Raises:
-            ValueError: If image is invalid
+            ValueError: If image is empty, None, or has an unsupported
+                shape (anything other than HxW, HxWx1, HxWx3 or HxWx4)
         """
         if image is None or image.size == 0:
             raise ValueError("Input image is empty or None")
+        
+        # Channel guard: every strategy assumes 3-channel BGR input.
+        # Grayscale (2-D or single-channel) and BGRA images are normalised
+        # to BGR once here, so the strategies keep that assumption.
+        if image.ndim == 2 or (image.ndim == 3 and image.shape[2] == 1):
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        elif image.ndim == 3 and image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        elif image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError(
+                f"Unsupported image shape {image.shape}: expected 2-D "
+                f"grayscale or HxWxC with 1, 3 or 4 channels"
+            )
         
         # Use provided strategy or default
         active_strategy = strategy or self.config.strategy
@@ -343,10 +363,26 @@ class VINPreprocessor:
     
     def _resize_to_target(self, image: np.ndarray) -> np.ndarray:
         """
-        Resize image to target width while maintaining aspect ratio.
+        Resize toward the configured target while preserving aspect ratio.
+        
+        maintain_aspect=True: the scale is computed from target_width and
+        the scaled height is clamped to [min_height, max_height]. When the
+        clamp binds, the width is RECOMPUTED from the clamped height so the
+        aspect ratio still holds; the output width then differs from
+        target_width. Decision: no consumer needs an exact output width -
+        every caller of process() (VINRecognitionDataset._preprocess_image,
+        the provider and pipeline wrappers feeding PaddleOCR) re-resizes
+        and pads to its own model dimensions - so ratio-true output was
+        chosen over letterboxing back to target_width. Previously the width
+        stayed pinned at target_width while the height clamped, silently
+        distorting extreme aspect ratios.
+        
+        maintain_aspect=False: distort to exactly
+        (target_width, target_height). Previously this branch used
+        min_height - a lower bound, not a target - as the output height.
         
         Args:
-            image: Input image
+            image: Input image with nonzero height and width.
             
         Returns:
             Resized image
@@ -356,20 +392,26 @@ class VINPreprocessor:
         if not self.config.maintain_aspect:
             return cv2.resize(
                 image, 
-                (self.config.target_width, self.config.min_height)
+                (self.config.target_width, self.config.target_height)
             )
         
-        # Calculate scale to reach target width
+        # Calculate scale to reach target width, then clamp the height.
         scale = self.config.target_width / w
-        new_h = int(h * scale)
+        scaled_h = int(round(h * scale))
+        new_h = max(self.config.min_height, min(scaled_h, self.config.max_height))
         
-        # Clamp height
-        new_h = max(self.config.min_height, min(new_h, self.config.max_height))
+        if new_h == scaled_h:
+            new_w = self.config.target_width
+        else:
+            # The height clamp bound: derive the width from the actual
+            # output height so the ratio holds instead of pinning the
+            # width at target_width.
+            new_w = max(1, int(round(w * new_h / h)))
         
         return cv2.resize(
             image, 
-            (self.config.target_width, new_h),
-            interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
+            (new_w, new_h),
+            interpolation=cv2.INTER_AREA if new_w < w else cv2.INTER_CUBIC
         )
     
     def _save_debug(self, name: str, image: np.ndarray) -> None:
@@ -450,11 +492,13 @@ def preprocess_vin_image(
     Returns:
         Preprocessed image (BGR format)
     """
-    # Load image if path
+    # Load image if path (keep the path for the error message: assigning
+    # imread's result over the path used to make the failure print 'None')
     if isinstance(image, (str, Path)):
-        image = cv2.imread(str(image))
+        image_path = image
+        image = cv2.imread(str(image_path))
         if image is None:
-            raise ValueError(f"Failed to load image: {image}")
+            raise ValueError(f"Failed to load image: {image_path}")
     
     config = PreprocessConfig(
         strategy=strategy,

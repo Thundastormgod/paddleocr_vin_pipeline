@@ -97,12 +97,21 @@ def load_char_dict(
         (char_to_idx, idx_to_char)
 
     Raises:
-        ValueError: If the resolved dictionary is empty or maps the blank to a
-            non-zero index.
+        FileNotFoundError: If an explicitly given dict_path does not resolve
+            to a file. Silent fallback is reserved for dict_path=None; an
+            explicit-but-missing path falling back to the built-in charset
+            is exactly the silent char<->index mismatch this module exists
+            to prevent.
+        ValueError: If the resolved dictionary is empty, contains duplicate
+            entries, or maps the blank to a non-zero index.
     """
     resolved = _resolve_dict_path(dict_path, search_dirs)
 
     if resolved is None:
+        if dict_path is not None:
+            raise FileNotFoundError(
+                f"Character dictionary not found: {dict_path}"
+            )
         # Fall back to the built-in charset with an implicit blank at 0.
         entries = [BLANK_TOKEN, *VIN_CHARSET]
     else:
@@ -123,6 +132,15 @@ def load_char_dict(
     char_to_idx: Dict[str, int] = {}
     idx_to_char: Dict[int, str] = {}
     for idx, char in enumerate(entries):
+        if char in char_to_idx:
+            # Last-wins would silently desync num_classes (len(char_to_idx))
+            # from the model's output layer (len(idx_to_char)) and leave an
+            # index that decodes to a char which encodes elsewhere.
+            raise ValueError(
+                f"Duplicate character {char!r} in dictionary "
+                f"{resolved if resolved is not None else '<built-in>'}: "
+                f"first at index {char_to_idx[char]}, again at index {idx}"
+            )
         char_to_idx[char] = idx
         idx_to_char[idx] = char
 

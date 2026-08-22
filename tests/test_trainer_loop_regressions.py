@@ -469,6 +469,119 @@ class TestCorruptionThreshold:
             assert len(warnings) == 1, name
 
 
+class TestImageReadsAreStreamCompatible:
+    """
+    DagsHub streaming regression (2026-08-22): install_hooks patches only
+    builtins.open / io.open / os.stat. cv2.imread opens files in native
+    OpenCV code, so under streaming a remote-only image passed the hooked
+    Path.exists() check (phantom stat) and then read as None - the sample
+    was misclassified as corrupt and the run aborted at the 5% threshold.
+    The dataset must therefore read image BYTES through Python's open()
+    and decode with cv2.imdecode.
+    """
+
+    @pytest.fixture()
+    def small_dataset(self, tmp_path):
+        pytest.importorskip("paddle")
+        import numpy as np
+        import cv2
+        from src.vin_ocr.core.charset import load_char_dict
+        from src.vin_ocr.training.finetune_paddleocr import VINRecognitionDataset
+
+        char_to_idx, _ = load_char_dict("configs/vin_dict.txt")
+        lines = []
+        for i in range(2):
+            name = f"good_{i}.jpg"
+            img = np.full((64, 320, 3), 128, np.uint8)
+            cv2.putText(img, "SAL1A2A40SA606662", (5, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            cv2.imwrite(str(tmp_path / name), img)
+            lines.append(f"{name}\tSAL1A2A40SA606662")
+        (tmp_path / "corrupt.jpg").write_bytes(b"this is not a jpeg")
+        lines.append("corrupt.jpg\tSAL1A2A40SA606662")
+        (tmp_path / "labels.txt").write_text("\n".join(lines) + "\n")
+        return VINRecognitionDataset(
+            data_dir=str(tmp_path), label_file=str(tmp_path / "labels.txt"),
+            char_dict=char_to_idx, is_training=False,
+        )
+
+    def test_read_image_matches_cv2_imread(self, small_dataset):
+        """Same bytes, same decoder: pixel-identical to cv2.imread."""
+        import numpy as np
+        import cv2
+        good = next(p for p, _ in small_dataset.samples if "good_0" in p)
+        assert np.array_equal(small_dataset._read_image(good), cv2.imread(good))
+
+    def test_read_image_keeps_imread_none_contract(self, small_dataset, tmp_path):
+        """Corrupt bytes and missing files both map to None, like imread."""
+        corrupt = next(p for p, _ in small_dataset.samples if "corrupt" in p)
+        assert small_dataset._read_image(corrupt) is None
+        assert small_dataset._read_image(str(tmp_path / "absent.jpg")) is None
+        (tmp_path / "empty.jpg").write_bytes(b"")
+        assert small_dataset._read_image(str(tmp_path / "empty.jpg")) is None
+
+    def test_getitem_reads_bytes_through_builtins_open(self, small_dataset, monkeypatch):
+        """The image byte read must be interceptable by install_hooks."""
+        import builtins
+        opened = []
+        real_open = builtins.open
+
+        def counting_open(file, *args, **kwargs):
+            opened.append(str(file))
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", counting_open)
+        item = small_dataset[0]
+        assert item["image"].shape[0] == 3
+        assert any(p.endswith("good_0.jpg") for p in opened), (
+            "image bytes were not read through builtins.open - native "
+            "file I/O cannot be intercepted by dagshub install_hooks"
+        )
+
+    def test_remote_only_file_served_by_hooked_open(self, small_dataset, monkeypatch):
+        """
+        The install_hooks scenario end-to-end: the file is DELETED from
+        disk and served from a patched builtins.open, exactly the way the
+        hooks materialize remote-only files. cv2.imread returns None here;
+        the dataset must still produce a real tensor.
+        """
+        import builtins
+        import io as _io
+        img_path = Path(small_dataset.samples[0][0])
+        data = img_path.read_bytes()
+        img_path.unlink()
+        real_open = builtins.open
+
+        def hooked_open(file, mode="r", *args, **kwargs):
+            if str(file) == str(img_path):
+                return _io.BytesIO(data)
+            return real_open(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", hooked_open)
+        item = small_dataset[0]
+        assert item["image"].shape[0] == 3
+        assert item["text"] == "SAL1A2A40SA606662"
+
+    def test_missing_file_skips_like_unreadable(self, small_dataset):
+        """A file that vanishes after load resolves to the next sample."""
+        Path(small_dataset.samples[0][0]).unlink()
+        item = small_dataset[0]
+        assert item["text"] == "SAL1A2A40SA606662"
+        assert item["image"].shape[0] == 3
+
+    def test_no_native_imread_left_in_dataset(self):
+        """cv2.imread must not reappear inside VINRecognitionDataset."""
+        import textwrap
+        from src.vin_ocr.training.finetune_paddleocr import VINRecognitionDataset
+        src = textwrap.dedent(inspect.getsource(VINRecognitionDataset))
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Attribute) and node.attr == "imread":
+                pytest.fail(
+                    "cv2.imread found in VINRecognitionDataset: native "
+                    "file I/O bypasses dagshub streaming hooks"
+                )
+
+
 class TestTrackingFallback:
     """_run_tracked must run untracked - loudly - when tracking is absent."""
 

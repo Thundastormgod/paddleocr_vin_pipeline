@@ -71,16 +71,13 @@ from pathlib import Path
 project_root = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(project_root))
 
-# Check for DagsHub streaming support
-try:
-    from src.vin_ocr.data.dagshub_integration import (
-        enable_dagshub_streaming, 
-        get_streaming_config, 
-        is_streaming_active
-    )
-    DAGSHUB_INTEGRATION_AVAILABLE = True
-except ImportError:
-    DAGSHUB_INTEGRATION_AVAILABLE = False
+# DagsHub streaming lives in train_vin_streaming.py (repo root), which
+# installs dagshub.streaming hooks BEFORE constructing VINFineTuner. This
+# module used to guard a --stream flag behind an import of
+# src.vin_ocr.data.dagshub_integration - a module that does not exist in
+# this repository, so the flag was permanently dead code. Image reads are
+# streaming-compatible via VINRecognitionDataset._read_image, which goes
+# through Python's (hookable) open() instead of cv2.imread's native fopen.
 import math
 import yaml
 import json
@@ -466,6 +463,44 @@ class VINRecognitionDataset(Dataset):
     #: neighbour samples and the measurement is no longer of the dataset.
     MAX_CORRUPT_FRACTION = 0.05
 
+    @staticmethod
+    def _read_image(img_path: str) -> Optional[np.ndarray]:
+        """
+        Read an image through Python file I/O, then decode from memory.
+
+        cv2.imread opens the file inside native OpenCV code (C++ fopen),
+        which bypasses Python's io layer entirely. DagsHub streaming
+        (``dagshub.streaming.install_hooks``) works by monkeypatching
+        ``builtins.open`` / ``io.open`` / ``os.stat`` only, so under
+        streaming a remote-only image passes the hooked ``Path.exists()``
+        check in ``_load_samples`` (phantom stat) and then imread returns
+        None - the sample is misclassified as corrupt and the run aborts
+        at MAX_CORRUPT_FRACTION. Reading the bytes via ``open()``
+        materializes streamed files on demand, and ``cv2.imdecode``
+        produces the identical BGR array imread would have returned.
+
+        Returns:
+            The decoded BGR image, or None when the file is missing,
+            empty, or not a decodable image - the same contract
+            cv2.imread has, so the caller's corrupt-skip loop keeps one
+            failure semantics for local and streamed runs alike.
+
+        Infrastructure errors from the streaming layer (e.g. dagshub's
+        RuntimeError after exhausting download retries) are NOT swallowed:
+        a network outage aborting the run must not be reported as "your
+        dataset is corrupt".
+        """
+        try:
+            with open(img_path, 'rb') as f:
+                data = f.read()
+        except OSError:
+            # Missing/unreadable file: cv2.imread returns None for these.
+            return None
+        if not data:
+            return None
+        buf = np.frombuffer(data, dtype=np.uint8)
+        return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         # Skip unreadable images by advancing to the next sample - but with
         # a bounded LOOP, not recursion: the previous implementation
@@ -479,7 +514,7 @@ class VINRecognitionDataset(Dataset):
         img_path, label = self.samples[idx]
         for offset in range(len(self.samples)):
             img_path, label = self.samples[(idx + offset) % len(self.samples)]
-            image = cv2.imread(img_path)
+            image = self._read_image(img_path)
             if image is not None:
                 break
             if img_path not in self._corrupt_paths:
@@ -3098,46 +3133,20 @@ def main():
         help='Export model to ONNX format after training'
     )
     
-    # DagsHub streaming arguments
-    if DAGSHUB_INTEGRATION_AVAILABLE:
-        parser.add_argument(
-            '--stream',
-            action='store_true',
-            help='Use DagsHub data streaming (no local download)'
-        )
-        parser.add_argument(
-            '--dagshub-user',
-            default=None,
-            help='DagsHub username for streaming authentication'
-        )
-        parser.add_argument(
-            '--dagshub-token',
-            default=None,
-            help='DagsHub access token for streaming authentication'
-        )
-    
+    # DagsHub streaming: use train_vin_streaming.py at the repo root, which
+    # installs the dagshub hooks before this module's dataset ever opens a
+    # file. The --stream/--dagshub-* flags that used to be registered here
+    # were dead: they were guarded by an import of a module that does not
+    # exist in this repository, so the branch could never activate.
+
     args = parser.parse_args()
-    
+
     # Check dependencies
     if not PADDLE_AVAILABLE:
         print("ERROR: PaddlePaddle is required for training.")
         print("Install with: pip install paddlepaddle-gpu")
         sys.exit(1)
-    
-    args = parser.parse_args()
-    
-    # Initialize DagsHub streaming if requested
-    if DAGSHUB_INTEGRATION_AVAILABLE and getattr(args, 'stream', False):
-        print("🌐 Initializing DagsHub streaming...")
-        if enable_dagshub_streaming(args.dagshub_user, args.dagshub_token):
-            print("✅ DagsHub streaming enabled")
-            # Update config path for streaming
-            args.config = get_streaming_config(args.config)
-            print(f"📄 Using streaming config: {args.config}")
-        else:
-            print("❌ Failed to enable DagsHub streaming")
-            sys.exit(1)
-    
+
     # Load configuration - ONLY source of truth
     config = load_config(args.config)
     

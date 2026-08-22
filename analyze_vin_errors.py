@@ -13,6 +13,7 @@ Usage:
     python analyze_vin_errors.py
 """
 
+import difflib
 import json
 import numpy as np
 import matplotlib.pyplot as plt
@@ -36,7 +37,15 @@ def extract_failed_predictions(metrics):
     return failed
 
 def analyze_error_patterns(failed_predictions):
-    """Analyze common error patterns in failed predictions."""
+    """Analyze common error patterns in failed predictions.
+
+    Error positions, substitutions and error types are derived from
+    edit-distance ALIGNMENT (difflib opcodes), not positional zip: a single
+    insertion/deletion no longer smears a false "error" over every later
+    position, and the insertion/deletion counters are actually reachable -
+    a single-char deletion is classified as a deletion, not a substitution
+    (audit M32/L40).
+    """
     patterns = {
         'edit_distance_distribution': Counter(),
         'error_positions': defaultdict(int),
@@ -56,16 +65,43 @@ def analyze_error_patterns(failed_predictions):
         
         patterns['edit_distance_distribution'][edit_dist] += 1
         
-        # Analyze position-specific errors
-        for i, (g_char, p_char) in enumerate(zip(gt, pred_text)):
-            if g_char != p_char:
-                patterns['error_positions'][i+1] += 1  # 1-indexed positions
-                patterns['common_substitutions'][f"{p_char}→{g_char}"] += 1
+        # Align ground truth and prediction, then walk the edit operations.
+        n_sub = n_ins = n_del = 0
+        matcher = difflib.SequenceMatcher(None, gt, pred_text, autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'equal':
+                continue
+            if tag == 'replace':
+                gt_seg = gt[i1:i2]
+                pr_seg = pred_text[j1:j2]
+                paired = min(len(gt_seg), len(pr_seg))
+                n_sub += paired
+                for k in range(paired):
+                    patterns['error_positions'][i1 + k + 1] += 1  # 1-indexed GT positions
+                    patterns['common_substitutions'][f"{pr_seg[k]}→{gt_seg[k]}"] += 1
+                if len(gt_seg) > paired:
+                    n_del += len(gt_seg) - paired
+                    for k in range(paired, len(gt_seg)):
+                        patterns['error_positions'][i1 + k + 1] += 1
+                elif len(pr_seg) > paired:
+                    n_ins += len(pr_seg) - paired
+            elif tag == 'delete':
+                n_del += i2 - i1
+                for k in range(i1, i2):
+                    patterns['error_positions'][k + 1] += 1
+            elif tag == 'insert':
+                n_ins += j2 - j1
         
-        # Categorize error types
-        if edit_dist == 1:
-            patterns['error_types']['substitution'] += 1
-        elif edit_dist > 1:
+        # Categorize error types from the aligned operations
+        total_ops = n_sub + n_ins + n_del
+        if total_ops == 1:
+            if n_sub == 1:
+                patterns['error_types']['substitution'] += 1
+            elif n_ins == 1:
+                patterns['error_types']['insertion'] += 1
+            else:
+                patterns['error_types']['deletion'] += 1
+        elif total_ops > 1:
             patterns['error_types']['multiple_errors'] += 1
     
     return patterns
@@ -115,10 +151,11 @@ def analyze_character_performance(metrics):
     sorted_by_f1 = sorted(per_class.items(), key=lambda x: x[1]['f1'])
     
     # Identify problematic characters
+    # (loop var renamed: `metrics` shadowed this function's parameter, L40)
     problematic = []
-    for char, metrics in per_class.items():
-        if metrics['f1'] < 0.8 or metrics['precision'] < 0.8 or metrics['recall'] < 0.8:
-            problematic.append((char, metrics))
+    for char, char_metrics in per_class.items():
+        if char_metrics['f1'] < 0.8 or char_metrics['precision'] < 0.8 or char_metrics['recall'] < 0.8:
+            problematic.append((char, char_metrics))
     
     return {
         'worst_performing': sorted_by_f1[:5],
@@ -134,9 +171,11 @@ def generate_error_report(metrics, failed_predictions, patterns, pos_analysis, c
     report.append("=" * 60)
     report.append("")
     
-    # Executive Summary
+    # Executive Summary (denominator computed from the data, not hardcoded)
+    total_predictions = len(metrics['evaluation_metrics']['sample_results'])
+    failed_pct = (len(failed_predictions) / total_predictions * 100) if total_predictions else 0.0
     report.append("## Executive Summary")
-    report.append(f"- **Total Failed Predictions**: {len(failed_predictions)}/43 ({len(failed_predictions)/43*100:.1f}%)")
+    report.append(f"- **Total Failed Predictions**: {len(failed_predictions)}/{total_predictions} ({failed_pct:.1f}%)")
     report.append(f"- **Character Accuracy**: {metrics['evaluation_metrics']['character_level']['character_accuracy']:.1%}")
     report.append(f"- **VIN Accuracy**: {metrics['evaluation_metrics']['image_level']['exact_match_accuracy']:.1%}")
     report.append(f"- **Performance Gap**: {(metrics['evaluation_metrics']['character_level']['character_accuracy'] - metrics['evaluation_metrics']['image_level']['exact_match_accuracy'])*100:.1f} percentage points")
@@ -190,14 +229,14 @@ def generate_error_report(metrics, failed_predictions, patterns, pos_analysis, c
     report.append("")
     
     report.append("### Worst Performing Characters")
-    for char, metrics in char_analysis['worst_performing']:
-        report.append(f"- **{char}**: F1={metrics['f1']:.3f}, Precision={metrics['precision']:.3f}, Recall={metrics['recall']:.3f}")
+    for char, char_metrics in char_analysis['worst_performing']:
+        report.append(f"- **{char}**: F1={char_metrics['f1']:.3f}, Precision={char_metrics['precision']:.3f}, Recall={char_metrics['recall']:.3f}")
     report.append("")
     
     if char_analysis['problematic_chars']:
         report.append("### Problematic Characters (F1 < 0.8)")
-        for char, metrics in char_analysis['problematic_chars']:
-            report.append(f"- **{char}**: F1={metrics['f1']:.3f}, Support={metrics['support']}")
+        for char, char_metrics in char_analysis['problematic_chars']:
+            report.append(f"- **{char}**: F1={char_metrics['f1']:.3f}, Support={char_metrics['support']}")
         report.append("")
     
     # Detailed Failed VIN Analysis
@@ -215,13 +254,14 @@ def generate_error_report(metrics, failed_predictions, patterns, pos_analysis, c
             gt = pred['ground_truth']
             pred_text = pred['prediction']
             
-            # Show character differences
+            # Show character differences (explicit length handling: positions
+            # present in only one of the strings are marked as errors instead
+            # of being silently truncated by zip)
             diff = ""
-            for i, (g, p) in enumerate(zip(gt, pred_text)):
-                if g == p:
-                    diff += "✓"
-                else:
-                    diff += "✗"
+            for i in range(max(len(gt), len(pred_text))):
+                g = gt[i] if i < len(gt) else None
+                p = pred_text[i] if i < len(pred_text) else None
+                diff += "✓" if (g is not None and g == p) else "✗"
             
             report.append(f"  - GT:  {gt}")
             report.append(f"  - Pred:{pred_text}")
@@ -229,14 +269,24 @@ def generate_error_report(metrics, failed_predictions, patterns, pos_analysis, c
             report.append(f"  - Confidence: {pred['confidence']:.3f}")
             report.append("")
     
-    # Recommendations
+    # Recommendations (computed from the actual input data, not hardcoded)
     report.append("## 6. Recommendations")
     report.append("")
     
     report.append("### Immediate Actions")
-    report.append("1. **Focus on Position 6**: Only 65.1% accuracy - highest priority")
-    report.append("2. **Improve Character Discrimination**: Target A↔F, P↔K, A↔B confusions")
-    report.append("3. **Data Augmentation**: Add more examples for problematic characters (F, K, B, P)")
+    action_num = 1
+    if pos_analysis['worst_positions']:
+        worst_pos, worst_acc = pos_analysis['worst_positions'][0]
+        pos_label = worst_pos.replace('_', ' ').title()
+        report.append(f"{action_num}. **Focus on {pos_label}**: Only {worst_acc:.1%} accuracy - highest priority")
+        action_num += 1
+    top_subs = [sub for sub, _count in patterns['common_substitutions'].most_common(3)]
+    if top_subs:
+        report.append(f"{action_num}. **Improve Character Discrimination**: Target {', '.join(top_subs)} confusions")
+        action_num += 1
+    problem_chars = sorted({char for char, _cm in char_analysis['problematic_chars']})
+    if problem_chars:
+        report.append(f"{action_num}. **Data Augmentation**: Add more examples for problematic characters ({', '.join(problem_chars)})")
     report.append("")
     
     report.append("### Medium-term Improvements")
@@ -279,7 +329,7 @@ def save_position_accuracy_plot(position_accuracy):
     bars = plt.bar(positions, accuracies, color='steelblue', alpha=0.7)
     
     # Color bars based on performance
-    for bar, acc in zip(bars, accuracies):
+    for bar, acc in zip(bars, accuracies, strict=True):
         if acc < 0.8:
             bar.set_color('red')
         elif acc < 0.9:
@@ -333,10 +383,15 @@ def main():
     print("📊 Confusion matrix saved to: output/vin_rec_finetune/confusion_matrix.png")
     print("📈 Position accuracy plot saved to: output/vin_rec_finetune/position_accuracy.png")
     
-    # Print key findings
+    # Print key findings (computed from the data, not hardcoded)
     print("\n🎯 Key Findings:")
-    print(f"- Worst position: Position 6 ({metrics['evaluation_metrics']['position_accuracy']['position_6']:.1%} accuracy)")
-    print(f"- Most common confusion: A→F ({patterns['common_substitutions']['A→F']} times)")
+    pos_acc = metrics['evaluation_metrics']['position_accuracy']
+    if pos_acc:
+        worst_pos, worst_acc = min(pos_acc.items(), key=lambda item: item[1])
+        print(f"- Worst position: {worst_pos.replace('_', ' ').title()} ({worst_acc:.1%} accuracy)")
+    if patterns['common_substitutions']:
+        top_sub, top_count = patterns['common_substitutions'].most_common(1)[0]
+        print(f"- Most common confusion: {top_sub} ({top_count} times)")
     print(f"- Average edit distance: {metrics['evaluation_metrics']['edit_distance_distribution']['mean']:.2f} characters")
 
 if __name__ == "__main__":

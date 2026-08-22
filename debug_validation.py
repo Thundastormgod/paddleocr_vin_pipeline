@@ -40,7 +40,10 @@ def debug_validation():
     trainer.model.eval()
     
     print(f"📊 Model loaded successfully")
-    print(f"   Device: {'GPU' if paddle.is_compiled_with_cuda() else 'CPU'}")
+    # Runtime GPU availability, not just the compile flag: a CUDA build on a
+    # GPU-less machine must report CPU (audit L39).
+    gpu_available = paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0
+    print(f"   Device: {'GPU' if gpu_available else 'CPU'}")
     print(f"   Classes: {len(trainer.char_to_idx)}")
     
     # Test on a few validation samples
@@ -58,8 +61,10 @@ def debug_validation():
         from PIL import Image
         image = np.array(Image.open(img_path).convert('RGB'))
         
-        # Preprocess
-        image = trainer.val_loader.dataset._preprocess_image(image)
+        # Preprocess. _preprocess_image returns (tensor, valid_width): the CHW
+        # array plus the unpadded content width used for CTC input lengths
+        # (audit M31 - the tuple was previously indexed like an array).
+        image, _valid_width = trainer.val_loader.dataset._preprocess_image(image)
         
         # Add batch dimension
         image_tensor = paddle.to_tensor(image[np.newaxis, ...])
@@ -76,7 +81,7 @@ def debug_validation():
         all_targets.append(target)
     
     # Calculate accuracy
-    correct = sum(1 for p, t in zip(all_preds, all_targets) if p == t)
+    correct = sum(1 for p, t in zip(all_preds, all_targets, strict=True) if p == t)
     accuracy = correct / len(all_targets)
     
     print(f"\n📊 Results:")
@@ -96,11 +101,13 @@ def debug_validation():
     print(f"   Final eval: {final_exact_match:.2%}")
     print(f"   Char accuracy: {final_char_acc:.2%}")
     
-    if accuracy == 0.0 and final_exact_match > 0.0:
-        print(f"\n❌ ISSUE: Debug shows 0% but final evaluation shows {final_exact_match:.2%}")
-        print(f"   This confirms the training validation is broken!")
-    else:
+    # "Results match" requires actual agreement within tolerance - any
+    # nonzero accuracy is NOT a match (audit M31).
+    if abs(accuracy - final_exact_match) < 1e-6:
         print(f"\n✅ Results match - no issue detected")
+    else:
+        print(f"\n❌ MISMATCH: debug accuracy {accuracy:.2%} vs final evaluation {final_exact_match:.2%}")
+        print(f"   The training validation and the final evaluation disagree - investigate!")
 
 if __name__ == '__main__':
     debug_validation()

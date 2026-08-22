@@ -1,4 +1,4 @@
-.PHONY: help install dev test lint format clean run train evaluate docker
+.PHONY: help install dev test lint format clean run train evaluate docker gate gate-quick hooks
 
 # Default target
 help:
@@ -14,6 +14,9 @@ help:
 	@echo "  make train       Start training (interactive)"
 	@echo "  make evaluate    Run model evaluation"
 	@echo "  make docker      Build Docker image"
+	@echo "  make gate        Run the full local CI gate (no GitHub Actions needed)"
+	@echo "  make gate-quick  Fast pre-push subset (secrets, lint, test)"
+	@echo "  make hooks       Activate the pre-push quick-gate hook"
 	@echo ""
 
 # Installation
@@ -93,3 +96,17 @@ validate:
 	python -c "from src.vin_ocr.inference import VINInference, ONNXVINRecognizer; print('✅ Imports OK')"
 	python -c "import paddle; print(f'✅ PaddlePaddle {paddle.__version__}')"
 	python -c "import onnxruntime; print(f'✅ ONNX Runtime {onnxruntime.__version__}')"
+
+# Local CI gate (scripts/local_ci.py) - same jobs as .github/workflows/ci.yml,
+# executed natively. Works while GitHub Actions is billing-locked.
+gate:
+	python scripts/local_ci.py
+
+gate-quick:
+	python scripts/local_ci.py --quick
+
+# Install the pre-push hook: every push runs the quick gate first; a red
+# gate refuses the push (bypass with `git push --no-verify`).
+hooks:
+	git config core.hooksPath scripts/githooks
+	@echo "pre-push quick gate activated"

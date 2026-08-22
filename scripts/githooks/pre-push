@@ -1,0 +1,31 @@
+#!/bin/zsh
+# Pre-push quick gate: runs the fast subset of scripts/local_ci.py
+# (secrets, lint, test) before any push leaves this machine. Bypass with
+# `git push --no-verify`. Activated via `make hooks`.
+#
+# stdin receives "local_ref local_sha remote_ref remote_sha" - push of a
+# branch with no new commits (delete or no-op) passes through.
+
+read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA
+
+if [ "$LOCAL_SHA" = "0000000000000000000000000000000000000000" ]; then
+  exit 0  # branch deletion, nothing to gate
+fi
+
+ZERO="0000000000000000000000000000000000000000"
+if [ "$REMOTE_SHA" = "$ZERO" ]; then
+  RANGE="$LOCAL_SHA"
+else
+  RANGE="$REMOTE_SHA..$LOCAL_SHA"
+fi
+
+# Only gate when Python sources changed; tag-only and docs-only pushes pass.
+CHANGED=$(git diff --name-only "$RANGE" -- 'src/*.py' 'tests/*.py' 'scripts/*.py' \
+  'configs/*' '.github/requirements-ci.txt')
+if [ -z "$CHANGED" ]; then
+  echo "pre-push: no Python/config changes in $RANGE - quick gate skipped"
+  exit 0
+fi
+
+echo "pre-push: quick gate on $(echo "$CHANGED" | wc -l | tr -d ' ') changed file(s)"
+exec python "$(git rev-parse --show-toplevel)/scripts/local_ci.py" --quick

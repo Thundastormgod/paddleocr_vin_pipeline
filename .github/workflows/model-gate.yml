@@ -1,0 +1,112 @@
+name: model gate
+
+# The ML half of the gate: dataset fingerprint verification (DVC) plus
+# model-eval regression check against the committed baseline
+# (configs/model_baseline.json). Weekly and on demand - not per-PR,
+# because it downloads the dataset and the registered model.
+#
+# This workflow is INTENTIONALLY red until the org supplies:
+#   1. Repo secrets: DAGSHUB_USERNAME, DAGSHUB_TOKEN, MLFLOW_TRACKING_URI
+#      (gh secret set DAGSHUB_USERNAME; gh secret set DAGSHUB_TOKEN;
+#       gh secret set MLFLOW_TRACKING_URI)
+#   2. A servable registered model (scripts/promote_model.py) - note the
+#      current local exports are weights-only because Paddle static-graph
+#      export fails in this repo (see export_inference_model's warning);
+#      the gate refuses weights-only artifacts by design.
+#   3. A committed baseline: scripts/model_eval_gate.py --write-baseline
+# A gate that silently passes while unconfigured would be a fake gate.
+on:
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      model_version:
+        description: "Registry version to gate (default: latest)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_CONSTRAINT: .github/requirements-ci.txt
+
+jobs:
+  model-gate:
+    name: dataset fingerprint + eval regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/requirements-ci.txt
+
+      - name: Require gate secrets
+        env:
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+          DAGSHUB_TOKEN: ${{ secrets.DAGSHUB_TOKEN }}
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: |
+          missing=""
+          [ -z "$DAGSHUB_USERNAME" ] && missing="$missing DAGSHUB_USERNAME"
+          [ -z "$DAGSHUB_TOKEN" ] && missing="$missing DAGSHUB_TOKEN"
+          [ -z "$MLFLOW_TRACKING_URI" ] && missing="$missing MLFLOW_TRACKING_URI"
+          if [ -n "$missing" ]; then
+            echo "::error::model gate unconfigured; missing repo secrets:$missing. Set them with 'gh secret set <NAME>'."
+            exit 1
+          fi
+
+      - name: Install gate dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            numpy opencv-python-headless Pillow pyyaml rapidfuzz tqdm \
+            paddlepaddle mlflow "dvc[s3]"
+
+      - name: Pull dataset via DVC
+        env:
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+          DAGSHUB_TOKEN: ${{ secrets.DAGSHUB_TOKEN }}
+        run: |
+          dvc remote modify origin --local access_key_id "$DAGSHUB_TOKEN"
+          dvc remote modify origin --local secret_access_key "$DAGSHUB_TOKEN"
+          dvc pull -r origin finetune_data.dvc
+
+      # Fingerprint gate: the workspace hash must match the committed
+      # .dvc pointer. A drifted dataset invalidates every metric.
+      - name: Verify dataset fingerprint
+        run: |
+          status=$(dvc status finetune_data.dvc)
+          echo "$status"
+          if ! echo "$status" | grep -q "Data and pipelines are up to date"; then
+            echo "::error::finetune_data does not match its committed DVC fingerprint"
+            exit 1
+          fi
+
+      - name: Fetch registered model
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+          MLFLOW_TRACKING_PASSWORD: ${{ secrets.DAGSHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.model_version }}" ]; then
+            OUT=$(python scripts/fetch_registered_model.py --version "${{ github.event.inputs.model_version }}")
+          else
+            OUT=$(python scripts/fetch_registered_model.py)
+          fi
+          echo "$OUT"
+          echo "MODEL_DIR=$(echo "$OUT" | tail -1)" >> "$GITHUB_ENV"
+
+      - name: Evaluate against committed baseline
+        run: |
+          python scripts/model_eval_gate.py \
+            --model-dir "$MODEL_DIR" \
+            --labels finetune_data/val_labels.txt \
+            --data-root finetune_data \
+            --baseline configs/model_baseline.json

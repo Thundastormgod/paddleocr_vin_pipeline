@@ -235,7 +235,7 @@ smmap==5.0.2
 SQLAlchemy==2.0.46
 SQLAlchemy-Utils==0.42.1
 sqlmodel==0.0.18
-sqlparse==0.5.5
+sqlparse==0.6.0
 sqltrie==0.11.2
 starlette==0.45.3
 streamlit==1.53.1

@@ -34,13 +34,174 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Tuple
 import logging
+
+import yaml
 
 logger = logging.getLogger(__name__)
 
 # Project root for resolving relative paths
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
+
+
+# =============================================================================
+# PaddleOCR fine-tune config assembly
+# =============================================================================
+# finetune_paddleocr.py takes NO hyperparameter CLI flags — its argparse
+# defines only --config/--resume/--export-onnx (plus optional DagsHub
+# streaming flags). The ONLY way to carry UI settings into that trainer is a
+# config YAML written for the run, passed via --config.
+
+#: Base config consumed by finetune_paddleocr.py.
+DEFAULT_FINETUNE_BASE_CONFIG = PROJECT_ROOT / "configs" / "vin_finetune_config.yml"
+
+#: Architecture.algorithm values implemented by finetune_paddleocr's
+#: VINFineTuner (see its SUPPORTED_ARCHITECTURES), keyed by the normalized
+#: selector ("PP-OCRv5"/"PP_OCRv5"/"pp-ocrv5" all map to "ppocrv5").
+FINETUNE_ALGORITHM_MAP = {
+    "ppocrv4": "PP-OCRv4",
+    "ppocrv5": "PP-OCRv5",
+    "rosetta": "Rosetta",
+}
+
+
+def _normalize_architecture(architecture: str) -> str:
+    """Lowercase and drop separators: 'PP-OCRv5' / 'PP_OCRv5' -> 'ppocrv5'."""
+    return "".join(c for c in architecture.lower() if c.isalnum())
+
+
+def _load_base_finetune_config(base_config_path: Optional[str]) -> Tuple[Dict[str, Any], Path]:
+    """Load the base fine-tune config YAML, resolving against PROJECT_ROOT."""
+    base_path = Path(base_config_path) if base_config_path else DEFAULT_FINETUNE_BASE_CONFIG
+    if not base_path.is_absolute():
+        base_path = PROJECT_ROOT / base_path
+    if not base_path.exists():
+        raise FileNotFoundError(f"Base fine-tune config not found: {base_path}")
+    with open(base_path, "r") as f:
+        config = yaml.safe_load(f)
+    if not isinstance(config, dict):
+        raise ValueError(f"Base fine-tune config is not a mapping: {base_path}")
+    return config, base_path
+
+
+def _resolve_dict_paths(config: Dict[str, Any]) -> None:
+    """
+    Make character_dict_path entries absolute (against PROJECT_ROOT).
+
+    The merged config is written into the run's output directory; relative
+    dictionary paths would then depend on the trainer's CWD.
+    """
+    for section_name in ("Global", "PostProcess"):
+        section = config.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        dict_path = section.get("character_dict_path")
+        if isinstance(dict_path, str) and dict_path and not Path(dict_path).is_absolute():
+            section["character_dict_path"] = str(PROJECT_ROOT / dict_path)
+
+
+def build_finetune_config(
+    ui_config: Dict[str, Any],
+    output_dir: str,
+    base_config_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Merge UI training settings into the finetune_paddleocr base config.
+
+    Key mapping (UI -> config keys the trainer actually reads, per its
+    _REQUIRED_CONFIG_KEYS):
+        epochs        -> Global.epoch_num (and Optimizer.lr.T_max for Cosine,
+                         which the base config defines as the cosine period
+                         in epochs)
+        batch_size    -> Train.loader.batch_size_per_card
+        learning_rate -> Optimizer.lr.learning_rate
+        output_dir    -> Global.save_model_dir
+        device        -> Global.use_gpu (False for 'cpu', True otherwise)
+        train_data_dir / train_labels -> Train.dataset.data_dir / label_file_list
+        val_data_dir / val_labels     -> Eval.dataset.data_dir / label_file_list
+        architecture  -> Architecture.algorithm (only values the trainer
+                         implements: PP-OCRv4, PP-OCRv5, Rosetta)
+
+    Args:
+        ui_config: Settings collected by the web UI.
+        output_dir: Run output directory (becomes Global.save_model_dir).
+        base_config_path: Base YAML; defaults to configs/vin_finetune_config.yml.
+
+    Returns:
+        The merged config dict, ready to be written with write_finetune_config.
+
+    Raises:
+        FileNotFoundError: The base config does not exist.
+        ValueError: The base config is not a mapping, or the requested
+            architecture is not implemented by the trainer.
+    """
+    merged, base_path = _load_base_finetune_config(base_config_path)
+
+    def section(*path_keys: str) -> Dict[str, Any]:
+        node: Dict[str, Any] = merged
+        for key in path_keys:
+            child = node.get(key)
+            if not isinstance(child, dict):
+                child = {}
+                node[key] = child
+            node = child
+        return node
+
+    global_cfg = section("Global")
+    global_cfg["save_model_dir"] = str(output_dir)
+    global_cfg["use_gpu"] = str(ui_config.get("device", "cpu")).lower() != "cpu"
+    if "epochs" in ui_config:
+        global_cfg["epoch_num"] = int(ui_config["epochs"])
+        lr_cfg = section("Optimizer", "lr")
+        if str(lr_cfg.get("name", "")).lower() == "cosine" and "T_max" in lr_cfg:
+            lr_cfg["T_max"] = int(ui_config["epochs"])
+    if "learning_rate" in ui_config:
+        section("Optimizer", "lr")["learning_rate"] = float(ui_config["learning_rate"])
+    if "batch_size" in ui_config:
+        section("Train", "loader")["batch_size_per_card"] = int(ui_config["batch_size"])
+
+    dataset_overrides = (
+        ("train_data_dir", ("Train", "dataset"), "data_dir", False),
+        ("train_labels", ("Train", "dataset"), "label_file_list", True),
+        ("val_data_dir", ("Eval", "dataset"), "data_dir", False),
+        ("val_labels", ("Eval", "dataset"), "label_file_list", True),
+    )
+    for ui_key, section_path, config_key, as_list in dataset_overrides:
+        value = ui_config.get(ui_key)
+        if value:
+            section(*section_path)[config_key] = [str(value)] if as_list else str(value)
+
+    architecture = str(ui_config.get("architecture") or "")
+    if architecture:
+        algorithm = FINETUNE_ALGORITHM_MAP.get(_normalize_architecture(architecture))
+        if algorithm is None:
+            supported = ", ".join(sorted(set(FINETUNE_ALGORITHM_MAP.values())))
+            raise ValueError(
+                f"Architecture {architecture!r} is not implemented by "
+                f"finetune_paddleocr.py (supported: {supported}); the "
+                f"architecture is otherwise fixed by the base config "
+                f"({base_path.name})."
+            )
+        section("Architecture")["algorithm"] = algorithm
+
+    _resolve_dict_paths(merged)
+    return merged
+
+
+def write_finetune_config(config: Dict[str, Any], output_dir: str) -> Path:
+    """
+    Write the merged trainer config into the run's output directory.
+
+    Returns:
+        Absolute path of the written YAML (passed to the trainer's --config).
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    config_path = out / "train_config.yml"
+    with open(config_path, "w") as f:
+        yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
+    return config_path
 
 
 @dataclass
@@ -67,6 +228,9 @@ class TrainingState:
     best_accuracy: float = 0.0
     start_time: Optional[float] = None
     error: Optional[str] = None
+    #: Distinct terminal status: the user aborted the run. A stopped run is
+    #: neither "completed" nor "failed" and the UI must render it as such.
+    stopped: bool = False
     history: List[TrainingUpdate] = field(default_factory=list)
 
 
@@ -107,6 +271,7 @@ class ProgressTracker:
         self._state.current_batch = 0
         self._state.start_time = time.time()
         self._state.error = None
+        self._state.stopped = False
         self._state.history = []
     
     def update(self, epoch: int, batch: int, loss: float, accuracy: float = 0.0, message: str = ""):
@@ -147,6 +312,24 @@ class ProgressTracker:
         """Mark training as failed."""
         self._state.is_running = False
         self._state.error = error_message
+    
+    def mark_stopped(self, message: str = "Training stopped by user"):
+        """
+        Mark training as stopped by the user (distinct terminal status).
+        
+        A user-aborted run is neither completed nor failed: `stopped` is set,
+        `error` is cleared, and the message lands in the history for display.
+        """
+        self._state.is_running = False
+        self._state.stopped = True
+        self._state.error = None
+        self.update(
+            self._state.current_epoch,
+            self._state.current_batch,
+            self._state.current_loss,
+            self._state.best_accuracy,
+            message,
+        )
     
     def pause(self):
         """Pause training."""
@@ -201,7 +384,10 @@ class TrainingRunner:
     
     _instance: Optional['TrainingRunner'] = None
     _lock = threading.Lock()
-    _lock_file = Path("./output/.training_lock")
+    # Anchored to PROJECT_ROOT like every other path this module resolves:
+    # a CWD-relative lock file silently stops being a mutex the moment the
+    # server is launched from a different directory (W-M13).
+    _lock_file = PROJECT_ROOT / "output" / ".training_lock"
     
     # Training parameter bounds for validation
     PARAM_BOUNDS = {
@@ -226,7 +412,9 @@ class TrainingRunner:
             self._tracker = get_global_tracker()
             self._stop_requested = False
             self._current_model_type = None  # Track which model is training
+            self._current_training_type = None  # e.g. "paddleocr_finetune"
             self._current_console_log = None  # Track current console log path
+            self._monitor_thread: Optional[threading.Thread] = None
             self._lock_fd: Optional[int] = None  # File descriptor for fcntl lock
             self._initialized = True
     
@@ -281,11 +469,13 @@ class TrainingRunner:
                 else:
                     logger.info(f"Resolved val labels: {resolved}")
         
-        # Validate device selection
+        # Validate device selection. A device string is valid when it names
+        # one of the supported device tokens (display forms like
+        # "GPU (CUDA - Paddle)" or "MPS (Apple Silicon)" contain one).
         device = config.get("device", "").lower()
-        valid_devices = ["cpu", "cuda", "mps", "gpu", "gpu (cuda)", "gpu (cuda - paddle)", "mps (apple silicon)"]
-        if device and not any(d in device.lower() for d in ["cpu", "cuda", "mps", "gpu"]):
-            errors.append(f"Invalid device: {device}")
+        valid_devices = ("cpu", "cuda", "mps", "gpu")
+        if device and not any(token in device for token in valid_devices):
+            errors.append(f"Invalid device: {device} (expected one of {', '.join(valid_devices)})")
         
         if errors:
             raise ValueError("Invalid training configuration:\n  - " + "\n  - ".join(errors))
@@ -357,21 +547,18 @@ class TrainingRunner:
         # Check lock file for training started by another session
         if self._lock_file.exists():
             try:
-                import json
                 with open(self._lock_file, 'r') as f:
                     lock_data = json.load(f)
                 pid = lock_data.get('pid')
                 # Check if process is still running
-                if pid:
-                    import os
-                    try:
-                        os.kill(pid, 0)  # Doesn't kill, just checks if exists
-                        return True
-                    except OSError:
-                        # Process not running, clean up stale lock
-                        self._lock_file.unlink()
-            except:
-                pass
+                if pid and self._pid_alive(int(pid)):
+                    return True
+                # Process not running (or no pid recorded): stale lock
+                self._lock_file.unlink(missing_ok=True)
+            except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
+                # Malformed/unreadable lock state must not crash the status
+                # check, but it must not vanish silently either (W-L12).
+                logger.debug(f"Could not parse training lock {self._lock_file}: {e}")
         
         return False
     
@@ -455,98 +642,76 @@ class TrainingRunner:
             logger.warning(f"Error releasing lock: {e}")
     
     def start_paddleocr_finetuning(self, config: Dict[str, Any]):
-        """Start PaddleOCR fine-tuning process."""
+        """
+        Start the PaddleOCR fine-tuning process.
+
+        finetune_paddleocr.py accepts no hyperparameter flags — its argparse
+        defines only --config/--resume/--export-onnx. The UI settings are
+        merged into the base config YAML (build_finetune_config), the merged
+        config is written into the run's output directory, and the trainer is
+        launched with --config pointing at that file.
+
+        Raises:
+            RuntimeError: Training already in progress.
+            ValueError: Invalid settings, or an architecture the trainer
+                does not implement.
+            FileNotFoundError: Base config missing.
+        """
         if self.is_running:
             raise RuntimeError("Training already in progress. Please wait for it to complete or stop it first.")
         
         # Validate configuration before starting
         self._validate_training_config(config, "paddleocr_finetune")
         
-        self._tracker.start(config.get("epochs", 10))
-        self._stop_requested = False
-        
         # Create timestamped, model-specific output directory
         base_output_dir = config.get("output_dir", "./output/vin_rec_finetune")
         output_dir = self._build_output_dir(base_output_dir, "paddleocr_finetune")
         
-        # Set current model type for UI - include architecture if specified
-        architecture = config.get("architecture", "")
-        if architecture:
-            # Use clean architecture name for display
-            if "PP-OCRv5" in architecture or "PP_OCRv5" in architecture:
-                self._current_model_type = "PP-OCRv5"
-            elif "PP-OCRv4" in architecture or "PP_OCRv4" in architecture:
-                self._current_model_type = "PP-OCRv4"
-            elif "PP-OCRv3" in architecture or "PP_OCRv3" in architecture:
-                self._current_model_type = "PP-OCRv3"
-            elif "SVTR_LCNet" in architecture:
-                self._current_model_type = "SVTR_LCNet"
-            elif "SVTR_Tiny" in architecture:
-                self._current_model_type = "SVTR_Tiny"
-            elif "CRNN" in architecture:
-                self._current_model_type = "CRNN"
-            else:
-                self._current_model_type = architecture
-        else:
-            self._current_model_type = "PaddleOCR"
+        # Build the merged trainer config BEFORE touching tracker/lock state:
+        # an unsupported architecture or a missing base config must surface
+        # without leaving a phantom "running" tracker or a stale lock.
+        merged_config = build_finetune_config(
+            ui_config=config,
+            output_dir=output_dir,
+            base_config_path=config.get("base_config"),
+        )
+        
+        self._tracker.start(config.get("epochs", 10))
+        self._stop_requested = False
+        
+        # Set current model type for UI from the algorithm that will actually
+        # be trained (the merged config is the single source of truth).
+        self._current_model_type = merged_config.get("Architecture", {}).get(
+            "algorithm", "PaddleOCR"
+        )
+        self._current_training_type = "paddleocr_finetune"
         
         # Acquire lock to prevent simultaneous training
         self._acquire_lock("paddleocr_finetune", output_dir)
         
-        cmd = [
-            sys.executable, "-m", "src.vin_ocr.training.finetune_paddleocr",
-            "--epochs", str(config.get("epochs", 10)),
-            "--batch-size", str(config.get("batch_size", 8)),
-            "--lr", str(config.get("learning_rate", 0.0005)),
-            "--output-dir", output_dir,
-        ]
-        
-        # Device selection - explicitly pass GPU or CPU flag
-        device = config.get("device", "cpu")
-        if device == "cpu":
-            cmd.append("--cpu")
-        else:
-            cmd.append("--gpu")
-        
-        logger.info(f"  Device: {device.upper()}")
-        
-        # Add architecture if specified (PP-OCRv5, SVTR_LCNet, CRNN)
-        architecture = config.get("architecture", "")
-        if architecture:
-            # Extract architecture name from display format
-            if "PP-OCRv5" in architecture or "PP_OCRv5" in architecture:
-                cmd.extend(["--architecture", "PP-OCRv5"])
-            elif "SVTR_LCNet" in architecture:
-                cmd.extend(["--architecture", "SVTR_LCNet"])
-            elif "SVTR_Tiny" in architecture:
-                cmd.extend(["--architecture", "SVTR_Tiny"])
-            elif "CRNN" in architecture:
-                cmd.extend(["--architecture", "CRNN"])
-        
-        # Add data paths if provided
-        if config.get("train_data_dir"):
-            cmd.extend(["--train-data-dir", config.get("train_data_dir")])
-        if config.get("train_labels"):
-            cmd.extend(["--train-labels", config.get("train_labels")])
-        if config.get("val_data_dir"):
-            cmd.extend(["--val-data-dir", config.get("val_data_dir")])
-        if config.get("val_labels"):
-            cmd.extend(["--val-labels", config.get("val_labels")])
-        
-        logger.info(f"✓ Starting PaddleOCR Fine-Tuning")
-        logger.info(f"  Model: PaddleOCR")
-        logger.info(f"  Training Script: src.vin_ocr.training.finetune_paddleocr")
-        logger.info(f"  Output Directory: {output_dir}")
-        logger.info(f"  Command: {' '.join(cmd)}")
-        
         try:
+            config_path = write_finetune_config(merged_config, output_dir)
+            
+            cmd = [
+                sys.executable, "-m", "src.vin_ocr.training.finetune_paddleocr",
+                "--config", str(config_path),
+            ]
+            
+            logger.info(f"✓ Starting PaddleOCR Fine-Tuning")
+            logger.info(f"  Model: {self._current_model_type}")
+            logger.info(f"  Training Script: src.vin_ocr.training.finetune_paddleocr")
+            logger.info(f"  Device: {'GPU' if merged_config['Global'].get('use_gpu') else 'CPU'}")
+            logger.info(f"  Output Directory: {output_dir}")
+            logger.info(f"  Config: {config_path}")
+            logger.info(f"  Command: {' '.join(cmd)}")
+            
             self._process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                cwd=str(Path(__file__).parent.parent.parent.parent),  # Project root
+                cwd=str(PROJECT_ROOT),
             )
             
             # Start monitoring thread with output directory and model tag
@@ -555,11 +720,13 @@ class TrainingRunner:
                 args=(output_dir, "paddleocr"),
                 daemon=True
             )
+            self._monitor_thread = thread
             thread.start()
             
         except Exception as e:
             self._tracker.error(str(e))
             self._current_model_type = None  # Clear on error
+            self._current_training_type = None
             self._release_lock()  # Release lock on error
             raise
     
@@ -580,6 +747,7 @@ class TrainingRunner:
         
         # Set current model type for UI - DeepSeek VL2
         self._current_model_type = "DeepSeek-VL2"
+        self._current_training_type = "deepseek_finetune"
         
         # Acquire lock to prevent simultaneous training
         self._acquire_lock("deepseek_finetune", output_dir)
@@ -628,11 +796,13 @@ class TrainingRunner:
                 args=(output_dir, "deepseek"),
                 daemon=True
             )
+            self._monitor_thread = thread
             thread.start()
             
         except Exception as e:
             self._tracker.error(str(e))
             self._current_model_type = None  # Clear on error
+            self._current_training_type = None
             self._release_lock()  # Release lock on error
             raise
     
@@ -657,6 +827,7 @@ class TrainingRunner:
             self._current_model_type = f"{architecture} (Scratch)"
         else:
             self._current_model_type = "PaddleOCR (Scratch)"
+        self._current_training_type = "paddleocr_scratch"
         
         # Acquire lock to prevent simultaneous training
         self._acquire_lock("paddleocr_scratch", output_dir)
@@ -711,11 +882,13 @@ class TrainingRunner:
                 args=(output_dir, "paddleocr"),
                 daemon=True
             )
+            self._monitor_thread = thread
             thread.start()
             
         except Exception as e:
             self._tracker.error(str(e))
             self._current_model_type = None  # Clear on error
+            self._current_training_type = None
             self._release_lock()  # Release lock on error
             raise
     
@@ -736,6 +909,7 @@ class TrainingRunner:
         
         # Set current model type for UI - DeepSeek-VL2 from Scratch
         self._current_model_type = "DeepSeek-VL2 (Scratch)"
+        self._current_training_type = "deepseek_scratch"
         
         # Acquire lock to prevent simultaneous training
         self._acquire_lock("deepseek_scratch", output_dir)
@@ -783,11 +957,13 @@ class TrainingRunner:
                 args=(output_dir, "deepseek"),
                 daemon=True
             )
+            self._monitor_thread = thread
             thread.start()
             
         except Exception as e:
             self._tracker.error(str(e))
             self._current_model_type = None  # Clear on error
+            self._current_training_type = None
             self._release_lock()  # Release lock on error
             raise
     
@@ -827,6 +1003,7 @@ class TrainingRunner:
             self._current_model_type = "DeepSeek-VL2 (HP Tuning)"
         else:
             self._current_model_type = f"{model_type} (HP Tuning)"
+        self._current_training_type = "hyperparameter_tuning"
         
         # Acquire lock to prevent simultaneous training
         self._acquire_lock("hyperparameter_tuning", output_dir)
@@ -886,17 +1063,23 @@ class TrainingRunner:
                 args=(output_dir, model_type),
                 daemon=True
             )
+            self._monitor_thread = thread
             thread.start()
             
         except Exception as e:
             self._tracker.error(str(e))
             self._current_model_type = None  # Clear on error
+            self._current_training_type = None
             self._release_lock()  # Release lock on error
             raise
     
     def _monitor_tuning_process(self, output_dir: str = "./output/hyperparameter_tuning", model_tag: str = "paddleocr"):
         """Monitor Optuna tuning process output and update tracker."""
-        if self._process is None:
+        # Capture the process handle in a local: stop() and this thread's own
+        # finally block null self._process, and dereferencing the attribute
+        # mid-run raced against that (W-M2).
+        proc = self._process
+        if proc is None:
             return
         
         trial = 0
@@ -923,7 +1106,7 @@ class TrainingRunner:
             
             # Use append mode for real-time writing
             with open(console_log_path, 'a') as console_log:
-                for line in self._process.stdout:
+                for line in proc.stdout:
                     if self._stop_requested:
                         console_log.write(f"\n[STOPPED] Tuning stopped by user\n")
                         console_log.flush()
@@ -965,7 +1148,7 @@ class TrainingRunner:
                     self._tracker.update(trial, 0, 0.0, best_value, line[:100])
                 
                 # Write completion status
-                return_code = self._process.wait()
+                return_code = proc.wait()
                 end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 console_log.write(f"\n" + "=" * 60 + "\n")
                 console_log.write(f"Tuning Ended: {end_time}\n")
@@ -974,45 +1157,198 @@ class TrainingRunner:
                 console_log.write(f"=" * 60 + "\n")
                 console_log.flush()
             
-            if return_code == 0:
+            # User-stop wins over this thread's completion/error paths:
+            # stop() sets the terminal "stopped" status itself (W-M2/W-M11).
+            if self._stop_requested:
+                pass
+            elif return_code == 0:
                 self._tracker.complete(f"Hyperparameter tuning completed. Best value: {best_value:.4f}")
             else:
                 self._tracker.error(f"Tuning failed with code {return_code}")
                 
         except Exception as e:
             logger.exception(f"Error monitoring tuning: {e}")
-            self._tracker.error(str(e))
+            if not self._stop_requested:
+                self._tracker.error(str(e))
         finally:
             self._process = None
             self._current_model_type = None  # Clear on completion
+            self._current_training_type = None
             self._release_lock()  # Always release lock when tuning ends
     
-    def stop(self):
-        """Stop the running training process with graceful shutdown."""
-        self._stop_requested = True
-        if self._process is not None:
-            # First, try graceful shutdown with SIGTERM
-            # The training script handles SIGTERM and saves checkpoint
-            logger.info("Sending SIGTERM for graceful shutdown...")
-            self._process.terminate()
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        """True when a process with this PID exists (signal 0 probe)."""
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # exists but owned by another user
+        except OSError:
+            return False
+    
+    def _read_lock_pid(self) -> Optional[int]:
+        """PID recorded in the lock file, or None when absent/unreadable."""
+        if not self._lock_file.exists():
+            return None
+        try:
+            with open(self._lock_file, 'r') as f:
+                lock_data = json.load(f)
+            pid = lock_data.get('pid')
+            return int(pid) if pid is not None else None
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
+            logger.debug(f"Could not read training lock {self._lock_file}: {e}")
+            return None
+    
+    @staticmethod
+    def _terminate_child(proc: subprocess.Popen) -> Tuple[bool, bool]:
+        """
+        Terminate a child process: SIGTERM, then SIGKILL after 30s.
+        
+        Returns:
+            (exited, graceful): exited=False means the process survived even
+            SIGKILL; graceful=True means it exited on SIGTERM.
+        """
+        logger.info("Sending SIGTERM for graceful shutdown...")
+        proc.terminate()
+        try:
+            # Give the process time to run its shutdown path (up to 30s)
+            proc.wait(timeout=30)
+            logger.info("Training process terminated gracefully")
+            return True, True
+        except subprocess.TimeoutExpired:
+            logger.warning("Graceful shutdown timeout, sending SIGKILL...")
+            proc.kill()
             try:
-                # Give process time to save checkpoint (up to 30 seconds)
-                self._process.wait(timeout=30)
-                logger.info("Training process terminated gracefully")
+                proc.wait(timeout=5)
+                return True, False
             except subprocess.TimeoutExpired:
-                # Force kill if graceful shutdown takes too long
-                logger.warning("Graceful shutdown timeout, sending SIGKILL...")
-                self._process.kill()
-                self._process.wait(timeout=5)
-            self._process = None
+                logger.error("Training process did not exit after SIGKILL")
+                return False, False
+    
+    def _terminate_locked_pid(self) -> Tuple[bool, bool]:
+        """
+        Terminate the training process recorded in the lock file (W-M3).
+        
+        Covers the server-restart case: is_running derives from the lock file
+        of a process this runner never started (self._process is None).
+        
+        Returns:
+            (exited, graceful): exited=True when no live process remains
+            (including "nothing was running"); graceful=True when it exited
+            on SIGTERM (or nothing had to be signalled).
+        """
+        pid = self._read_lock_pid()
+        if pid is None or pid == os.getpid() or not self._pid_alive(pid):
+            return True, True  # nothing (left) to stop
+        
+        logger.info(f"Stopping training process from lock file (PID {pid})...")
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as e:
+            logger.error(f"Could not send SIGTERM to PID {pid}: {e}")
+            return (not self._pid_alive(pid)), False
+        
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if not self._pid_alive(pid):
+                return True, True
+            time.sleep(0.5)
+        
+        logger.warning(f"PID {pid} ignored SIGTERM, sending SIGKILL...")
+        try:
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        except OSError as e:
+            logger.error(f"Could not send SIGKILL to PID {pid}: {e}")
+            return (not self._pid_alive(pid)), False
+        
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if not self._pid_alive(pid):
+                return True, False
+            time.sleep(0.2)
+        return False, False
+    
+    @staticmethod
+    def _stopped_message(graceful: bool, training_type: Optional[str]) -> str:
+        """Honest per-trainer stop message (W-M11)."""
+        if not graceful:
+            return ("Training stopped by user (process had to be force-killed; "
+                    "no shutdown checkpoint was written)")
+        if training_type == "paddleocr_finetune":
+            # finetune_paddleocr registers a SIGTERM handler and saves a
+            # `latest` resume checkpoint during graceful shutdown (verified:
+            # its train loop calls save_checkpoint on the shutdown flag).
+            return ("Training stopped by user (the fine-tune trainer saves a "
+                    "`latest` resume checkpoint on SIGTERM)")
+        # finetune_deepseek / train_from_scratch / optuna_tuning install no
+        # SIGTERM handler: the process just exits. Only checkpoints already
+        # written during training remain — claim nothing more.
+        return "Training stopped by user (no shutdown checkpoint is saved by this trainer)"
+    
+    def stop(self) -> bool:
+        """
+        Stop the running training process with graceful shutdown.
+        
+        Handles both a child started by this runner and — after a server
+        restart — a process known only from the lock file (W-M3). The lock
+        file is only removed once its process is confirmed dead; a process
+        that survives SIGKILL is reported honestly and the lock retained.
+        
+        Returns:
+            True when nothing is left running (status set to "stopped"),
+            False when the process could not be terminated (status set to
+            an error, lock left in place).
+        """
+        self._stop_requested = True
+        # Local captures: the monitor thread's finally block nulls
+        # self._process and self._current_training_type; dereferencing the
+        # attributes mid-stop raced against that (W-M2).
+        proc = self._process
+        monitor = self._monitor_thread
+        training_type = self._current_training_type
+        
+        if proc is not None and proc.poll() is None:
+            exited, graceful = self._terminate_child(proc)
+        elif proc is None:
+            exited, graceful = self._terminate_locked_pid()
+        else:
+            exited, graceful = True, True  # child already exited on its own
+        
+        if not exited:
+            # Never delete the lock while its process is alive: that would
+            # let a second training start against a live one.
+            self._tracker.error(
+                "Stop failed: the training process is still running and could "
+                "not be terminated; the training lock was left in place."
+            )
+            return False
+        
+        # Let the monitor thread finish BEFORE the final status is set: its
+        # completion/error paths are guarded by _stop_requested, so after the
+        # join the "stopped" status below cannot be overwritten (W-M2).
+        if monitor is not None and monitor is not threading.current_thread() and monitor.is_alive():
+            monitor.join(timeout=15)
+        
+        message = self._stopped_message(graceful, training_type)
+        self._process = None
+        self._monitor_thread = None
         self._current_model_type = None  # Clear model type
         self._current_console_log = None  # Clear console log path
+        self._current_training_type = None
         self._release_lock()  # Release lock when stopping
-        self._tracker.complete("Training stopped by user (checkpoint saved)")
+        self._tracker.mark_stopped(message)
+        return True
     
     def _monitor_process(self, output_dir: str = "./output/vin_rec_finetune", model_tag: str = "paddleocr"):
         """Monitor training process output and update tracker with real-time console logging."""
-        if self._process is None:
+        # Capture the process handle in a local: stop() and this thread's own
+        # finally block null self._process, and dereferencing the attribute
+        # mid-run raced against that (W-M2).
+        proc = self._process
+        if proc is None:
             return
         
         epoch = 1
@@ -1042,7 +1378,7 @@ class TrainingRunner:
             
             # Use append mode for real-time writing
             with open(console_log_path, 'a') as console_log:
-                for line in self._process.stdout:
+                for line in proc.stdout:
                     if self._stop_requested:
                         console_log.write(f"\n[STOPPED] Training stopped by user\n")
                         console_log.flush()
@@ -1105,7 +1441,7 @@ class TrainingRunner:
                         lines_since_update = 0
                 
                 # Write completion status
-                return_code = self._process.wait()
+                return_code = proc.wait()
                 end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 console_log.write(f"\n" + "=" * 60 + "\n")
                 console_log.write(f"Training Ended: {end_time}\n")
@@ -1113,7 +1449,12 @@ class TrainingRunner:
                 console_log.write(f"=" * 60 + "\n")
                 console_log.flush()
             
-            if return_code == 0:
+            # User-stop wins over this thread's completion/error paths: the
+            # nonzero exit code after a stop is the SIGTERM/SIGKILL stop()
+            # itself sent, and stop() sets the terminal status (W-M2/W-M11).
+            if self._stop_requested:
+                pass
+            elif return_code == 0:
                 self._tracker.complete("Training completed successfully")
             else:
                 state = self._tracker.get_state()
@@ -1122,10 +1463,12 @@ class TrainingRunner:
                 
         except Exception as e:
             logger.exception(f"Error monitoring training: {e}")
-            self._tracker.error(str(e))
+            if not self._stop_requested:
+                self._tracker.error(str(e))
         finally:
             self._process = None
             self._current_model_type = None  # Clear model type
+            self._current_training_type = None
             self._release_lock()  # Always release lock when training ends
     
     def get_console_log_path(self) -> Optional[str]:
@@ -1280,4 +1623,8 @@ __all__ = [
     "get_global_tracker",
     "get_global_runner",
     "reset_global_state",
+    "build_finetune_config",
+    "write_finetune_config",
+    "DEFAULT_FINETUNE_BASE_CONFIG",
+    "FINETUNE_ALGORITHM_MAP",
 ]

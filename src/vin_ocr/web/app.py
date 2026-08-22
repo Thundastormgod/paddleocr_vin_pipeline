@@ -55,29 +55,13 @@ try:
 except ImportError:
     PLOTLY_AVAILABLE = False
 
-# Project imports
-try:
-    from src.vin_ocr.core.vin_utils import extract_vin_from_filename, is_valid_vin
-    VIN_UTILS_AVAILABLE = True
-except ImportError:
-    VIN_UTILS_AVAILABLE = False
-    def extract_vin_from_filename(filename):
-        import re
-        patterns = [
-            r'[A-HJ-NPR-Z0-9]{17}',
-        ]
-        name = Path(filename).stem.upper()
-        for pattern in patterns:
-            match = re.search(pattern, name)
-            if match:
-                return match.group(0)
-        return None
-    
-    def is_valid_vin(vin):
-        if not vin or len(vin) != 17:
-            return False
-        invalid_chars = set('IOQ')
-        return all(c not in invalid_chars for c in vin.upper())
+# Project imports. No try/except fallback: the project root is on sys.path
+# (inserted above) and vin_utils is stdlib-only, so this import is reliable
+# in the app context. The previous fallback silently replaced the
+# pattern-prioritized extractor with a naive first-17-chars regex whenever
+# the import list carried a nonexistent name — timestamps in filenames were
+# then extracted as ground-truth VINs (W-M1).
+from src.vin_ocr.core.vin_utils import extract_vin_from_filename
 
 # DeepSeek OCR Provider imports (existing implementation)
 try:
@@ -119,12 +103,14 @@ try:
         get_global_tracker,
         TrainingRunner,
         ProgressTracker,
+        FINETUNE_ALGORITHM_MAP,
     )
     TRAINING_COMPONENTS_AVAILABLE = True
 except ImportError:
     TRAINING_COMPONENTS_AVAILABLE = False
     get_global_runner = None
     get_global_tracker = None
+    FINETUNE_ALGORITHM_MAP = {}
 
 # =============================================================================
 # CONFIGURATION
@@ -212,6 +198,20 @@ st.markdown("""
 # Persistent storage file
 PERSISTENT_STATE_FILE = Config.ROOT / ".streamlit_state.json"
 
+# Session-state key of the sidebar navigation radio, plus a pending-target
+# key for programmatic navigation. A widget's own key cannot be written
+# after the widget was instantiated in the same run, so buttons store the
+# target under NAV_TARGET_KEY and rerun; render_sidebar applies it to the
+# radio's key BEFORE the radio is created on the next run.
+NAV_RADIO_KEY = "nav_page"
+NAV_TARGET_KEY = "nav_page_target"
+
+
+def navigate_to(page: str) -> None:
+    """Navigate to a sidebar page on the next rerun."""
+    st.session_state[NAV_TARGET_KEY] = page
+    st.rerun()
+
 
 def save_persistent_state():
     """Save current session state to disk for persistence across restarts."""
@@ -263,8 +263,10 @@ def init_session_state():
     try:
         import paddle
         cuda_available = paddle.device.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0
-    except Exception:
-        pass
+    except (ImportError, OSError, RuntimeError) as e:
+        # Best-effort UI probe: paddle absent, native libs broken, or the
+        # CUDA runtime probe failing all mean "no CUDA default".
+        logger.debug(f"CUDA availability probe failed: {e}")
     
     # Check for Apple Silicon MPS (PyTorch only - PaddlePaddle doesn't support MPS)
     mps_available = False
@@ -272,8 +274,8 @@ def init_session_state():
         import torch
         if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
             mps_available = True
-    except Exception:
-        pass
+    except (ImportError, OSError) as e:
+        logger.debug(f"MPS availability probe failed: {e}")
     
     # Note: For PaddleOCR training, only CUDA is supported, not MPS
     # MPS can be used for PyTorch-based models like DeepSeek
@@ -327,20 +329,28 @@ def init_session_state():
 # UTILITY FUNCTIONS
 # =============================================================================
 
-def get_image_files(directory: Path) -> List[Path]:
-    """Get all image files from a directory."""
-    images = []
+def get_image_files(directory: Path, recursive: bool = False) -> List[Path]:
+    """
+    Get all image files from a directory (optionally recursive).
+    
+    A single traversal matched case-insensitively on the suffix: globbing
+    `*ext` plus `*EXT` double-counted every file on case-insensitive
+    filesystems (W-L2), and mixed-case suffixes like `.Jpg` were missed.
+    The set collection deduplicates within the batch.
+    """
+    images: set = set()
     if directory.exists():
-        for ext in Config.IMAGE_EXTENSIONS:
-            images.extend(directory.glob(f"*{ext}"))
-            images.extend(directory.glob(f"*{ext.upper()}"))
+        iterator = directory.rglob("*") if recursive else directory.glob("*")
+        for path in iterator:
+            if path.suffix.lower() in Config.IMAGE_EXTENSIONS and path.is_file():
+                images.add(path)
     return sorted(images)
 
 
-def load_image_pool_from_directory(directory: Path) -> List[Dict]:
+def load_image_pool_from_directory(directory: Path, recursive: bool = False) -> List[Dict]:
     """Load images from a directory into the pool format."""
     pool = []
-    images = get_image_files(directory)
+    images = get_image_files(directory, recursive=recursive)
     
     for img_path in images:
         vin = extract_vin_from_filename(img_path.name)
@@ -583,33 +593,37 @@ def run_inference(model_path: str, image_path: str, model_type: str = "finetuned
                 if use_gpu:
                     try:
                         paddle.device.set_device('gpu')
-                    except Exception:
+                    except (ValueError, RuntimeError) as e:
+                        logger.debug(f"GPU unavailable, falling back to CPU: {e}")
                         paddle.device.set_device('cpu')
                 else:
                     paddle.device.set_device('cpu')
                 
-                # Initialize PaddleOCR with specific version
-                if model_path == "PP-OCRv5":
-                    ocr = PaddleOCR(lang='en', ocr_version='PP-OCRv5', show_log=False)
-                elif model_path == "PP-OCRv4":
-                    ocr = PaddleOCR(lang='en', ocr_version='PP-OCRv4', show_log=False)
-                else:  # PP-OCRv3
-                    ocr = PaddleOCR(lang='en', ocr_version='PP-OCRv3', show_log=False)
+                # PaddleOCR 3.x API — mirrors the repo's canonical usage in
+                # src/vin_ocr/providers/ocr_providers.py. The 2.x kwargs
+                # (show_log=...) and methods (.ocr(path, cls=True)) were
+                # removed in 3.x and raised on every "Base" evaluation (W-H2).
+                ocr_version = model_path if model_path in ("PP-OCRv5", "PP-OCRv4", "PP-OCRv3") else "PP-OCRv3"
+                ocr = PaddleOCR(
+                    lang='en',
+                    ocr_version=ocr_version,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                )
                 
-                # Run OCR
-                ocr_result = ocr.ocr(image_path, cls=True)
+                # Run OCR (3.x: .predict returns a list of per-image dicts
+                # with rec_texts / rec_scores)
+                ocr_result = ocr.predict(image_path)
                 
                 # Extract text and confidence
                 texts = []
                 confidences = []
                 
-                if ocr_result and ocr_result[0]:
-                    for line in ocr_result[0]:
-                        if line and len(line) >= 2:
-                            text = line[1][0] if isinstance(line[1], (list, tuple)) else str(line[1])
-                            conf = line[1][1] if isinstance(line[1], (list, tuple)) and len(line[1]) > 1 else 0.5
-                            texts.append(text)
-                            confidences.append(conf)
+                page = ocr_result[0] if isinstance(ocr_result, list) and ocr_result else ocr_result
+                if isinstance(page, dict):
+                    texts = [str(t) for t in page.get('rec_texts', [])]
+                    confidences = [float(s) for s in page.get('rec_scores', [])]
                 
                 # Combine all detected text
                 raw_text = ' '.join(texts)
@@ -697,8 +711,11 @@ def render_data_management_page():
             
             # Preview
             with st.expander("👁️ Preview Uploaded Images", expanded=False):
+                # len(cols) == len(uploaded_files[:5]) == min(5, n) by
+                # construction; strict=True turns any future drift into an
+                # error instead of a silently truncated preview.
                 cols = st.columns(min(5, len(uploaded_files)))
-                for i, (col, f) in enumerate(zip(cols, uploaded_files[:5])):
+                for i, (col, f) in enumerate(zip(cols, uploaded_files[:5], strict=True)):
                     with col:
                         if PIL_AVAILABLE:
                             img = Image.open(f)
@@ -769,16 +786,14 @@ def render_data_management_page():
             dir_path = Path(selected_dir)
             
             if dir_path.exists():
-                # Count images
-                if include_subdirs:
-                    images = list(dir_path.rglob("*.jpg")) + list(dir_path.rglob("*.png"))
-                else:
-                    images = get_image_files(dir_path)
+                # Count with the SAME helper (extension set + recursion) that
+                # loads the pool, so the displayed count is the loaded count.
+                images = get_image_files(dir_path, recursive=include_subdirs)
                 
                 st.info(f"📊 Found **{len(images)}** images in `{dir_path.name}`")
                 
                 if images and st.button("📥 Load into Image Pool", type="primary"):
-                    new_entries = load_image_pool_from_directory(dir_path)
+                    new_entries = load_image_pool_from_directory(dir_path, recursive=include_subdirs)
                     
                     # Avoid duplicates
                     existing_paths = {img['path'] for img in st.session_state.image_pool}
@@ -990,6 +1005,12 @@ def render_data_management_page():
 # PAGE: TRAINING
 # =============================================================================
 
+def finetune_architecture_supported(architecture: str) -> bool:
+    """True when finetune_paddleocr implements this architecture selection."""
+    normalized = "".join(c for c in architecture.lower() if c.isalnum())
+    return normalized in FINETUNE_ALGORITHM_MAP
+
+
 def render_training_page():
     """Render the training page."""
     st.markdown('<h1 class="main-header">🎯 Model Training</h1>', unsafe_allow_html=True)
@@ -999,8 +1020,9 @@ def render_training_page():
     if not st.session_state.train_images:
         st.warning("⚠️ No training data configured. Go to **📁 Data Management** to set up your dataset first.")
         if st.button("Go to Data Management →"):
-            st.session_state.current_page = "📁 Data Management"
-            st.rerun()
+            # Programmatic navigation: the sidebar applies the target to the
+            # radio's key before the radio renders on the rerun (W-M6).
+            navigate_to("📁 Data Management")
         return
     
     # Check if training components are available
@@ -1015,7 +1037,6 @@ def render_training_page():
     # Get global runner and tracker
     runner = get_global_runner()
     tracker = get_global_tracker()
-    state = tracker.get_state()
     
     # Show current dataset status
     st.markdown("### 📊 Dataset Status")
@@ -1114,6 +1135,17 @@ def render_training_page():
             st.caption(model_info['type'].upper())
         
         st.caption(f"📝 {model_info['description']}")
+        
+        # The PaddleOCR fine-tuner builds its own networks; only the
+        # architectures it implements can be selected — everything else is
+        # fixed by the base training config, not by this control.
+        if model_info['type'] == 'paddleocr' and not finetune_architecture_supported(model_info['key']):
+            supported = ", ".join(sorted(set(FINETUNE_ALGORITHM_MAP.values()))) or "PP-OCRv4, PP-OCRv5"
+            st.warning(
+                f"⚠️ {model_info['key']} fine-tuning is not implemented by the "
+                f"trainer — the architecture is fixed by the base config. "
+                f"Supported selections: {supported}."
+            )
         
         st.markdown("---")
         
@@ -1230,8 +1262,10 @@ def render_training_page():
         
         with col_btn2:
             if st.button("🛑 Stop Training", use_container_width=True, disabled=not is_training):
+                # stop() sets the terminal status itself ("stopped by user"
+                # on success, an error when the process would not die); the
+                # Training Console renders it after the rerun.
                 runner.stop()
-                st.warning("⚠️ Training stopped by user")
                 st.rerun()
         
         # Show brief status
@@ -1318,14 +1352,17 @@ def render_training_console(runner, tracker):
     
     # Check if training is running
     if not state.is_running:
-        # Check for completion by looking at history
-        has_completed = state.history and not state.error and state.current_epoch > 0
-        if has_completed:
-            st.success("✅ Training completed!")
+        # A user-aborted run is neither completed nor failed: render its
+        # distinct terminal status (W-M11).
+        if getattr(state, 'stopped', False):
+            st.warning("⏹️ Training stopped by user")
             if state.history:
-                st.info(f"Last message: {state.history[-1].message[:200] if state.history else 'N/A'}")
+                st.info(f"Last message: {state.history[-1].message[:200]}")
         elif state.error:
             st.error(f"❌ Training error: {state.error}")
+        elif state.history and state.current_epoch > 0:
+            st.success("✅ Training completed!")
+            st.info(f"Last message: {state.history[-1].message[:200]}")
         else:
             st.info("ℹ️ No training in progress. Start training from the Fine-Tuning or Hyperparameter Tuning tab.")
         return
@@ -1405,8 +1442,9 @@ def render_training_console(runner, tracker):
     
     # Stop button
     if st.button("⏹️ Stop Training", type="secondary", key="stop_training_console"):
+        # stop() sets the terminal status ("stopped by user" or an error if
+        # the process would not die); it renders above after the rerun.
         runner.stop()
-        st.warning("⏹️ Stop requested...")
         st.rerun()
     
     # Auto-refresh logic
@@ -1481,11 +1519,11 @@ def render_inference_page():
                 with st.spinner("Processing..."):
                     result = run_inference(model_path, tmp_path, model_type)
                 
-                # Clean up
+                # Clean up (best effort: a leaked temp file must not fail the UI)
                 try:
                     os.unlink(tmp_path)
-                except Exception:
-                    pass
+                except OSError as e:
+                    logger.debug(f"Could not remove temp file {tmp_path}: {e}")
                 
                 # Display result
                 if result['error']:
@@ -1559,11 +1597,11 @@ def render_inference_page():
                     result['correct'] = result['vin'] == result['ground_truth'] if result['ground_truth'] else None
                     results.append(result)
                     
-                    # Cleanup
+                    # Cleanup (best effort: a leaked temp file must not fail the UI)
                     try:
                         os.unlink(tmp_path)
-                    except Exception:
-                        pass
+                    except OSError as e:
+                        logger.debug(f"Could not remove temp file {tmp_path}: {e}")
                     
                     progress.progress((i + 1) / len(uploaded_files))
                 
@@ -1620,9 +1658,16 @@ def render_inference_page():
                 result['ground_truth'] = img['vin']
                 result['correct'] = result['vin'] == result['ground_truth']
                 
-                # Character-level accuracy
-                if result['ground_truth']:
-                    chars_correct = sum(1 for a, b in zip(result['vin'][:17], result['ground_truth'][:17]) if a == b)
+                # Character-level accuracy: positional comparison against the
+                # ground truth with an explicit length guard — missing or
+                # extra characters count as wrong (fixed /17 denominator).
+                gt = result['ground_truth'][:17]
+                pred = result['vin'][:17]
+                if gt:
+                    chars_correct = sum(
+                        1 for pos, gt_char in enumerate(gt)
+                        if pos < len(pred) and pred[pos] == gt_char
+                    )
                     result['char_accuracy'] = chars_correct / 17 * 100
                 else:
                     result['char_accuracy'] = 0
@@ -1639,17 +1684,8 @@ def render_inference_page():
             char_accuracy = df['char_accuracy'].mean()
             avg_confidence = df['confidence'].mean() * 100
             
-            st.markdown("### 📈 Evaluation Results")
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Exact Match Accuracy", f"{exact_match:.1f}%")
-            with col2:
-                st.metric("Character Accuracy", f"{char_accuracy:.1f}%")
-            with col3:
-                st.metric("Avg Confidence", f"{avg_confidence:.1f}%")
-            
-            # Save to session state
+            # Store in session state; the results and export control are
+            # rendered OUTSIDE this button body so they survive reruns (W-H1).
             st.session_state.evaluation_results = {
                 'model': selected_model,
                 'exact_match': exact_match,
@@ -1658,6 +1694,26 @@ def render_inference_page():
                 'results': results,
                 'timestamp': datetime.now().isoformat()
             }
+            save_persistent_state()
+        
+        # Rendered outside the Run Evaluation body: any click of a nested
+        # button triggers a rerun in which the outer button is False, so a
+        # nested export button could never execute (W-H1). Gating on
+        # session_state keeps results and export available across reruns.
+        eval_data = st.session_state.get('evaluation_results') or {}
+        if eval_data.get('results'):
+            df = pd.DataFrame(eval_data['results'])
+            
+            st.markdown("### 📈 Evaluation Results")
+            st.caption(f"Model: {eval_data.get('model', 'unknown')} • Run: {eval_data.get('timestamp', 'unknown')}")
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Exact Match Accuracy", f"{eval_data.get('exact_match', 0):.1f}%")
+            with col2:
+                st.metric("Character Accuracy", f"{eval_data.get('char_accuracy', 0):.1f}%")
+            with col3:
+                st.metric("Avg Confidence", f"{eval_data.get('avg_confidence', 0):.1f}%")
             
             # Show detailed results
             with st.expander("📋 Detailed Results"):
@@ -1669,8 +1725,13 @@ def render_inference_page():
             # Export option
             if st.button("💾 Export Results to CSV"):
                 csv_path = Config.RESULTS_DIR / f"evaluation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-                df.to_csv(csv_path, index=False)
-                st.success(f"✅ Results exported to `{csv_path}`")
+                csv_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    df.to_csv(csv_path, index=False)
+                except OSError as e:
+                    st.error(f"❌ Could not write CSV: {e}")
+                else:
+                    st.success(f"✅ Results exported to `{csv_path}`")
 
 
 # =============================================================================
@@ -1710,23 +1771,25 @@ def get_training_runs() -> List[Dict]:
             time_str = ts_match.group(2)
             try:
                 run_info['timestamp'] = datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
-            except Exception:
-                pass
+            except ValueError as e:
+                # Digits matched the pattern but are not a real datetime
+                logger.debug(f"Unparseable timestamp in run dir {run_dir.name}: {e}")
         
-        # Load metrics if available
+        # Load metrics if available (best effort: a corrupt metrics file
+        # must not hide the run, but it must not vanish silently either)
         if metrics_file.exists():
             try:
                 with open(metrics_file, 'r') as f:
                     run_info['metrics'] = json.load(f)
                     run_info['has_metrics'] = True
-            except Exception:
-                pass
+            except (OSError, json.JSONDecodeError) as e:
+                logger.debug(f"Could not load metrics for {run_dir.name}: {e}")
         elif progress_file.exists():
             try:
                 with open(progress_file, 'r') as f:
                     run_info['progress'] = json.load(f)
-            except Exception:
-                pass
+            except (OSError, json.JSONDecodeError) as e:
+                logger.debug(f"Could not load progress for {run_dir.name}: {e}")
         
         runs.append(run_info)
     
@@ -1906,45 +1969,46 @@ def render_results_dashboard():
     # TAB: Compare Models
     # =========================================================================
     with tab_compare:
+        # No `return` here: returning exited the whole dashboard renderer
+        # before the Export tab could render (W-M5).
         if len(runs_with_metrics) < 2:
             st.info("Train more models to compare results.")
-            return
-        
-        compare_runs = st.multiselect("Select models to compare", 
-                                       options=[r['name'] for r in runs_with_metrics],
-                                       default=[runs_with_metrics[0]['name']])
-        
-        if compare_runs:
-            comparison = []
-            for run_name in compare_runs:
-                run = next((r for r in runs_with_metrics if r['name'] == run_name), None)
-                if run and run.get('metrics'):
-                    m = run['metrics']
-                    em = m.get('evaluation_metrics', {})
-                    il = em.get('image_level', {})
-                    cl = em.get('character_level', {})
-                    cfg = m.get('training_config', {})
-                    ds = m.get('dataset_info', {})
-                    
-                    # Device info
-                    device = cfg.get('device', 'N/A')
-                    device_name = cfg.get('device_name', '')
-                    device_str = f"{device.upper()}"
-                    if device_name:
-                        device_str = f"{device_name[:15]}"
-                    
-                    comparison.append({
-                        'Model': run_name[:25],
-                        'Device': device_str,
-                        'Train': ds.get('train_samples', 0),
-                        'Epochs': cfg.get('epochs', 0),
-                        'Img Acc%': f"{il.get('exact_match_accuracy', 0)*100:.1f}",
-                        'Char Acc%': f"{cl.get('character_accuracy', 0)*100:.1f}",
-                        'F1-μ': f"{cl.get('f1_micro', 0):.3f}",
-                        'F1-M': f"{cl.get('f1_macro', 0):.3f}",
-                    })
+        else:
+            compare_runs = st.multiselect("Select models to compare", 
+                                           options=[r['name'] for r in runs_with_metrics],
+                                           default=[runs_with_metrics[0]['name']])
             
-            st.dataframe(pd.DataFrame(comparison), hide_index=True, use_container_width=True)
+            if compare_runs:
+                comparison = []
+                for run_name in compare_runs:
+                    run = next((r for r in runs_with_metrics if r['name'] == run_name), None)
+                    if run and run.get('metrics'):
+                        m = run['metrics']
+                        em = m.get('evaluation_metrics', {})
+                        il = em.get('image_level', {})
+                        cl = em.get('character_level', {})
+                        cfg = m.get('training_config', {})
+                        ds = m.get('dataset_info', {})
+                        
+                        # Device info
+                        device = cfg.get('device', 'N/A')
+                        device_name = cfg.get('device_name', '')
+                        device_str = f"{device.upper()}"
+                        if device_name:
+                            device_str = f"{device_name[:15]}"
+                        
+                        comparison.append({
+                            'Model': run_name[:25],
+                            'Device': device_str,
+                            'Train': ds.get('train_samples', 0),
+                            'Epochs': cfg.get('epochs', 0),
+                            'Img Acc%': f"{il.get('exact_match_accuracy', 0)*100:.1f}",
+                            'Char Acc%': f"{cl.get('character_accuracy', 0)*100:.1f}",
+                            'F1-μ': f"{cl.get('f1_micro', 0):.3f}",
+                            'F1-M': f"{cl.get('f1_macro', 0):.3f}",
+                        })
+                
+                st.dataframe(pd.DataFrame(comparison), hide_index=True, use_container_width=True)
     
     # =========================================================================
     # TAB: Export
@@ -2071,8 +2135,26 @@ def render_system_health():
                 st.text("❌ Apple MPS: Not available")
         except ImportError:
             st.text("❌ PyTorch: Not installed")
-        except Exception:
-            pass
+        except OSError as e:
+            logger.debug(f"PyTorch probe failed: {e}")
+            st.text("⚠️ PyTorch: probe failed")
+        
+        # Summary the training pipeline acts on (A3: the computed GPU
+        # status must be rendered, not just computed).
+        if cuda_available:
+            gpu_info = "NVIDIA CUDA"
+            gpu_available = True
+        elif mps_available:
+            gpu_info = "Apple MPS (PyTorch only)"
+            gpu_available = False  # PaddleOCR doesn't support MPS
+        else:
+            gpu_info = "None detected"
+            gpu_available = False
+        st.metric("Training GPU", gpu_info)
+        st.caption(
+            "PaddleOCR GPU training " +
+            ("available ✅" if gpu_available else "unavailable — CPU will be used")
+        )
         
         # Show compatibility info
         st.markdown("---")
@@ -2095,12 +2177,17 @@ def render_system_health():
     models = get_available_models()
     
     if models:
-        for name, path in models.items():
+        for name, info in models.items():
             col1, col2 = st.columns([1, 3])
             with col1:
                 st.text(name)
             with col2:
-                st.caption(path)
+                # Values are {"path": ..., "type": ...} dicts; render the
+                # fields readably instead of the dict repr (W-L1).
+                if isinstance(info, dict):
+                    st.caption(f"{info.get('type', 'model')} • `{info.get('path', '')}`")
+                else:
+                    st.caption(str(info))
     else:
         st.info("No trained models found")
     
@@ -2522,7 +2609,13 @@ def render_sidebar() -> str:
         
         st.divider()
         
-        # Navigation
+        # Apply any pending programmatic navigation BEFORE the radio is
+        # instantiated — a widget key may only be written up to that point.
+        nav_target = st.session_state.pop(NAV_TARGET_KEY, None)
+        if nav_target is not None:
+            st.session_state[NAV_RADIO_KEY] = nav_target
+        
+        # Navigation. The key lets navigate_to() drive this radio (W-M6).
         page = st.radio(
             "Navigation",
             [
@@ -2532,7 +2625,8 @@ def render_sidebar() -> str:
                 "📊 Results Dashboard",
                 "🔧 System Health"
             ],
-            label_visibility="collapsed"
+            label_visibility="collapsed",
+            key=NAV_RADIO_KEY,
         )
         
         st.divider()
@@ -2560,20 +2654,20 @@ def render_sidebar() -> str:
                     gpu_count = paddle.device.cuda.device_count()
                     if gpu_count > 0:
                         cuda_available = True
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except (OSError, RuntimeError) as e:
+                    logger.debug(f"CUDA device count probe failed: {e}")
+        except (ImportError, OSError, RuntimeError) as e:
+            logger.debug(f"Paddle CUDA probe failed: {e}")
         
         # Check MPS (Apple Silicon)
         try:
             import torch
             if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 mps_available = True
-        except Exception:
-            pass
+        except (ImportError, OSError) as e:
+            logger.debug(f"MPS probe failed: {e}")
         
-        # Determine GPU status message
+        # Determine GPU status (rendered below — these were dead stores)
         if cuda_available:
             gpu_info = "NVIDIA CUDA"
             gpu_available = True
@@ -2584,17 +2678,19 @@ def render_sidebar() -> str:
             gpu_info = "None detected"
             gpu_available = False
         
-        # For PaddleOCR, only CUDA is supported
+        st.caption(f"Detected GPU: {gpu_info}")
+        
+        # For PaddleOCR, only CUDA is usable for GPU training/inference
         use_gpu = st.checkbox(
             "🚀 Use GPU (CUDA)",
             value=st.session_state.use_gpu,
             help="PaddleOCR requires NVIDIA CUDA GPU",
-            disabled=not cuda_available
+            disabled=not gpu_available
         )
         st.session_state.use_gpu = use_gpu
         
         # Show current device status
-        if cuda_available and use_gpu:
+        if gpu_available and use_gpu:
             st.success(f"✅ Using NVIDIA GPU")
         elif mps_available:
             st.warning(f"🍎 Apple M3 detected but PaddleOCR doesn't support MPS. Using CPU.")

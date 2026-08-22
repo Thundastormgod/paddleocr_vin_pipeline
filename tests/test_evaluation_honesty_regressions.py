@@ -429,7 +429,21 @@ class TestCrashesAreErrorsNotMeasurements:
         error_rows = [s for s in metrics.sample_results if s.get('status') == 'error']
         assert len(error_rows) == 1
         assert 'OCR backend crashed' in error_rows[0]['error']
-        assert 'prediction' not in error_rows[0], "an error row carries no prediction"
+        # H10: an error row carries the FULL result schema with NEUTRAL
+        # values (so _print_comparison and the CSV writers cannot KeyError
+        # mid-report), while status='error' remains the discriminator and
+        # the row stays out of every metric denominator (asserted above).
+        # This previously asserted the key was absent - which is exactly
+        # the reduced schema that crashed both consumers.
+        assert error_rows[0]['prediction'] == '', (
+            "an error row must carry a neutral empty prediction, never a value"
+        )
+        assert error_rows[0]['exact_match'] is False
+        assert error_rows[0]['chars_correct'] == 0
+        assert error_rows[0]['char_accuracy'] == 0.0
+        assert error_rows[0]['match_pattern'] == ''
+        assert error_rows[0]['confidence'] == 0.0
+        assert error_rows[0]['processing_time'] == 0.0
 
     def test_predictions_are_never_padded(self, monkeypatch):
         """The '_' padding wrote falsified predictions into the JSON."""

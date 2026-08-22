@@ -1,129 +1,164 @@
 name: CI
 
+# The pull_request trigger deliberately has NO base-branch filter: this
+# repository uses stacked PRs (branch N based on branch N-1), and the old
+# `branches: [main]` filter meant only the bottom PR of a stack ever got
+# CI. Every PR gets the full gate regardless of its base.
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
   workflow_dispatch:
-  schedule:
-    # Weekly paddle smoke: the heavy-backend job below only runs here and on
-    # manual dispatch, so PR latency is unaffected.
-    - cron: "17 4 * * 1"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   PYTHONUNBUFFERED: "1"
+  PIP_CONSTRAINT: .github/requirements-ci.txt
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Unit tests. Deliberately does NOT install paddlepaddle/paddleocr: the core
-  # package (VIN validation, charset, metrics, evaluation, postprocessing) is
-  # pure Python, and tests needing the heavy backends skip themselves.
+  # Unit + regression tests with the REAL backends. The previous paddle-less
+  # job could not even collect the suite (finetune_paddleocr's ImportError
+  # fallback leaves `nn` undefined, so test collection died with NameError) -
+  # verified empirically 2026-08-22 in a clean venv; that job design had never
+  # actually run because Actions was billing-locked from the day it landed.
+  # Installing the pinned backends makes the 61 trainer regressions and the
+  # web/pipeline happy paths run on every PR instead of never.
+  # Verified locally in a clean py3.12 venv: 448 passed, 8 skipped, ~2 min.
   # ---------------------------------------------------------------------------
   test:
     name: test (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+          cache-dependency-path: .github/requirements-ci.txt
 
-      - name: Install test dependencies
+      - name: Install pinned test dependencies
         run: |
           python -m pip install --upgrade pip
           pip install \
-            pytest pytest-cov \
-            numpy "opencv-python-headless<5" Pillow \
-            pyyaml rapidfuzz tqdm
+            numpy opencv-python-headless Pillow pyyaml rapidfuzz tqdm \
+            pytest pytest-cov coverage \
+            paddlepaddle paddleocr streamlit mlflow
 
-      - name: Run tests
-        run: pytest -v --cov=src --cov-report=term-missing --cov-report=xml
+      # Coverage floor measured at 34% in the verification run; the gate
+      # starts at 30% to absorb matrix variance and MUST only ever be
+      # raised. Raising it is the ratchet; lowering it is a regression.
+      - name: Run tests (coverage gate 30%)
+        run: pytest -q --cov=src --cov-report=term-missing --cov-report=xml --cov-fail-under=30
 
       - name: Upload coverage
         if: matrix.python-version == '3.12'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-report
           path: coverage.xml
-          if-no-files-found: ignore
+          if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Paddle training smoke (C8). The unit-test job is deliberately paddle-less,
-  # which historically made an entire failure class invisible: the paddle 3.x
-  # warpctc dtype contract crashed every real training run on its first batch
-  # and no CI job could have caught it. This job installs the real backend and
-  # proves the trainer RUNS and LEARNS on a synthetic micro-dataset (loss must
-  # fall, checkpoints must exist, resume must restore). Weekly + manual only.
+  # Lint gate - BLOCKING, scoped to the critical-correctness subset (syntax
+  # errors, undefined names, broken comparisons: E9/F63/F7/F82, configured in
+  # pyproject [tool.ruff]). This subset passes on main today except one real
+  # F821 already fixed in PR #7, which carries a documented per-file ignore
+  # until that PR merges. Style rules stay out of the gate until the tree is
+  # formatted in a dedicated no-op PR; an advisory ruff run reports them.
   # ---------------------------------------------------------------------------
-  paddle-smoke:
-    name: paddle training smoke
+  lint:
+    name: lint (ruff critical)
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    timeout-minutes: 30
-
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: .github/requirements-ci.txt
 
-      - name: Install training backend
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: ruff critical subset (blocking)
+        run: ruff check src/ tests/
+
+      - name: ruff full report (advisory)
+        continue-on-error: true
+        run: ruff check src/ tests/ --select ALL --statistics
+
+  # ---------------------------------------------------------------------------
+  # Type gate - mypy behind a committed baseline ratchet (mypy-baseline).
+  # main carries 213 known errors, frozen in .github/mypy-baseline.txt; this
+  # job fails only on NEW errors. After the open PR stack (#1-#11) merges,
+  # refresh once with `mypy src/ | mypy-baseline sync` and add this job to
+  # the required checks (documented in the gate PR).
+  # ---------------------------------------------------------------------------
+  typecheck:
+    name: typecheck (mypy ratchet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/requirements-ci.txt
+
+      - name: Install type-check dependencies
         run: |
           python -m pip install --upgrade pip
           pip install \
-            paddlepaddle==3.3.1 \
-            numpy "opencv-python-headless<5" Pillow \
-            pyyaml rapidfuzz tqdm "mlflow>=3.1"
+            mypy mypy-baseline \
+            numpy opencv-python-headless Pillow pyyaml rapidfuzz tqdm \
+            paddlepaddle paddleocr streamlit mlflow
 
-      - name: Run training smoke test
-        run: python scripts/train_smoke_test.py
+      - name: mypy against committed baseline
+        run: mypy src/ | mypy-baseline filter --baseline-path .github/mypy-baseline.txt
 
   # ---------------------------------------------------------------------------
-  # Static checks. Non-blocking for now: the existing codebase is not yet
-  # black/isort clean, so failing the build on style would block every PR.
-  # Remove continue-on-error once `make format` has been run across the tree.
+  # Dependency vulnerability audit of the exact pins CI installs.
   # ---------------------------------------------------------------------------
-  lint:
-    name: lint (advisory)
+  pip-audit:
+    name: pip-audit (pinned deps)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: .github/requirements-ci.txt
 
-      - name: Install linters
-        run: pip install black isort flake8
+      - name: Install pip-audit
+        run: pip install pip-audit
 
-      - name: black --check
-        continue-on-error: true
-        run: black --check src/ tests/
-
-      - name: isort --check-only
-        continue-on-error: true
-        run: isort --check-only src/ tests/
-
-      - name: flake8
-        continue-on-error: true
-        run: flake8 src/ tests/ --count --max-line-length=100 --statistics
+      # --no-deps audits exactly the committed pins (verified clean
+      # 2026-08-22). The transitive closure is not pinned in this file;
+      # it is covered by Dependabot alerts and the docker/trivy job.
+      - name: Audit CI pins
+        run: pip-audit -r .github/requirements-ci.txt --disable-pip --no-deps
 
   # ---------------------------------------------------------------------------
   # Guard against re-committing the credentials that previously leaked
@@ -132,8 +167,9 @@ jobs:
   secrets-scan:
     name: secrets scan
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Fail if credential files are tracked
         run: |
@@ -169,17 +205,20 @@ jobs:
   build:
     name: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: .github/requirements-ci.txt
 
       - name: Build distribution
         run: |
-          python -m pip install --upgrade pip build
+          python -m pip install --upgrade pip
+          pip install build
           python -m build
 
       - name: Verify declared console scripts resolve to real modules

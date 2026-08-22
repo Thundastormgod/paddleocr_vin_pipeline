@@ -134,6 +134,29 @@ profile = "black"
 line_length = 100
 skip = ["venv", ".venv", "PaddleOCR"]
 
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["PaddleOCR", ".venv", "venv"]
+
+[tool.ruff.lint]
+# CI GATE (blocking): the critical-correctness subset only - syntax
+# errors (E9), invalid prints/comparisons (F63), forward-annotation and
+# statement errors (F7xx), undefined names (F82x). Measured 2026-08-22:
+# this subset is clean on the working tree and finds exactly one real
+# bug on main (see per-file ignore below). Style/modernization rules are
+# reported advisorily in CI and enter the gate only after a dedicated
+# format-the-tree PR.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.ruff.lint.per-file-ignores]
+# F821: `_select_device(...) -> 'torch.device'` references torch, which
+# is not imported at module scope. The fix (annotation -> Any) is
+# already queued in PR #7 (refactor/providers-pipeline, audit item A1).
+# REMOVE this ignore when the stack merges - the gate then enforces
+# F821 here too.
+"src/vin_ocr/providers/ocr_providers.py" = ["F821"]
+
 [tool.mypy]
 python_version = "3.10"
 warn_return_any = true

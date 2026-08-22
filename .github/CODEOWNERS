@@ -1,0 +1,4 @@
+# Default owner for everything in the repository. Review-by-codeowner
+# becomes enforceable once required reviews are enabled in branch
+# protection (phase 2 - see the enterprise-gate PR description).
+* @Thundastormgod

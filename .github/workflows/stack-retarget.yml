@@ -1,0 +1,39 @@
+name: stack retarget
+
+# Stacked-PR maintenance: user-owned repos have no merge queue, so when
+# a stack PR merges, every open PR based on the merged HEAD branch is
+# retargeted to the merged PR's BASE. This keeps the chain intact as it
+# merges bottom-up (e.g. merging #2 fix/dagshub-streaming -> #3
+# refactor/core-vin-utils is retargeted from fix/dagshub-streaming to
+# #2's base).
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  retarget:
+    name: retarget children of merged branch
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Retarget open PRs based on the merged head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          MERGED_HEAD: ${{ github.event.pull_request.head.ref }}
+          NEW_BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          children=$(gh api "repos/${REPO}/pulls?state=open&base=${MERGED_HEAD}" --jq '.[].number')
+          if [ -z "$children" ]; then
+            echo "No open PRs are based on ${MERGED_HEAD}; nothing to retarget."
+            exit 0
+          fi
+          for pr in $children; do
+            echo "Retargeting #${pr}: base ${MERGED_HEAD} -> ${NEW_BASE}"
+            gh api -X PATCH "repos/${REPO}/pulls/${pr}" -f base="${NEW_BASE}"
+          done

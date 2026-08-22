@@ -1,0 +1,82 @@
+name: e2e
+
+# Live-browser tests of the Streamlit UI (tests/test_ui_playwright.py,
+# e2e-marked and excluded from the unit suite). Runs on web changes,
+# weekly, and on demand. Not in the required-check set until it has a
+# green history - promote it once it proves stable.
+on:
+  pull_request:
+    paths:
+      - "src/vin_ocr/web/**"
+      - "tests/test_ui_playwright.py"
+      - ".github/workflows/e2e.yml"
+      - ".github/requirements-ci.txt"
+  schedule:
+    - cron: "50 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_CONSTRAINT: .github/requirements-ci.txt
+
+jobs:
+  e2e:
+    name: playwright vs live streamlit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/requirements-ci.txt
+
+      - name: Install app + test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            numpy opencv-python-headless Pillow pyyaml rapidfuzz tqdm \
+            pytest paddlepaddle paddleocr streamlit mlflow playwright
+
+      - name: Install chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Launch Streamlit
+        run: |
+          nohup streamlit run src/vin_ocr/web/app.py \
+            --server.headless true --server.port 8501 \
+            > streamlit.log 2>&1 &
+          echo $! > streamlit.pid
+
+      - name: Wait for server
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8501/_stcore/health > /dev/null; then
+              echo "Streamlit up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Streamlit did not become healthy within 60s"
+          cat streamlit.log
+          exit 1
+
+      - name: Run e2e tests
+        run: pytest -m e2e tests/test_ui_playwright.py -v
+
+      - name: Server log on failure
+        if: failure()
+        run: cat streamlit.log
+
+      - name: Stop Streamlit
+        if: always()
+        run: kill "$(cat streamlit.pid)" 2>/dev/null || true

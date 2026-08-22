@@ -1,0 +1,76 @@
+name: model promote
+
+# Manual promotion of a trained checkpoint into the MLflow registry.
+# Registration evaluates the checkpoint on the val split and attaches
+# the metrics to the version (src.vin_ocr.tracking.model_registry).
+on:
+  workflow_dispatch:
+    inputs:
+      checkpoint:
+        description: "Checkpoint path in the repo/DVC workspace (e.g. output/vin_rec_finetune_stage3/best_val_loss)"
+        required: true
+      stage_label:
+        description: "Free-form stage tag recorded on the version"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_CONSTRAINT: .github/requirements-ci.txt
+
+jobs:
+  promote:
+    name: register checkpoint version
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/requirements-ci.txt
+
+      - name: Require promotion secrets
+        env:
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+          DAGSHUB_TOKEN: ${{ secrets.DAGSHUB_TOKEN }}
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: |
+          missing=""
+          [ -z "$DAGSHUB_USERNAME" ] && missing="$missing DAGSHUB_USERNAME"
+          [ -z "$DAGSHUB_TOKEN" ] && missing="$missing DAGSHUB_TOKEN"
+          [ -z "$MLFLOW_TRACKING_URI" ] && missing="$missing MLFLOW_TRACKING_URI"
+          if [ -n "$missing" ]; then
+            echo "::error::promotion unconfigured; missing repo secrets:$missing. Set them with 'gh secret set <NAME>'."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            numpy opencv-python-headless Pillow pyyaml rapidfuzz tqdm \
+            paddlepaddle mlflow "dvc[s3]"
+
+      - name: Pull dataset and checkpoints via DVC
+        env:
+          DAGSHUB_TOKEN: ${{ secrets.DAGSHUB_TOKEN }}
+        run: |
+          dvc remote modify origin --local access_key_id "$DAGSHUB_TOKEN"
+          dvc remote modify origin --local secret_access_key "$DAGSHUB_TOKEN"
+          dvc pull -r origin
+
+      - name: Register version (evaluates on val split)
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+          MLFLOW_TRACKING_PASSWORD: ${{ secrets.DAGSHUB_TOKEN }}
+        run: |
+          python scripts/promote_model.py \
+            --checkpoint "${{ github.event.inputs.checkpoint }}" \
+            --stage-label "${{ github.event.inputs.stage_label }}"

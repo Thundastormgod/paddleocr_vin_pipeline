@@ -1,0 +1,31 @@
+# Exact pins for every CI job. Referenced with `pip install -c` (as a
+# constraints file) so each job installs only its subset at these
+# versions. Named requirements-ci.txt (not constraints-*.txt) so
+# Dependabot's pip ecosystem recognizes it and proposes weekly bumps.
+#
+# Locked 2026-08-22 against the py3.10-3.12 matrix. Install of the
+# test-job subset plus the full suite (448 passed, 34% coverage) was
+# verified in a clean py3.12 venv before these pins were committed.
+# numpy is held at the 2.2 line: it is the newest series that still
+# supports Python 3.10.
+numpy==2.2.6
+opencv-python-headless==4.14.0.94
+Pillow==12.3.0
+PyYAML==6.0.3
+rapidfuzz==3.14.5
+tqdm==4.70.0
+pytest==9.1.1
+pytest-cov==7.1.0
+coverage==7.15.4
+ruff==0.16.3
+mypy==2.3.1
+mypy-baseline==0.7.4
+pip-audit==2.10.1
+build==1.5.0
+mlflow==3.15.1
+paddlepaddle==3.3.1
+paddleocr==3.7.0
+paddlex==3.7.2
+streamlit==1.62.0
+playwright==1.62.0
+dvc==3.67.1

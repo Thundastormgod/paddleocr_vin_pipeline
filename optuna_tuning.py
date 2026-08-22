@@ -47,7 +47,11 @@ logger = logging.getLogger(__name__)
 #: any working directory.
 REPO_ROOT = Path(__file__).resolve().parent
 
-#: Where finetune_paddleocr writes the metrics each trial is scored from.
+#: Backward-compatible DEFAULT metrics location, used only when
+#: run_training_trial is called without an explicit per-trial path.
+#: The tuner itself derives the real location from the --base-config's
+#: Global.save_model_dir (see _resolve_base_save_model_dir) and gives every
+#: trial its own save_model_dir/trial_<n>/training_metrics.json.
 #: Absolute, because the trial subprocess runs with cwd=REPO_ROOT while the
 #: tuner may have been launched from anywhere. A relative path here read a
 #: file in the tuner's CWD that the subprocess never wrote.
@@ -67,10 +71,56 @@ class VINOCRHyperparameterTuner:
         self.study_name: str = "vin_ocr_optimization"
         self.experiment_name: str = "vin_ocr_optimization"
         self.dataset_roots: tuple = ()
-        
+        # Where trial outputs live: derived from the base config's
+        # Global.save_model_dir, NOT hardcoded (L35). Each trial then gets its
+        # own trial_<n> subdirectory so checkpoints survive the study (L36).
+        self.base_save_model_dir: Path = self._resolve_base_save_model_dir()
+        logger.info(
+            f"Trial output root: {self.base_save_model_dir} "
+            f"(per trial: trial_<n>/training_metrics.json)"
+        )
+
+    def _resolve_config_path(self) -> Path:
+        """Resolve the base config path against the repo root when relative."""
+        cfg_path = Path(self.base_config_path)
+        if not cfg_path.is_absolute():
+            cfg_path = REPO_ROOT / cfg_path
+        return cfg_path
+
+    def _resolve_base_save_model_dir(self) -> Path:
+        """
+        Derive the trial output root from the base config (L35).
+
+        Reads Global.save_model_dir from --base-config; falls back to the
+        historical default (the parent of TRIAL_METRICS_PATH) when the config
+        cannot be read or lacks the key, logging the resolved path either way.
+        """
+        default = TRIAL_METRICS_PATH.parent
+        cfg_path = self._resolve_config_path()
+        try:
+            with open(cfg_path, 'r') as f:
+                cfg = yaml.safe_load(f)
+            save_dir = cfg['Global']['save_model_dir']
+        except (OSError, yaml.YAMLError, KeyError, TypeError) as exc:
+            logger.warning(
+                f"Could not read Global.save_model_dir from {cfg_path} "
+                f"({type(exc).__name__}: {exc}); falling back to {default}"
+            )
+            return default
+        save_path = Path(str(save_dir))
+        if not save_path.is_absolute():
+            # Trial subprocesses run with cwd=REPO_ROOT, so a relative
+            # save_model_dir resolves against the repo root.
+            save_path = (REPO_ROOT / save_path).resolve()
+        return save_path
+
+    def trial_metrics_path(self, trial_number: int) -> Path:
+        """Metrics file for one trial, inside that trial's own output dir."""
+        return self.base_save_model_dir / f"trial_{trial_number}" / "training_metrics.json"
+
     def load_base_config(self) -> Dict[str, Any]:
         """Load the base configuration file."""
-        with open(self.base_config_path, 'r') as f:
+        with open(self._resolve_config_path(), 'r') as f:
             return yaml.safe_load(f)
     
     def create_trial_config(self, trial: optuna.Trial) -> Dict[str, Any]:
@@ -131,6 +181,13 @@ class VINOCRHyperparameterTuner:
             'min_delta', 0.0001, 0.01, log=True
         )
         
+        # Per-trial output directory (L36): with a shared save_model_dir every
+        # trial overwrote the previous trial's checkpoints, so the best
+        # trial's weights were unrecoverable at the end of the study.
+        config['Global']['save_model_dir'] = str(
+            self.base_save_model_dir / f"trial_{trial.number}"
+        )
+        
         return config
     
     def save_trial_config(self, config: Dict[str, Any], trial_number: int):
@@ -140,12 +197,18 @@ class VINOCRHyperparameterTuner:
             yaml.dump(config, f, default_flow_style=False)
         return trial_config_path
     
-    def run_training_trial(self, config_path: str) -> Dict[str, Any]:
+    def run_training_trial(
+        self, config_path: str, metrics_path: Optional[Path] = None
+    ) -> Dict[str, Any]:
         """
         Run a single training trial and return its measured metrics.
 
         Args:
             config_path: Trial configuration to train with.
+            metrics_path: Where THIS trial's training_metrics.json will be
+                written (the trial config's save_model_dir). Defaults to the
+                module-level TRIAL_METRICS_PATH for backward compatibility
+                with callers that share one output directory.
 
         Returns:
             Dict of measured metrics plus the wall-clock training time.
@@ -170,6 +233,9 @@ class VINOCRHyperparameterTuner:
             removed before launching, a non-zero exit is fatal, and the file's
             modification time must post-date the launch.
         """
+        if metrics_path is None:
+            metrics_path = TRIAL_METRICS_PATH
+
         # sys.executable (not bare "python") so the trial runs in the same
         # interpreter/venv as the tuner.
         cmd = [
@@ -178,7 +244,7 @@ class VINOCRHyperparameterTuner:
         ]
 
         # Guard 1: no output from a previous trial can be mistaken for this one.
-        TRIAL_METRICS_PATH.unlink(missing_ok=True)
+        metrics_path.unlink(missing_ok=True)
 
         start_time = time.time()
         try:
@@ -204,26 +270,26 @@ class VINOCRHyperparameterTuner:
                 f"training exited {result.returncode}:\n{tail or '<no output>'}"
             )
 
-        if not TRIAL_METRICS_PATH.is_file():
+        if not metrics_path.is_file():
             raise TrialExecutionError(
-                f"training exited 0 but wrote no metrics to {TRIAL_METRICS_PATH}"
+                f"training exited 0 but wrote no metrics to {metrics_path}"
             )
 
         # Guard 3: the file must have been written by THIS run.
-        if TRIAL_METRICS_PATH.stat().st_mtime < start_time:
+        if metrics_path.stat().st_mtime < start_time:
             raise TrialExecutionError(
-                f"{TRIAL_METRICS_PATH} predates this trial; it is a stale "
+                f"{metrics_path} predates this trial; it is a stale "
                 f"artifact of an earlier run and must not be scored"
             )
 
         try:
-            metrics = json.loads(TRIAL_METRICS_PATH.read_text(encoding="utf-8"))
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
             image_level = metrics['evaluation_metrics']['image_level']
             char_level = metrics['evaluation_metrics']['character_level']
             training_results = metrics['training_results']
         except (json.JSONDecodeError, KeyError, OSError) as exc:
             raise TrialExecutionError(
-                f"could not read metrics from {TRIAL_METRICS_PATH}: {exc}"
+                f"could not read metrics from {metrics_path}: {exc}"
             ) from exc
 
         return {
@@ -277,7 +343,10 @@ class VINOCRHyperparameterTuner:
         ) as run:
             run.log_artifact(config_path, "trial_config")
 
-            results = self.run_training_trial(str(config_path))
+            results = self.run_training_trial(
+                str(config_path),
+                metrics_path=self.trial_metrics_path(trial_number),
+            )
             accuracy = results['exact_match_accuracy']
 
             run.log_metrics({
@@ -370,7 +439,18 @@ class VINOCRHyperparameterTuner:
             logger.info(f"Resuming: {len(completed)} completed trial(s) already recorded")
 
         def print_callback(study, trial):
-            if trial.number % 5 == 0 and study.best_trial is not None:
+            # M25: study.best_trial RAISES ValueError while no trial has
+            # COMPLETED (`is not None` cannot guard that), and callbacks are
+            # not covered by optimize(catch=...) - an exception here would
+            # abort the whole study after a failed early trial. Guard on the
+            # completed-trial count instead so failed trials are recorded
+            # and skipped, never fatal.
+            if trial.number % 5 != 0:
+                return
+            has_complete = any(
+                t.state == optuna.trial.TrialState.COMPLETE for t in study.trials
+            )
+            if has_complete:
                 logger.info(f"Trial {trial.number}: Best accuracy = {study.best_value:.4f}")
 
         # catch=(TrialExecutionError,) records a failed trial as FAILED rather
@@ -402,6 +482,10 @@ class VINOCRHyperparameterTuner:
             )
             return study
 
+        # L36: each trial trains into its own directory, so the best trial's
+        # checkpoints are still on disk when the study ends.
+        best_trial_dir = self.base_save_model_dir / f"trial_{study.best_trial.number}"
+
         best_results = {
             'study_name': study_name,
             'n_trials_total': len(study.trials),
@@ -410,6 +494,7 @@ class VINOCRHyperparameterTuner:
             'best_trial': study.best_trial.number,
             'best_accuracy': study.best_value,
             'best_params': study.best_params,
+            'best_trial_dir': str(best_trial_dir),
             'all_trials': [
                 {
                     'trial_number': trial.number,
@@ -429,6 +514,7 @@ class VINOCRHyperparameterTuner:
         logger.info(f"Trials measured: {len(measured)} (failed: {failed})")
         logger.info(f"Best accuracy: {study.best_value:.4f}")
         logger.info(f"Best trial: {study.best_trial.number}")
+        logger.info(f"Best trial checkpoints: {best_trial_dir}")
         logger.info("Best parameters:")
         for param, value in study.best_params.items():
             logger.info(f"  {param}: {value}")

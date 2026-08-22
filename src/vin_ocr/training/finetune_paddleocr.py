@@ -152,7 +152,7 @@ try:
     from ppocr.utils.utility import set_seed
     from ppocr.utils.logging import get_logger
     PPOCR_TRAIN_AVAILABLE = True
-except ImportError as e:
+except ImportError:
     # This is NOT an error - our custom training implementation works without ppocr
     # ppocr is only needed for using official PaddleOCR configs/architectures
     pass
@@ -292,6 +292,14 @@ def merge_config(base_config: Dict, override: Dict) -> Dict:
 # CUSTOM VIN DATASET
 # =============================================================================
 
+#: Documented VIN character policy (ISO 3779 excludes I, O, Q): map them to
+#: their look-alike digits. Applied to labels BEFORE encoding so an excluded
+#: character can never fall through to index 0 - the CTC blank (invalid
+#: inside targets) and the CrossEntropy ignore_index (silently unsupervised
+#: position).
+IOQ_CHAR_MAP = {'I': '1', 'O': '0', 'Q': '0'}
+
+
 class VINRecognitionDataset(Dataset):
     """
     Dataset for VIN recognition training.
@@ -340,6 +348,14 @@ class VINRecognitionDataset(Dataset):
         Supports both absolute and relative paths. If the path in the label file
         is absolute (starts with /), it's used directly. Otherwise, it's joined
         with data_dir.
+
+        Labels are normalised through the documented I->1 / O->0 / Q->0 policy;
+        a sample whose normalised label still contains characters outside the
+        dictionary is REJECTED here - encoding such a character used to fall
+        through to index 0, the CTC blank / CE ignore_index, silently
+        corrupting the targets (M13). Every dropped sample is counted and
+        LOGGED: silently shrinking a dataset (especially the validation set)
+        corrupts checkpoint selection and early stopping (H4).
         """
         # Resolve label file path
         label_path = Path(label_file)
@@ -355,6 +371,9 @@ class VINRecognitionDataset(Dataset):
             raise FileNotFoundError(f"Label file not found: {label_file} (tried: {label_path})")
         
         samples = []
+        dropped_malformed = 0
+        dropped_bad_label: List[str] = []
+        dropped_missing: List[str] = []
         with open(label_path, 'r') as f:
             for line in f:
                 line = line.strip()
@@ -367,25 +386,71 @@ class VINRecognitionDataset(Dataset):
                     # Split on any whitespace (handles multiple spaces)
                     parts = line.split(None, 1)
                 
-                if len(parts) >= 2:
-                    img_path = parts[0].strip()
-                    label = parts[1].strip()
-                    # Support both absolute and relative paths
-                    if os.path.isabs(img_path):
-                        full_path = Path(img_path)
-                    else:
-                        full_path = self.data_dir / img_path
-                    if full_path.exists():
-                        samples.append((str(full_path), label))
+                if len(parts) < 2:
+                    dropped_malformed += 1
+                    continue
+                img_path = parts[0].strip()
+                label = parts[1].strip()
+                normalized = ''.join(IOQ_CHAR_MAP.get(c, c) for c in label)
+                unknown = sorted({c for c in normalized if c not in self.char_dict})
+                if unknown:
+                    dropped_bad_label.append(
+                        f"{img_path} (label={label!r}, unknown chars={unknown})"
+                    )
+                    continue
+                # Support both absolute and relative paths
+                if os.path.isabs(img_path):
+                    full_path = Path(img_path)
+                else:
+                    full_path = self.data_dir / img_path
+                if full_path.exists():
+                    samples.append((str(full_path), normalized))
+                else:
+                    dropped_missing.append(str(full_path))
+        if dropped_malformed:
+            logger.warning(
+                f"{label_file}: dropped {dropped_malformed} malformed line(s) "
+                f"(no <path> <label> pair)"
+            )
+        if dropped_bad_label:
+            logger.warning(
+                f"{label_file}: rejected {len(dropped_bad_label)} sample(s) "
+                f"whose label has characters outside the dictionary (they "
+                f"would encode to the CTC blank / CE ignore_index). First "
+                f"{min(5, len(dropped_bad_label))}: {dropped_bad_label[:5]}"
+            )
+        if dropped_missing:
+            logger.warning(
+                f"{label_file}: dropped {len(dropped_missing)} sample(s) "
+                f"whose image file is missing. First "
+                f"{min(5, len(dropped_missing))}: {dropped_missing[:5]}"
+            )
         return samples
     
     def _encode_label(self, label: str) -> np.ndarray:
-        """Encode text label to indices for CrossEntropyLoss."""
-        # For CrossEntropyLoss, we need fixed-length padded sequences
+        """
+        Encode a text label to indices for the CTC/CrossEntropy targets.
+
+        I/O/Q map through IOQ_CHAR_MAP; any OTHER unknown character raises.
+        The previous behaviour left index 0 inside the target for unknown
+        characters - 0 is the CTC blank (invalid inside warpctc targets) and
+        the CE ignore_index (a silently unsupervised position). Samples are
+        pre-filtered by _load_samples, so a raise here means this was called
+        with a label that never went through loading.
+        """
+        # Fixed-length zero-padded sequence; positions BEYOND label_length are
+        # padding and are excluded from the loss via the length tensor.
         encoded = np.zeros(self.max_text_length, dtype=np.int64)
         for i, char in enumerate(label[:self.max_text_length]):
-            if char in self.char_dict:
-                encoded[i] = self.char_dict[char]
+            mapped = IOQ_CHAR_MAP.get(char, char)
+            index = self.char_dict.get(mapped)
+            if index is None or index == 0:
+                raise ValueError(
+                    f"Label {label!r} contains {char!r} which is not encodable "
+                    f"with the loaded dictionary; emitting index 0 (CTC blank "
+                    f"/ CE ignore_index) into targets is forbidden."
+                )
+            encoded[i] = index
         return encoded
     
     def _preprocess_image(self, image: np.ndarray) -> Tuple[np.ndarray, int]:
@@ -547,6 +612,12 @@ class VINRecognitionDataset(Dataset):
         # real target ends; using len(encoded_label) would always report the
         # padded width (max_text_length) and corrupt the loss for short labels.
         label_length = min(len(label), self.max_text_length)
+        # CTC feasibility bound: every adjacent pair of EQUAL target classes
+        # needs a mandatory blank between their emissions, so the alignment
+        # lattice requires label_length + adjacent_repeats timesteps, not
+        # just label_length (L25). Counted on the encoded (truncated) target.
+        target = encoded_label[:label_length]
+        adjacent_repeats = int(np.sum(target[1:] == target[:-1])) if label_length > 1 else 0
 
         return {
             'image': image,
@@ -557,6 +628,9 @@ class VINRecognitionDataset(Dataset):
             # CTC input lengths so the loss never demands emissions over the
             # black padding.
             'valid_width': np.array([valid_width], dtype=np.int64),
+            # Adjacent equal-class pairs in the target; raises the per-sample
+            # CTC input-length floor to label_length + repeats.
+            'adjacent_repeats': np.array([adjacent_repeats], dtype=np.int64),
         }
 
 
@@ -748,7 +822,12 @@ class SVTREncoder(nn.Layer):
         self.out_channels = hidden_dim
     
     def forward(self, x: paddle.Tensor) -> paddle.Tensor:
-        assert x.ndim == 4, f"SVTREncoder expects [B, C, H, W], got rank {x.ndim}"
+        # Explicit raise, not assert: this shape contract must survive
+        # `python -O` (asserts are stripped there).
+        if x.ndim != 4:
+            raise ValueError(
+                f"SVTREncoder expects [B, C, H, W], got rank {x.ndim}"
+            )
         # Pool height dimension: [B, C, H, W] -> [B, C, 1, W]
         x = self.pool(x)
         # Reshape: [B, C, 1, W] -> [B, W, C]
@@ -759,7 +838,10 @@ class SVTREncoder(nn.Layer):
         
         # Add positional encoding
         T = x.shape[1]
-        assert T <= 200, f"sequence length {T} exceeds positional table (200)"
+        if T > 200:
+            raise ValueError(
+                f"sequence length {T} exceeds positional table (200)"
+            )
         positions = paddle.arange(T).unsqueeze(0).expand([x.shape[0], -1])
         x = x + self.pos_embed(positions)
         
@@ -781,6 +863,7 @@ def ctc_input_lengths(
     total_timesteps: int,
     image_width: int,
     label_lengths: List[int],
+    adjacent_repeats: Optional[List[int]] = None,
 ) -> List[int]:
     """
     Per-sample CTC input lengths from content widths. Pure and unit-testable.
@@ -796,22 +879,46 @@ def ctc_input_lengths(
         valid_widths: Content width in pixels per sample (before padding).
         total_timesteps: T of the logits tensor.
         image_width: The padded model input width (e.g. 320).
-        label_lengths: True target lengths per sample; CTC requires
-            input_length >= label_length, so lengths are clamped up to it.
+        label_lengths: True target lengths per sample.
+        adjacent_repeats: Count of adjacent EQUAL target classes per sample.
+            CTC inserts a mandatory blank between repeated emissions, so a
+            feasible alignment needs label_length + adjacent_repeats
+            timesteps; clamping only to label_length (the old bound) left a
+            rare infeasible lattice whose loss is inf (L25). None means 0
+            repeats per sample.
 
     Returns:
-        One input length per sample, each in [label_length, total_timesteps].
+        One input length per sample, each in
+        [label_length + adjacent_repeats, total_timesteps].
+
+    Raises:
+        ValueError: On non-positive geometry, mismatched batch lists, or a
+            sample whose required length exceeds total_timesteps - clamping
+            such a sample cannot make its alignment feasible, and letting it
+            through produces an inf loss that kills the run.
     """
     if total_timesteps <= 0 or image_width <= 0:
         raise ValueError(
             f"total_timesteps={total_timesteps} and image_width={image_width} "
             f"must be positive"
         )
+    if adjacent_repeats is None:
+        adjacent_repeats = [0] * len(label_lengths)
     stride = image_width / total_timesteps
     lengths = []
-    for width, label_len in zip(valid_widths, label_lengths, strict=True):
+    for i, (width, label_len, repeats) in enumerate(
+        zip(valid_widths, label_lengths, adjacent_repeats, strict=True)
+    ):
+        required = int(label_len) + int(repeats)
+        if required > total_timesteps:
+            raise ValueError(
+                f"CTC-infeasible sample at batch index {i}: the label needs "
+                f"{required} timesteps ({label_len} chars + {repeats} "
+                f"adjacent repeat(s)) but the model emits only "
+                f"{total_timesteps}; its loss would be inf."
+            )
         timesteps = math.ceil(min(int(width), image_width) / stride)
-        lengths.append(max(min(timesteps, total_timesteps), int(label_len)))
+        lengths.append(max(min(timesteps, total_timesteps), required))
     return lengths
 
 
@@ -1339,7 +1446,10 @@ class RosettaRecognitionModel(nn.Layer):
 
     def __init__(self, config: Dict, num_classes: int):
         super().__init__()
-        assert num_classes >= 2, f"CTC needs blank + alphabet, got {num_classes}"
+        # Explicit raises, not asserts: these CTC-feasibility contracts must
+        # survive `python -O` (asserts are stripped there).
+        if num_classes < 2:
+            raise ValueError(f"CTC needs blank + alphabet, got {num_classes}")
         self.num_classes = num_classes
         self.backbone = ResNet34vdBackbone(in_channels=3)
         self.pool = nn.AdaptiveAvgPool2D((1, None))
@@ -1348,7 +1458,8 @@ class RosettaRecognitionModel(nn.Layer):
         self.head = nn.Linear(self.backbone.out_channels, num_classes)
 
     def forward(self, x: paddle.Tensor) -> paddle.Tensor:
-        assert x.ndim == 4, f"expected [B, C, H, W], got rank {x.ndim}"
+        if x.ndim != 4:
+            raise ValueError(f"expected [B, C, H, W], got rank {x.ndim}")
         features = self.backbone(x)             # [B, 512, H', W']
         features = self.pool(features)          # [B, 512, 1, W']
         features = features.squeeze(2)          # [B, 512, W']
@@ -1393,6 +1504,12 @@ class VINFineTuner:
         self.best_val_loss = float('inf')
         self.best_val_char_accuracy = 0.0
         self.epochs_without_improvement = 0
+        #: Best-accuracy checkpoint written by THIS run (None until the first
+        #: improvement). Export must only ever load a checkpoint this run
+        #: produced: a stale best_accuracy.pdparams left by a previous run in
+        #: the same directory used to be silently exported and its weights
+        #: loaded into self.model before final metrics (M18).
+        self._best_checkpoint_path: Optional[Path] = None
         #: True when a SIGTERM/SIGINT ended the run early; the tracked-run
         #: wrapper tags the MLflow run so an interrupted run can never be
         #: mistaken for a completed one (C7).
@@ -1677,7 +1794,15 @@ class VINFineTuner:
             logger.info(f"LR scheduler: PiecewiseDecay(boundaries={boundaries})")
 
         elif sched_key in ('const', 'constant', 'fixed'):
-            lr_scheduler = optim.lr.LRScheduler(learning_rate=base_lr)
+            # A REAL constant schedule. paddle's LRScheduler base class is
+            # abstract: its __init__ calls step() -> get_lr(), which raises
+            # NotImplementedError, so the previous
+            # `optim.lr.LRScheduler(learning_rate=base_lr)` could never even
+            # construct (M14). LambdaDecay with a constant multiplier keeps
+            # the scheduler interface train_epoch()'s .step() relies on.
+            lr_scheduler = optim.lr.LambdaDecay(
+                learning_rate=base_lr, lr_lambda=lambda epoch: 1.0
+            )
             logger.info(f"LR scheduler: constant({base_lr})")
 
         else:
@@ -1709,26 +1834,31 @@ class VINFineTuner:
         beta2 = float(opt_config.get('beta2', 0.999))
         params = self.model.parameters()
 
-        # Weight decay applies to weight MATRICES only: decaying BatchNorm
-        # scale/shift and biases regularises parameters whose purpose is to
-        # re-centre activations. Paddle's parameter-level regularizer
-        # overrides the optimizer-level weight_decay, and unlike
-        # apply_decay_param_fun (AdamW-only) it works for every optimizer
-        # here. Structured names: biases end '.b_0'; norm layers carry
-        # 'norm'/'bn'/BatchNorm buffer markers.
-        excluded = 0
-        for name, param in self.model.named_parameters():
-            lowered = name.lower()
-            if (
-                name.endswith('.b_0')
-                or 'bn' in lowered
-                or 'norm' in lowered
-                or '_mean' in lowered
-                or '_variance' in lowered
-            ):
-                param.regularizer = paddle.regularizer.L2Decay(0.0)
-                excluded += 1
-        logger.info(f"Weight decay excluded from {excluded} norm/bias parameters")
+        # Weight decay applies to weight MATRICES only: decaying BatchNorm/
+        # LayerNorm scale/shift and biases regularises parameters whose
+        # purpose is to re-centre activations. Exclusion is type-based (norm
+        # layers) plus attribute-based (biases) - the old suffix heuristic
+        # tested structured names for '.b_0', which is the INTERNAL name
+        # convention, so it never matched anything. Two mechanisms are
+        # needed (L24):
+        #   - Adam/Momentum decay THROUGH the regularizer, so excluded
+        #     params get an explicit zero L2Decay (a parameter-level
+        #     regularizer overrides the optimizer-level weight_decay).
+        #   - AdamW's DECOUPLED decay ignores regularizers entirely; the
+        #     only hook it honours is apply_decay_param_fun(param.name).
+        norm_types = (nn.BatchNorm1D, nn.BatchNorm2D, nn.BatchNorm3D, nn.LayerNorm)
+        excluded_param_names = set()
+        for sublayer in self.model.sublayers(include_self=True):
+            is_norm = isinstance(sublayer, norm_types)
+            for attr_name, param in sublayer.named_parameters(include_sublayers=False):
+                if is_norm or attr_name == 'bias':
+                    excluded_param_names.add(param.name)
+                    param.regularizer = paddle.regularizer.L2Decay(0.0)
+        logger.info(
+            f"Weight decay excluded from {len(excluded_param_names)} norm/bias "
+            f"parameters (zero-L2 regularizer for Adam/Momentum; "
+            f"apply_decay_param_fun for AdamW)"
+        )
 
         if opt_key == 'adam':
             optimizer = optim.Adam(
@@ -1739,6 +1869,9 @@ class VINFineTuner:
             optimizer = optim.AdamW(
                 parameters=params, learning_rate=lr_scheduler,
                 beta1=beta1, beta2=beta2, weight_decay=weight_decay,
+                # Decoupled decay honours ONLY this hook; the per-parameter
+                # regularizer set above is invisible to it. True = decayed.
+                apply_decay_param_fun=lambda pname: pname not in excluded_param_names,
             )
         elif opt_key in ('momentum', 'sgd'):
             optimizer = optim.Momentum(
@@ -1760,18 +1893,29 @@ class VINFineTuner:
         train_config = self.config['Train']
         val_config = self.config['Eval']
         
-        data_dir = train_config['dataset']['data_dir']
+        train_data_dir = train_config['dataset']['data_dir']
+        # Eval.dataset.data_dir is REQUIRED by _REQUIRED_CONFIG_KEYS; it was
+        # then ignored and the Train root used for BOTH datasets, so
+        # differing roots silently shrank (or emptied) the validation set,
+        # corrupting checkpoint selection and early stopping (H4).
+        val_data_dir = val_config['dataset']['data_dir']
         train_label = train_config['dataset']['label_file_list'][0]
         val_label = val_config['dataset']['label_file_list'][0]
         
         # Training dataset
         train_dataset = VINRecognitionDataset(
-            data_dir=data_dir,
+            data_dir=train_data_dir,
             label_file=train_label,
             char_dict=self.char_to_idx,
             max_text_length=self.config['Global']['max_text_length'],
             is_training=True
         )
+        if len(train_dataset) == 0:
+            raise ValueError(
+                f"Training set resolved to 0 samples "
+                f"(data_dir={train_data_dir}, label file={train_label}). "
+                f"Dropped/missing samples are logged above."
+            )
         
         # Determine batch size and drop_last based on dataset size
         batch_size = train_config['loader']['batch_size_per_card']
@@ -1788,12 +1932,19 @@ class VINFineTuner:
         
         # Validation dataset
         val_dataset = VINRecognitionDataset(
-            data_dir=data_dir,
+            data_dir=val_data_dir,
             label_file=val_label,
             char_dict=self.char_to_idx,
             max_text_length=self.config['Global']['max_text_length'],
             is_training=False
         )
+        if len(val_dataset) == 0:
+            raise ValueError(
+                f"Validation set resolved to 0 samples "
+                f"(data_dir={val_data_dir}, label file={val_label}). An empty "
+                f"validation set silently corrupts checkpoint selection and "
+                f"early stopping. Dropped/missing samples are logged above."
+            )
         
         val_loader = DataLoader(
             val_dataset,
@@ -1848,8 +1999,6 @@ class VINFineTuner:
                 decoded_text = ''.join(chars[:max_len])  # Truncate to exactly 17 chars
                 decoded.append(decoded_text)
             return decoded
-        
-        return decoded
     
     def train_epoch(self, epoch: int) -> float:
         """Train for one epoch."""
@@ -1865,71 +2014,78 @@ class VINFineTuner:
                 break
             
             images = paddle.to_tensor(batch['image'])
-            targets = batch['text']
 
-            # Forward pass
-            logits = self.model(images)  # [B, T, C]
+            # Forward + loss under autocast when AMP is enabled (auto_cast
+            # with enable=False is a no-op context). The GradScaler alone
+            # never changed the forward's dtype, so use_amp previously added
+            # scale/unscale overhead without any mixed precision (L23). This
+            # wraps BOTH the CTC and CrossEntropy paths.
+            with auto_cast(enable=self.use_amp):
+                logits = self.model(images)  # [B, T, C]
 
-            if self.use_ctc:
-                # CTC path. Paddle's warpctc kernel has MIXED dtype
-                # requirements (verified against paddle 3.3.1's own
-                # check_variable_and_dtype calls in nn/functional/loss.py):
-                #   labels        -> int32
-                #   input_lengths -> int64  (LogitsLength)
-                #   label_lengths -> int64  (LabelLength)
-                # The long-standing "data type mismatch" failure had two
-                # eras: int64 labels (pre-fix), then all-int32 (which fixed
-                # labels but broke both length tensors). Executed proof:
-                # all-int32 raises InvalidArgument on paddle 3.3.1; this
-                # combination trains.
-                labels = paddle.to_tensor(batch['label'], dtype='int32')
-                target_lengths = paddle.to_tensor(batch['length'], dtype='int64').reshape([-1])
-                # RAW logits, not log_softmax: Paddle's warpctc applies its
-                # own softmax internally ("aliased as softmax with CTC" -
-                # its input is documented as "the UNSCALED probability
-                # sequence"). Feeding log-probabilities gets re-normalised
-                # to a near-uniform distribution, and the gradient signal
-                # collapses. Executed proof: with log_softmax here, 1200
-                # optimizer steps on 12 images never left the ln(34)=3.53
-                # blank plateau; with raw logits the same run overfits.
-                ctc_logits = logits.transpose([1, 0, 2])  # [T, B, C] for CTC
-                # CTC input lengths. Default is FULL length: with fixed-width
-                # inputs, supervising the padded timesteps teaches the model
-                # to emit blanks there - CTC's native mechanism - and keeps
-                # the inference contract width-free. Global.ctc_mask_padding
-                # switches to per-sample content-width lengths; measured
-                # consequence of masking: models trained under full-T anchor
-                # emissions anywhere (a legacy checkpoint emitted 10/17
-                # characters inside the padded region), so masking is
-                # incompatible with warm-starting them - its loss jumps to
-                # cold-start levels (~13) despite 201/201 weights loading.
-                if self.config.get('Global', {}).get('ctc_mask_padding', False):
-                    input_lengths = paddle.to_tensor(
-                        ctc_input_lengths(
-                            [int(w) for w in batch['valid_width'].reshape([-1])],
-                            total_timesteps=logits.shape[1],
-                            image_width=self.config.get('Global', {}).get('image_width', 320),
-                            label_lengths=[int(l) for l in target_lengths],
-                        ),
-                        dtype='int64',
-                    )
+                if self.use_ctc:
+                    # CTC path. Paddle's warpctc kernel has MIXED dtype
+                    # requirements (verified against paddle 3.3.1's own
+                    # check_variable_and_dtype calls in nn/functional/loss.py):
+                    #   labels        -> int32
+                    #   input_lengths -> int64  (LogitsLength)
+                    #   label_lengths -> int64  (LabelLength)
+                    # The long-standing "data type mismatch" failure had two
+                    # eras: int64 labels (pre-fix), then all-int32 (which fixed
+                    # labels but broke both length tensors). Executed proof:
+                    # all-int32 raises InvalidArgument on paddle 3.3.1; this
+                    # combination trains.
+                    labels = paddle.to_tensor(batch['label'], dtype='int32')
+                    target_lengths = paddle.to_tensor(batch['length'], dtype='int64').reshape([-1])
+                    # RAW logits, not log_softmax: Paddle's warpctc applies its
+                    # own softmax internally ("aliased as softmax with CTC" -
+                    # its input is documented as "the UNSCALED probability
+                    # sequence"). Feeding log-probabilities gets re-normalised
+                    # to a near-uniform distribution, and the gradient signal
+                    # collapses. Executed proof: with log_softmax here, 1200
+                    # optimizer steps on 12 images never left the ln(34)=3.53
+                    # blank plateau; with raw logits the same run overfits.
+                    ctc_logits = logits.transpose([1, 0, 2])  # [T, B, C] for CTC
+                    # CTC input lengths. Default is FULL length: with fixed-width
+                    # inputs, supervising the padded timesteps teaches the model
+                    # to emit blanks there - CTC's native mechanism - and keeps
+                    # the inference contract width-free. Global.ctc_mask_padding
+                    # switches to per-sample content-width lengths; measured
+                    # consequence of masking: models trained under full-T anchor
+                    # emissions anywhere (a legacy checkpoint emitted 10/17
+                    # characters inside the padded region), so masking is
+                    # incompatible with warm-starting them - its loss jumps to
+                    # cold-start levels (~13) despite 201/201 weights loading.
+                    if self.config.get('Global', {}).get('ctc_mask_padding', False):
+                        input_lengths = paddle.to_tensor(
+                            ctc_input_lengths(
+                                [int(w) for w in batch['valid_width'].reshape([-1])],
+                                total_timesteps=logits.shape[1],
+                                image_width=self.config.get('Global', {}).get('image_width', 320),
+                                label_lengths=[int(l) for l in target_lengths],
+                                adjacent_repeats=[
+                                    int(r) for r in batch['adjacent_repeats'].reshape([-1])
+                                ],
+                            ),
+                            dtype='int64',
+                        )
+                    else:
+                        input_lengths = paddle.full(
+                            [logits.shape[0]], logits.shape[1], dtype='int64'
+                        )
+                    loss = self.criterion(ctc_logits, labels, input_lengths, target_lengths)
                 else:
-                    input_lengths = paddle.full(
-                        [logits.shape[0]], logits.shape[1], dtype='int64'
-                    )
-                loss = self.criterion(ctc_logits, labels, input_lengths, target_lengths)
-            else:
-                labels = paddle.to_tensor(batch['label'], dtype='int64')  # CrossEntropyLoss needs int64
-                # Cross-Entropy Loss path (simpler, works for fixed-length VINs)
-                # Take only first max_text_length outputs to match label length
-                max_len = labels.shape[1]  # 17 for VINs
-                logits_trimmed = logits[:, :max_len, :]  # [B, 17, C]
-                
-                # Flatten for cross-entropy: [B, 17, C] -> [B*17, C]
-                batch_size, seq_len, num_classes = logits_trimmed.shape
-                logits_flat = logits_trimmed.reshape([-1, num_classes])
-                labels_flat = labels.reshape([-1])
-                loss = self.criterion(logits_flat, labels_flat)
+                    labels = paddle.to_tensor(batch['label'], dtype='int64')  # CrossEntropyLoss needs int64
+                    # Cross-Entropy Loss path (simpler, works for fixed-length VINs)
+                    # Take only first max_text_length outputs to match label length
+                    max_len = labels.shape[1]  # 17 for VINs
+                    logits_trimmed = logits[:, :max_len, :]  # [B, 17, C]
+                    
+                    # Flatten for cross-entropy: [B, 17, C] -> [B*17, C]
+                    batch_size, seq_len, num_classes = logits_trimmed.shape
+                    logits_flat = logits_trimmed.reshape([-1, num_classes])
+                    labels_flat = labels.reshape([-1])
+                    loss = self.criterion(logits_flat, labels_flat)
             
             # Backward pass
             if self.use_amp:
@@ -1982,6 +2138,7 @@ class VINFineTuner:
         """
         self.model.eval()
         total_loss = 0.0
+        total_samples = 0
         all_predictions = []
         all_targets = []
         
@@ -2010,6 +2167,9 @@ class VINFineTuner:
                             total_timesteps=logits.shape[1],
                             image_width=self.config.get('Global', {}).get('image_width', 320),
                             label_lengths=[int(l) for l in target_lengths],
+                            adjacent_repeats=[
+                                int(r) for r in batch['adjacent_repeats'].reshape([-1])
+                            ],
                         ),
                         dtype='int64',
                     )
@@ -2028,10 +2188,16 @@ class VINFineTuner:
                 labels_flat = labels.reshape([-1])
                 loss = self.criterion(logits_flat, labels_flat)
             
+            # Sample-weighted accumulation: the epoch loss is
+            # sum(batch_mean * batch_size) / total_samples. A plain mean of
+            # batch means overweights the small final batch under
+            # drop_last=False (L26).
+            batch_samples = int(images.shape[0])
             total_loss += require_finite_loss(
                 loss.item(),
                 context=f"finetune validation epoch {self.current_epoch}",
-            )
+            ) * batch_samples
+            total_samples += batch_samples
             
             # Decode predictions
             mask_pad = self.config.get('Global', {}).get('ctc_mask_padding', False)
@@ -2042,7 +2208,7 @@ class VINFineTuner:
             all_predictions.extend(predictions)
             all_targets.extend(targets)
         
-        avg_loss = total_loss / max(1, len(self.val_loader))
+        avg_loss = total_loss / max(1, total_samples)
         
         # Canonical metrics (the debug-print storm that used to live here -
         # per-position comparisons printed EVERY validation epoch - is gone;
@@ -2128,12 +2294,20 @@ class VINFineTuner:
         """
         best_path = self.output_dir / 'best_accuracy'
         self._atomic_paddle_save(self.model.state_dict(), best_path.with_suffix('.pdparams'))
+        # Optimizer state ships WITH the best checkpoint: without the .pdopt
+        # a later resume from best_accuracy silently restarted the optimizer
+        # and scheduler from scratch - a half-resume (M17).
+        self._atomic_paddle_save(self.optimizer.state_dict(), best_path.with_suffix('.pdopt'))
         self._atomic_json_save(
             {**self._checkpoint_info(self.current_epoch),
              'selection_metric': 'val_exact_match_accuracy',
              'selection_value': self.best_accuracy},
             self.output_dir / 'best_accuracy_info.json',
         )
+        # Record that THIS run produced the best checkpoint; export loads
+        # only checkpoints recorded here, never a stale file left by a
+        # previous run in the same directory (M18).
+        self._best_checkpoint_path = best_path.with_suffix('.pdparams')
         logger.info(f"Saved best model with accuracy: {self.best_accuracy:.4f}")
 
     def _save_best_val_loss_model(self):
@@ -2174,11 +2348,21 @@ class VINFineTuner:
         )
 
     def _checkpoint_info(self, epoch: int) -> Dict[str, Any]:
-        """The resume metadata written next to every checkpoint."""
+        """
+        The resume metadata written next to every checkpoint.
+
+        Persists the best-metric baselines and the early-stop patience
+        counter (M15): without them, the first post-resume epoch compared
+        against fresh-run baselines and overwrote every best checkpoint,
+        and the patience counter silently restarted.
+        """
         return {
             'epoch': epoch,
             'global_step': self.global_step,
             'best_accuracy': self.best_accuracy,
+            'best_val_loss': self.best_val_loss,
+            'best_val_char_accuracy': self.best_val_char_accuracy,
+            'epochs_without_improvement': self.epochs_without_improvement,
             'config': self.config,
         }
     
@@ -2225,33 +2409,82 @@ class VINFineTuner:
         if is_best:
             best_path = self.output_dir / 'best_accuracy'
             self._atomic_paddle_save(self.model.state_dict(), best_path.with_suffix('.pdparams'))
+            # Same contract as _save_best_model: the best checkpoint carries
+            # its optimizer state (M17) and is recorded as produced by THIS
+            # run so export never picks up a stale file (M18).
+            self._atomic_paddle_save(self.optimizer.state_dict(), best_path.with_suffix('.pdopt'))
+            self._best_checkpoint_path = best_path.with_suffix('.pdparams')
             logger.info(f"Saved best model with accuracy: {self.best_accuracy:.4f}")
     
-    def load_checkpoint(self, checkpoint_path: str):
-        """Load checkpoint to resume training."""
+    def load_checkpoint(self, checkpoint_path: str) -> Dict[str, Any]:
+        """
+        Load checkpoint to resume training.
+
+        Accepts both `<name>` and `<name>.pdparams`. The resume info file is
+        always `<name>_info.json`: the `.pdparams` suffix is stripped FIRST.
+        Deriving `<name>.pdparams_info.json` (never written) was how resumes
+        from explicit `.pdparams` paths silently restarted at epoch 0 (M16).
+
+        Returns:
+            What was actually restored: model/optimizer flags, whether the
+            resume state (epoch/step/bests) was found, and its values -
+            callers can verify a resume instead of assuming it.
+        """
         logger.info(f"Loading checkpoint from {checkpoint_path}")
         
-        # Handle paths that may or may not already have the extension
-        if not checkpoint_path.endswith('.pdparams'):
-            model_path = checkpoint_path + '.pdparams'
+        # Normalise to the extensionless base so BOTH accepted forms derive
+        # the same .pdparams / .pdopt / _info.json triple.
+        if checkpoint_path.endswith('.pdparams'):
+            base_path = checkpoint_path[:-len('.pdparams')]
         else:
-            model_path = checkpoint_path
+            base_path = checkpoint_path
+        model_path = base_path + '.pdparams'
             
         model_state = paddle.load(model_path)
         self.model.set_state_dict(model_state)
         
-        opt_path = model_path.replace('.pdparams', '.pdopt')
-        if Path(opt_path).exists():
+        opt_path = base_path + '.pdopt'
+        optimizer_restored = Path(opt_path).exists()
+        if optimizer_restored:
             opt_state = paddle.load(opt_path)
             self.optimizer.set_state_dict(opt_state)
+        else:
+            logger.warning(
+                f"No optimizer state next to checkpoint ({opt_path} missing): "
+                f"optimizer/scheduler start FRESH - this is a half-resume "
+                f"(weights only)."
+            )
         
-        info_path = Path(checkpoint_path).parent / f"{Path(checkpoint_path).name}_info.json"
-        if info_path.exists():
+        info_path = Path(base_path).parent / f"{Path(base_path).name}_info.json"
+        resume_state_restored = info_path.exists()
+        if resume_state_restored:
             with open(info_path) as f:
                 info = json.load(f)
-                self.current_epoch = info.get('epoch', 0)
-                self.global_step = info.get('global_step', 0)
-                self.best_accuracy = info.get('best_accuracy', 0.0)
+            self.current_epoch = info.get('epoch', 0)
+            self.global_step = info.get('global_step', 0)
+            self.best_accuracy = info.get('best_accuracy', 0.0)
+            # Best-metric baselines and the patience counter survive the
+            # resume (M15). Missing keys (info files written before these
+            # were persisted) fall back to fresh-run values.
+            self.best_val_loss = info.get('best_val_loss', float('inf'))
+            self.best_val_char_accuracy = info.get('best_val_char_accuracy', 0.0)
+            self.epochs_without_improvement = info.get('epochs_without_improvement', 0)
+        else:
+            logger.warning(
+                f"RESUME STATE MISSING: no info file at {info_path}. Weights "
+                f"were loaded, but epoch/global_step/best-metric baselines "
+                f"are RESET - training will restart at epoch 0 and may "
+                f"overwrite best checkpoints."
+            )
+
+        return {
+            'model_restored': True,
+            'optimizer_restored': optimizer_restored,
+            'resume_state_restored': resume_state_restored,
+            'epoch': self.current_epoch,
+            'global_step': self.global_step,
+            'info_path': str(info_path),
+        }
     
     def train(self, resume_from: Optional[str] = None):
         """
@@ -2632,7 +2865,6 @@ class VINFineTuner:
         with paddle.no_grad():
             for batch in self.val_loader:
                 images = batch['image']
-                labels = batch['label']
                 texts = batch.get('text', [''] * len(images))
                 
                 # Forward pass
@@ -2751,12 +2983,12 @@ class VINFineTuner:
         # Position-wise accuracy
         position_accuracy = [
             c / t if t > 0 else 0 
-            for c, t in zip(position_correct, position_total)
+            for c, t in zip(position_correct, position_total, strict=True)
         ]
         
         # Top confusions
         confusion_pairs = []
-        for pred, gt in zip(predictions, ground_truths):
+        for pred, gt in zip(predictions, ground_truths, strict=True):
             for i in range(min(len(pred), len(gt), 17)):
                 if pred[i] != gt[i]:
                     confusion_pairs.append((pred[i], gt[i]))
@@ -2850,7 +3082,9 @@ class VINFineTuner:
             'device_name': 'GPU' if self.device == 'gpu' else 'CPU',
         }
         
-        # Try to get more detailed GPU info
+        # Try to get more detailed GPU info. Best-effort metadata, but never
+        # silent: a swallowed failure here previously hid real device-query
+        # bugs behind an incomplete metrics file.
         try:
             import paddle
             if self.device == 'gpu' and paddle.device.is_compiled_with_cuda():
@@ -2858,8 +3092,10 @@ class VINFineTuner:
                 device_info['gpu_count'] = paddle.device.cuda.device_count()
             else:
                 device_info['cuda_available'] = False
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                f"Could not query CUDA details for metrics metadata: {exc}"
+            )
         
         # Build complete metrics object
         metrics = {
@@ -2974,14 +3210,28 @@ class VINFineTuner:
         """
         logger.info("Exporting inference model...")
         
-        # Load best model
-        best_path = self.output_dir / 'best_accuracy.pdparams'
-        if best_path.exists():
-            state_dict = paddle.load(str(best_path))
-            self.model.set_state_dict(state_dict)
-            logger.info(f"Loaded best model weights from: {best_path}")
+        # Export the best checkpoint SAVED BY THIS RUN, loaded into a FRESH
+        # model instance. Two defects lived here (M18): any
+        # best_accuracy.pdparams in the output dir - including a STALE one
+        # left by a previous run - was silently exported, and loading it
+        # into self.model mutated the live model BEFORE _save_final_metrics,
+        # so the final metrics could describe another run's weights.
+        best_path = self._best_checkpoint_path
+        if best_path is not None and best_path.exists():
+            export_model = self._build_model()
+            export_model.set_state_dict(paddle.load(str(best_path)))
+            logger.info(
+                f"Exporting best checkpoint produced by this run: {best_path}"
+            )
+        else:
+            export_model = self.model
+            logger.info(
+                "No best-accuracy checkpoint was saved during this run; "
+                "exporting the current in-memory weights (final training "
+                "state of this run)."
+            )
         
-        self.model.eval()
+        export_model.eval()
         
         # Create inference directory
         inference_dir = self.output_dir / 'inference'
@@ -2995,7 +3245,7 @@ class VINFineTuner:
         export_success = False
         try:
             paddle.jit.save(
-                self.model,
+                export_model,
                 str(inference_dir / 'inference'),
                 input_spec=input_spec
             )
@@ -3036,7 +3286,7 @@ class VINFineTuner:
                 "inference.json/inference.pdmodel). Re-export from the "
                 "checkpoint or use the .pdparams for warm starts only."
             )
-            paddle.save(self.model.state_dict(), str(inference_dir / 'inference.pdiparams'))
+            paddle.save(export_model.state_dict(), str(inference_dir / 'inference.pdiparams'))
         
         # Create inference.yml config file (required by PaddleOCR v5)
         self._create_inference_config(inference_dir)

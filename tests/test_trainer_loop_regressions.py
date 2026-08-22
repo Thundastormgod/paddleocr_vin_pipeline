@@ -165,6 +165,11 @@ class TestCheckpointDurability:
         )
         trainer.global_step = 123
         trainer.best_accuracy = 0.5
+        # M15: checkpoint info persists the best-metric baselines and the
+        # early-stop patience counter, so they are part of trainer state.
+        trainer.best_val_loss = 0.9
+        trainer.best_val_char_accuracy = 0.4
+        trainer.epochs_without_improvement = 2
         trainer.config = {"probe": True}
         return trainer
 
@@ -193,21 +198,35 @@ class TestCheckpointDurability:
         """
         WAS BROKEN: `latest` had no info json, so load_checkpoint left
         current_epoch at 0 and a resume silently restarted from epoch 1
-        (re-running warmup). The info file must round-trip.
+        (re-running warmup). The info file must round-trip - including the
+        best-metric baselines and patience counter (M15), and identically
+        for BOTH the extensionless and explicit .pdparams forms (M16: the
+        latter used to derive `latest.pdparams_info.json`, never written,
+        silently resetting the epoch counter).
         """
         tiny_trainer._save_latest(epoch=9)
 
-        fresh = VINFineTuner.__new__(VINFineTuner)
-        fresh.model = tiny_trainer.model
-        fresh.optimizer = tiny_trainer.optimizer
-        fresh.current_epoch = 0
-        fresh.global_step = 0
-        fresh.best_accuracy = 0.0
-        fresh.load_checkpoint(str(tmp_path / "latest"))
+        for checkpoint_arg in ("latest", "latest.pdparams"):
+            fresh = VINFineTuner.__new__(VINFineTuner)
+            fresh.model = tiny_trainer.model
+            fresh.optimizer = tiny_trainer.optimizer
+            fresh.current_epoch = 0
+            fresh.global_step = 0
+            fresh.best_accuracy = 0.0
+            restored = fresh.load_checkpoint(str(tmp_path / checkpoint_arg))
 
-        assert fresh.current_epoch == 9
-        assert fresh.global_step == 123
-        assert fresh.best_accuracy == 0.5
+            assert fresh.current_epoch == 9, checkpoint_arg
+            assert fresh.global_step == 123, checkpoint_arg
+            assert fresh.best_accuracy == 0.5, checkpoint_arg
+            # M15: best baselines and patience survive the resume.
+            assert fresh.best_val_loss == 0.9, checkpoint_arg
+            assert fresh.best_val_char_accuracy == 0.4, checkpoint_arg
+            assert fresh.epochs_without_improvement == 2, checkpoint_arg
+            # load_checkpoint reports what it restored (H6 relies on this
+            # being checkable instead of assumed).
+            assert restored["resume_state_restored"] is True
+            assert restored["optimizer_restored"] is True
+            assert restored["epoch"] == 9
 
 
 class TestLossAwareEarlyStopping:
@@ -306,7 +325,7 @@ class TestDatasetSkipsAreBounded:
 
     @pytest.fixture()
     def dataset_factory(self, tmp_path):
-        paddle = pytest.importorskip("paddle")
+        pytest.importorskip("paddle")
         import numpy as np
         import cv2
         from src.vin_ocr.core.charset import load_char_dict
@@ -355,7 +374,7 @@ class TestDecodeConfidence:
 
     @pytest.fixture()
     def decoder(self):
-        paddle = pytest.importorskip("paddle")
+        pytest.importorskip("paddle")
         from src.vin_ocr.core.charset import load_char_dict
         trainer = VINFineTuner.__new__(VINFineTuner)
         char_to_idx, idx_to_char = load_char_dict("configs/vin_dict.txt")
@@ -433,7 +452,7 @@ class TestCorruptionThreshold:
     """C6 as SPECIFIED: warn once per corrupt path, abort past 5%."""
 
     def test_each_corrupt_path_warned_once_and_threshold_aborts(self, tmp_path, caplog):
-        paddle = pytest.importorskip("paddle")
+        pytest.importorskip("paddle")
         import numpy as np
         import cv2
         from src.vin_ocr.core.charset import load_char_dict
@@ -671,7 +690,7 @@ class TestCTCInputLengths:
             ctc_input_lengths([320, 160], 80, 320, [17])
 
     def test_dataset_emits_valid_width(self, tmp_path):
-        paddle = pytest.importorskip("paddle")
+        pytest.importorskip("paddle")
         import numpy as np
         import cv2
         from src.vin_ocr.core.charset import load_char_dict
@@ -705,6 +724,8 @@ class TestBestValLossCheckpoint:
         trainer.current_epoch = 3
         trainer.best_accuracy = 0.0
         trainer.best_val_loss = 0.862
+        trainer.best_val_char_accuracy = 0.0
+        trainer.epochs_without_improvement = 0
         trainer.config = {"probe": True}
 
         trainer._save_best_val_loss_model()
@@ -727,6 +748,8 @@ class TestBestValLossCheckpoint:
         trainer.current_epoch = 5
         trainer.best_accuracy = 0.25
         trainer.best_val_loss = 1.0
+        trainer.best_val_char_accuracy = 0.0
+        trainer.epochs_without_improvement = 0
         trainer.config = {"probe": True}
 
         trainer._save_best_model()
@@ -930,6 +953,7 @@ class TestCharAccuracyAwareSelection:
         trainer.best_accuracy = 0.0
         trainer.best_val_loss = 0.82
         trainer.best_val_char_accuracy = 0.7549
+        trainer.epochs_without_improvement = 0
         trainer.config = {"probe": True}
 
         trainer._save_best_char_accuracy_model()

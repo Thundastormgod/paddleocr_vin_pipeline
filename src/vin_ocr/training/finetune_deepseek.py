@@ -97,7 +97,7 @@ try:
     )
     from transformers.modeling_utils import PreTrainedModel
     TRANSFORMERS_AVAILABLE = True
-except (ImportError, RuntimeError) as e:
+except (ImportError, RuntimeError):
     # RuntimeError can occur due to numpy version incompatibility
     TRANSFORMERS_AVAILABLE = False  # Availability checked at runtime
 
@@ -132,8 +132,10 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-# Force unbuffered output for real-time training visibility
-for handler in logger.handlers:
+# Force unbuffered output for real-time training visibility.
+# basicConfig attaches its handlers to the ROOT logger; this module
+# logger's own handler list is empty, so iterating it was a no-op.
+for handler in logging.getLogger().handlers:
     handler.flush = sys.stdout.flush
 
 
@@ -278,16 +280,52 @@ class VINDeepSeekDataset(TorchDataset):
             if isinstance(inputs[key], torch.Tensor):
                 inputs[key] = inputs[key].squeeze(0)
         
-        # Add labels using the tokenizer
-        label_ids = self.tokenizer(
-            label,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors="pt"
-        )['input_ids'].squeeze(0)
+        # Teacher-forced causal-LM sequence: [prompt | answer | pad].
+        # Labels are -100 everywhere except the answer tokens, so the
+        # prompt/image region and padding contribute neither to the loss
+        # (CrossEntropy ignore_index) nor to compute_metrics, which
+        # aligns on the same -100 mask. The answer region has a fixed
+        # width of max_length tokens so batch samples stack.
+        if 'input_ids' not in inputs:
+            raise ValueError(
+                f"Processor {type(self.processor).__name__} returned no "
+                f"'input_ids' for the prompt; the causal-LM label masking "
+                f"needs the tokenized prompt to build the training sequence."
+            )
+        prompt_ids = inputs['input_ids'].long()
+        if 'attention_mask' in inputs:
+            prompt_attention = inputs['attention_mask'].long()
+        else:
+            prompt_attention = torch.ones_like(prompt_ids)
         
-        inputs['labels'] = label_ids
+        answer_ids = self.tokenizer(
+            label,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.max_length,
+        )['input_ids']
+        eos_id = self.tokenizer.eos_token_id
+        if eos_id is not None and len(answer_ids) < self.max_length:
+            answer_ids = answer_ids + [eos_id]
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = eos_id if eos_id is not None else 0
+        n_pad = self.max_length - len(answer_ids)
+        
+        answer_input = torch.tensor(answer_ids + [pad_id] * n_pad,
+                                    dtype=torch.long)
+        answer_labels = torch.tensor(answer_ids + [-100] * n_pad,
+                                     dtype=torch.long)
+        answer_attention = torch.tensor(
+            [1] * len(answer_ids) + [0] * n_pad, dtype=torch.long)
+        
+        inputs['input_ids'] = torch.cat([prompt_ids, answer_input])
+        inputs['attention_mask'] = torch.cat(
+            [prompt_attention, answer_attention])
+        inputs['labels'] = torch.cat([
+            torch.full((prompt_ids.shape[0],), -100, dtype=torch.long),
+            answer_labels,
+        ])
         inputs['text_labels'] = label
         
         return inputs
@@ -391,13 +429,17 @@ class DeepSeekVINTrainer:
                 logger.warning("BitsAndBytes not installed. Disabling 4-bit quantization.")
                 self.config.use_4bit = False
         elif self.config.use_8bit:
-            try:
+            # BitsAndBytesConfig imports fine without bitsandbytes; the
+            # real requirement is the bitsandbytes package itself, so
+            # gate on BNB_AVAILABLE (the old try/except ImportError around
+            # the transformers import could never trip).
+            if BNB_AVAILABLE:
                 from transformers import BitsAndBytesConfig
                 quantization_config = BitsAndBytesConfig(
                     load_in_8bit=True
                 )
-            except ImportError:
-                logger.warning("BitsAndBytes not installed. Disabling 8-bit quantization.")
+            else:
+                logger.warning("bitsandbytes not installed. Disabling 8-bit quantization.")
                 self.config.use_8bit = False
         
         # Load model
@@ -461,8 +503,10 @@ class DeepSeekVINTrainer:
             self.model = get_peft_model(self.model, lora_config)
             self.model.print_trainable_parameters()
         
-        # Enable gradient checkpointing for memory efficiency
-        if hasattr(self.model, 'gradient_checkpointing_enable'):
+        # Enable gradient checkpointing for memory efficiency (config-
+        # gated: --gradient-checkpointing / gradient_checkpointing: true)
+        if (self.config.gradient_checkpointing
+                and hasattr(self.model, 'gradient_checkpointing_enable')):
             self.model.gradient_checkpointing_enable()
         
         logger.info(f"Model loaded successfully")
@@ -490,93 +534,75 @@ class DeepSeekVINTrainer:
     
     def compute_metrics(self, eval_pred) -> Dict[str, float]:
         """
-        Compute comprehensive evaluation metrics.
+        Causal-LM evaluation aligned to the dataset's -100 label masking.
+        
+        A causal LM's logits at position t predict the token at position
+        t+1, so predictions are shift-aligned (logits[:, :-1] against
+        labels[:, 1:]) and scored ONLY where the shifted labels are not
+        -100 - exactly the VIN answer tokens the dataset supervises. The
+        previous implementation argmax-decoded the full shifted sequence
+        and compared it to a standalone 32-token label encoding: never
+        aligned, so `accuracy` (which drives best-model selection and
+        early stopping) was meaningless.
         
         Returns:
-            Dict with image-level and character-level metrics:
-            - accuracy: Image-level accuracy (exact match)
-            - correct_images: Number of correctly predicted VINs
-            - failed_images: Number of incorrectly predicted VINs
-            - char_accuracy: Character-level accuracy
-            - f1_micro: Micro-averaged F1 score
-            - f1_macro: Macro-averaged F1 score
-            - cer: Character error rate
+            Dict with:
+            - accuracy: exact-match rate over samples (every unmasked
+              answer token predicted correctly)
+            - char_accuracy: correct rate over unmasked answer tokens
+            - correct_images / failed_images: sample counts behind accuracy
+            - total_characters: number of scored (unmasked) tokens
         """
         predictions, labels = eval_pred
         
-        # Decode predictions
         if isinstance(predictions, tuple):
             predictions = predictions[0]
+        predictions = np.asarray(predictions)
+        labels = np.asarray(labels)
         
-        pred_ids = np.argmax(predictions, axis=-1)
+        # Raw logits [B, L, V] need argmax; ids [B, L] pass through
+        # (covers a preprocess_logits_for_metrics hook, if one is added).
+        if predictions.ndim == 3:
+            pred_ids = np.argmax(predictions, axis=-1)
+        else:
+            pred_ids = predictions
         
-        # Decode to text
-        pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-        label_texts = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+        # Shift: prediction at t scores against the label at t+1.
+        shifted_preds = pred_ids[:, :-1]
+        shifted_labels = labels[:, 1:]
+        mask = shifted_labels != -100
         
-        # Use comprehensive metrics calculator
-        try:
-            from ..evaluation.metrics import EvaluationMetricsCalculator
-            calc = EvaluationMetricsCalculator()
-            calc.add_batch(pred_texts, label_texts)
-            full_metrics = calc.compute()
-            
-            return {
-                # Image-level metrics
-                'accuracy': full_metrics.image_level.accuracy,
-                'correct_images': full_metrics.image_level.correct_images,
-                'failed_images': full_metrics.image_level.failed_images,
-                
-                # Character-level metrics
-                'char_accuracy': full_metrics.character_level.char_accuracy,
-                'total_characters': full_metrics.character_level.total_characters,
-                'f1_micro': full_metrics.character_level.f1_micro,
-                'f1_macro': full_metrics.character_level.f1_macro,
-                'precision': full_metrics.character_level.precision,
-                'recall': full_metrics.character_level.recall,
-                
-                # Industry metrics
-                'cer': full_metrics.character_level.char_error_rate,
-                'ned': full_metrics.character_level.normalized_edit_distance,
-            }
-        except ImportError:
-            # Fallback to basic metrics
-            correct = sum(1 for p, l in zip(pred_texts, label_texts) if p.strip() == l.strip())
-            accuracy = correct / len(pred_texts) if pred_texts else 0.0
-            
-            total_chars = sum(len(l) for l in label_texts)
-            total_errors = sum(
-                self._levenshtein(p.strip(), l.strip())
-                for p, l in zip(pred_texts, label_texts)
+        total_tokens = int(mask.sum())
+        if total_tokens == 0:
+            logger.warning(
+                "compute_metrics: no unmasked label tokens in this "
+                "evaluation set - reporting 0.0, nothing was measured"
             )
-            cer = total_errors / total_chars if total_chars > 0 else 1.0
-            
             return {
-                'accuracy': accuracy,
-                'correct_images': correct,
-                'failed_images': len(pred_texts) - correct,
-                'cer': cer
+                'accuracy': 0.0,
+                'char_accuracy': 0.0,
+                'correct_images': 0,
+                'failed_images': int(labels.shape[0]),
+                'total_characters': 0,
             }
-    
-    @staticmethod
-    def _levenshtein(s1: str, s2: str) -> int:
-        """Calculate Levenshtein distance."""
-        if len(s1) < len(s2):
-            return DeepSeekVINTrainer._levenshtein(s2, s1)
-        if len(s2) == 0:
-            return len(s1)
         
-        previous_row = range(len(s2) + 1)
-        for i, c1 in enumerate(s1):
-            current_row = [i + 1]
-            for j, c2 in enumerate(s2):
-                insertions = previous_row[j + 1] + 1
-                deletions = current_row[j] + 1
-                substitutions = previous_row[j] + (c1 != c2)
-                current_row.append(min(insertions, deletions, substitutions))
-            previous_row = current_row
+        token_hits = (shifted_preds == shifted_labels) & mask
+        char_accuracy = float(token_hits.sum()) / total_tokens
         
-        return previous_row[-1]
+        sample_has_tokens = mask.any(axis=1)
+        sample_exact = (
+            (token_hits.sum(axis=1) == mask.sum(axis=1)) & sample_has_tokens
+        )
+        n_samples = int(sample_has_tokens.sum())
+        correct = int(sample_exact.sum())
+        
+        return {
+            'accuracy': correct / n_samples if n_samples else 0.0,
+            'char_accuracy': char_accuracy,
+            'correct_images': correct,
+            'failed_images': n_samples - correct,
+            'total_characters': total_tokens,
+        }
     
     def train(self, resume_from: Optional[str] = None):
         """Run training with Hugging Face Trainer."""
@@ -624,7 +650,11 @@ class DeepSeekVINTrainer:
             
             for key in keys:
                 if key == 'text_labels':
-                    collated[key] = [item[key] for item in batch]
+                    # Not a model input: remove_unused_columns=False keeps
+                    # every collator key, and Trainer calls model(**batch),
+                    # so forwarding this raises TypeError on any forward
+                    # without **kwargs. Strip it here.
+                    continue
                 elif isinstance(batch[0][key], torch.Tensor):
                     collated[key] = torch.stack([item[key] for item in batch])
                 else:
@@ -666,8 +696,14 @@ class DeepSeekVINTrainer:
                 try:
                     with open(self.progress_file, 'w') as f:
                         json.dump(progress, f, indent=2)
-                except Exception:
-                    pass
+                except OSError as exc:
+                    # Progress reporting must not kill training, but the
+                    # failure must be visible (a silent swallow here left
+                    # the UI reading a stale/absent progress file).
+                    logger.warning(
+                        f"Could not write training progress to "
+                        f"{self.progress_file}: {exc}"
+                    )
             
             def on_train_begin(self, args, state, control, **kwargs):
                 import time
@@ -801,6 +837,21 @@ def main():
         help='Full fine-tuning (requires >40GB VRAM)'
     )
     parser.add_argument(
+        '--gradient-checkpointing',
+        action='store_true',
+        help='Enable gradient checkpointing (saves memory, ~20%% slower)'
+    )
+    parser.add_argument(
+        '--bf16',
+        action='store_true',
+        help='Train in bfloat16 mixed precision (Ampere or newer GPUs)'
+    )
+    parser.add_argument(
+        '--load-in-8bit',
+        action='store_true',
+        help='Load the base model in 8-bit via bitsandbytes (CUDA only)'
+    )
+    parser.add_argument(
         '--output', '-o',
         default=None,
         help='Output directory (overrides config)'
@@ -865,6 +916,18 @@ def main():
         config.use_lora = True
     if args.full:
         config.use_lora = False
+    if args.gradient_checkpointing:
+        config.gradient_checkpointing = True
+    if args.bf16:
+        config.bf16 = True
+        config.fp16 = False
+    if args.load_in_8bit:
+        if not BNB_AVAILABLE:
+            parser.error(
+                "--load-in-8bit requires the bitsandbytes package, which "
+                "is not installed. Install with: pip install bitsandbytes"
+            )
+        config.use_8bit = True
     if args.output:
         config.output_dir = args.output
     if args.epochs:

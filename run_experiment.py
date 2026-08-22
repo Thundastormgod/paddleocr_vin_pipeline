@@ -26,6 +26,7 @@ Date: January 2026
 """
 
 import argparse
+import difflib
 import json
 import logging
 import os
@@ -90,28 +91,43 @@ def calculate_metrics(predictions: List[Dict]) -> Dict:
         
         total_chars += len(gt)
         
-        # Character-level accuracy
-        for i, (g, p) in enumerate(zip(gt, pr)):
-            if i < 17:
-                position_total[i] += 1
-                if g == p:
-                    position_correct[i] += 1
-                    correct_chars += 1
-                    true_positives += 1
-                else:
-                    char_substitutions += 1
-                    false_negatives += 1  # Missed the correct char
-                    false_positives += 1  # Predicted wrong char
+        # Character-level metrics from edit-distance ALIGNMENT (difflib
+        # opcodes), not positional zip: one deletion counts as one deletion,
+        # not as a substitution at every subsequent position (audit M30).
+        for i in range(min(len(gt), 17)):
+            position_total[i] += 1
         
-        # Handle length differences
-        if len(pr) > len(gt):
-            extra = len(pr) - len(gt)
-            char_insertions += extra
-            false_positives += extra
-        elif len(gt) > len(pr):
-            missing = len(gt) - len(pr)
-            char_deletions += missing
-            false_negatives += missing
+        matcher = difflib.SequenceMatcher(None, gt, pr, autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'equal':
+                n = i2 - i1
+                correct_chars += n
+                true_positives += n
+                for i in range(i1, min(i2, 17)):
+                    position_correct[i] += 1
+            elif tag == 'replace':
+                gt_len = i2 - i1
+                pr_len = j2 - j1
+                subs = min(gt_len, pr_len)
+                char_substitutions += subs
+                false_negatives += subs   # missed the correct chars
+                false_positives += subs   # predicted wrong chars
+                if gt_len > pr_len:
+                    missing = gt_len - pr_len
+                    char_deletions += missing
+                    false_negatives += missing
+                elif pr_len > gt_len:
+                    extra = pr_len - gt_len
+                    char_insertions += extra
+                    false_positives += extra
+            elif tag == 'delete':
+                missing = i2 - i1
+                char_deletions += missing
+                false_negatives += missing
+            elif tag == 'insert':
+                extra = j2 - j1
+                char_insertions += extra
+                false_positives += extra
     
     # Calculate metrics
     cer = (char_substitutions + char_insertions + char_deletions) / total_chars if total_chars > 0 else 1.0
@@ -273,7 +289,9 @@ class ExperimentRunner:
         seed: int = 42
     ) -> Dict:
         """Prepare dataset with train/val/test splits."""
-        from prepare_dataset import prepare_dataset
+        # The implementation lives in src/vin_ocr/utils/prepare_dataset.py;
+        # there is no root-level prepare_dataset module (audit C3).
+        from src.vin_ocr.utils.prepare_dataset import prepare_dataset
         
         dataset_dir = self.output_dir / "dataset"
         
@@ -423,33 +441,40 @@ class ExperimentRunner:
         
         print("─" * 60)
         
-        # Overall metrics (weighted average across splits)
+        # Pooled-over-splits numbers are DIAGNOSTICS ONLY: averaging train,
+        # val and test into one figure mixes seen and unseen data and must
+        # never be read as a headline result (audit L49). The per-split table
+        # above is the report; this block exists to sanity-check pooling.
         total_samples = sum(
             results[s]['metrics']['sample_count'] 
             for s in results if 'metrics' in results.get(s, {})
         )
         
         if total_samples > 0:
-            overall_exact = sum(
+            pooled_exact = sum(
                 results[s]['metrics']['exact_match_accuracy'] * results[s]['metrics']['sample_count']
                 for s in results if 'metrics' in results.get(s, {})
             ) / total_samples
             
-            overall_f1 = sum(
+            pooled_f1 = sum(
                 results[s]['metrics']['f1_score'] * results[s]['metrics']['sample_count']
                 for s in results if 'metrics' in results.get(s, {})
             ) / total_samples
             
-            summary['overall_metrics'] = {
+            summary['pooled_split_diagnostics'] = {
+                'note': ('Sample-weighted pooling over train+val+test. '
+                         'Diagnostic only - NOT a headline metric; use the '
+                         'per-split results above.'),
                 'total_samples': total_samples,
-                'weighted_exact_match': overall_exact,
-                'weighted_f1_score': overall_f1
+                'pooled_exact_match': pooled_exact,
+                'pooled_f1_score': pooled_f1
             }
             
-            print(f"\nOverall Weighted Metrics:")
+            print("\nPooled-over-splits diagnostics (train+val+test pooled;")
+            print("NOT a headline metric - use the per-split table above):")
             print(f"  Total Samples:        {total_samples}")
-            print(f"  Exact Match:          {overall_exact*100:.2f}%")
-            print(f"  F1 Score:             {overall_f1*100:.2f}%")
+            print(f"  Pooled Exact Match:   {pooled_exact*100:.2f}%")
+            print(f"  Pooled F1 Score:      {pooled_f1*100:.2f}%")
         
         # Save summary
         summary_file = self.output_dir / "experiment_summary.json"
@@ -500,11 +525,14 @@ class ExperimentRunner:
             f.write("- **CER:** Character Error Rate - lower is better\n")
             f.write("- **Confidence:** Average model confidence score\n\n")
             
-            if 'overall_metrics' in summary:
-                f.write("## Overall Performance\n\n")
-                om = summary['overall_metrics']
-                f.write(f"- **Weighted Exact Match:** {om['weighted_exact_match']*100:.2f}%\n")
-                f.write(f"- **Weighted F1 Score:** {om['weighted_f1_score']*100:.2f}%\n")
+            if 'pooled_split_diagnostics' in summary:
+                f.write("## Pooled-Over-Splits Diagnostics\n\n")
+                f.write("*Sample-weighted pooling over train+val+test. "
+                        "Diagnostic only - NOT a headline metric; "
+                        "use the per-split results above.*\n\n")
+                om = summary['pooled_split_diagnostics']
+                f.write(f"- **Pooled Exact Match:** {om['pooled_exact_match']*100:.2f}%\n")
+                f.write(f"- **Pooled F1 Score:** {om['pooled_f1_score']*100:.2f}%\n")
             
             # Position accuracy if available
             if 'test' in summary.get('split_results', {}):
@@ -513,7 +541,12 @@ class ExperimentRunner:
                     f.write("\n## Per-Position Accuracy (Test Set)\n\n")
                     f.write("| Position | Accuracy |\n")
                     f.write("|----------|----------|\n")
-                    for pos, acc in sorted(m['position_accuracy'].items()):
+                    # Numeric sort: position_1, position_2, ..., position_17
+                    # (lexicographic put position_10 before position_2).
+                    for pos, acc in sorted(
+                        m['position_accuracy'].items(),
+                        key=lambda item: int(item[0].split('_')[1])
+                    ):
                         pos_num = pos.split('_')[1]
                         f.write(f"| {pos_num} | {acc*100:.2f}% |\n")
         

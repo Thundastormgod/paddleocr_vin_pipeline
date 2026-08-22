@@ -74,14 +74,15 @@ def train_paddleocr(
     # Load config
     config = load_config(config_path)
     
-    # Apply overrides
-    if output_dir:
+    # Apply overrides. Presence checks use `is not None`: truthiness treated
+    # legitimate falsy values (e.g. 0) as absent (audit L48).
+    if output_dir is not None:
         config['Global']['save_model_dir'] = output_dir
-    if epochs:
+    if epochs is not None:
         config['Global']['epoch_num'] = epochs
-    if batch_size:
+    if batch_size is not None:
         config['Train']['loader']['batch_size_per_card'] = batch_size
-    if learning_rate:
+    if learning_rate is not None:
         config['Optimizer']['lr']['learning_rate'] = learning_rate
     
     # Create trainer and train
@@ -118,15 +119,15 @@ def train_deepseek(
     else:
         config = DeepSeekFineTuneConfig()
     
-    # Apply overrides
+    # Apply overrides (`is not None`: 0 must be treated as present, L48)
     config.use_lora = use_lora
-    if output_dir:
+    if output_dir is not None:
         config.output_dir = output_dir
-    if epochs:
+    if epochs is not None:
         config.num_epochs = epochs
-    if batch_size:
+    if batch_size is not None:
         config.batch_size = batch_size
-    if learning_rate:
+    if learning_rate is not None:
         config.learning_rate = learning_rate
     
     # Create trainer and train
@@ -244,6 +245,23 @@ def main():
         )
     
     elif args.model == 'all':
+        # --config and --resume name ONE file/checkpoint; they cannot apply to
+        # two different model families. Fail loudly instead of silently
+        # ignoring them (audit L48).
+        if args.config is not None or args.resume is not None:
+            logger.error(
+                "--config/--resume are incompatible with --model all: a single "
+                "config or checkpoint path cannot apply to both PaddleOCR and "
+                "DeepSeek. Run each model separately to use them."
+            )
+            sys.exit(2)
+        
+        # --full/--lora are DeepSeek-specific and ARE propagated to the
+        # DeepSeek phase, resolved exactly as in the single-model branch.
+        deepseek_use_lora = not args.full
+        if args.lora:
+            deepseek_use_lora = True
+        
         results = {}
         
         # Train PaddleOCR
@@ -253,7 +271,7 @@ def main():
             logger.info("=" * 60 + "\n")
             
             paddle_config = 'configs/vin_finetune_config.yml'
-            paddle_output = args.output + '/paddleocr' if args.output else None
+            paddle_output = args.output + '/paddleocr' if args.output is not None else None
             
             results['paddleocr'] = train_paddleocr(
                 config_path=paddle_config,
@@ -272,7 +290,7 @@ def main():
             logger.info("=" * 60 + "\n")
             
             deepseek_config = 'configs/deepseek_finetune_config.yml'
-            deepseek_output = args.output + '/deepseek' if args.output else None
+            deepseek_output = args.output + '/deepseek' if args.output is not None else None
             
             train_deepseek(
                 config_path=deepseek_config,
@@ -280,7 +298,7 @@ def main():
                 epochs=args.epochs,
                 batch_size=args.batch_size,
                 learning_rate=args.lr,
-                use_lora=True
+                use_lora=deepseek_use_lora
             )
             results['deepseek'] = True
         else:

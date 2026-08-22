@@ -125,18 +125,33 @@ class DeepSeekONNXExporter:
                 trust_remote_code=True
             )
             print("  ✓ Tokenizer loaded")
-        except Exception:
-            # Try loading from base model
+        except Exception as primary_error:
+            # Try loading from the base model recorded in config.json.
+            # This path must never leave self.tokenizer unassigned and
+            # continue: everything downstream assumes a tokenizer exists.
             config_path = self.model_path / "config.json"
-            if config_path.exists():
-                with open(config_path) as f:
-                    config = json.load(f)
-                base_model = config.get("_name_or_path", "deepseek-ai/deepseek-vl-7b-base")
+            if not config_path.exists():
+                raise RuntimeError(
+                    f"Could not load a tokenizer: loading from "
+                    f"{self.model_path} failed ({primary_error}) and the "
+                    f"fallback source {config_path} does not exist, so no "
+                    f"base model name is available."
+                ) from primary_error
+            with open(config_path) as f:
+                config = json.load(f)
+            base_model = config.get("_name_or_path", "deepseek-ai/deepseek-vl-7b-base")
+            try:
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     base_model,
                     trust_remote_code=True
                 )
                 print(f"  ✓ Tokenizer loaded from base: {base_model}")
+            except Exception as fallback_error:
+                raise RuntimeError(
+                    f"Could not load a tokenizer from either source: "
+                    f"{self.model_path} ({primary_error}) or base model "
+                    f"{base_model!r} ({fallback_error})."
+                ) from fallback_error
         
         # Try to load processor for image handling
         try:
@@ -163,27 +178,56 @@ class DeepSeekONNXExporter:
         """
         Export the model to ONNX format.
         
+        torch.onnx.export binds example inputs POSITIONALLY to the traced
+        module's forward parameters (input_names only renames them). A
+        causal LM's forward starts (input_ids, attention_mask, ...), so
+        handing it the image tensor first silently bound pixels to
+        input_ids. The wrapper below pins an explicit (pixel_values,
+        input_ids, attention_mask) parameter order and forwards each
+        tensor to the real model BY KEYWORD, so `input_names` lists the
+        actually-bound order.
+        
         Args:
             input_height: Input image height
             input_width: Input image width
             opset_version: ONNX opset version
         """
         import torch
-        import onnx
         
         print(f"\nExporting to ONNX (opset={opset_version})...")
         
-        # Create dummy inputs
-        batch_size = 1
+        class VLExportWrapper(torch.nn.Module):
+            """Defined-order forward for correct example-input binding."""
+            
+            def __init__(self, wrapped):
+                super().__init__()
+                self.wrapped = wrapped
+            
+            def forward(self, pixel_values, input_ids, attention_mask):
+                outputs = self.wrapped(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pixel_values=pixel_values,
+                )
+                if hasattr(outputs, 'logits'):
+                    return outputs.logits
+                return outputs[0]
         
-        # For vision models, we need image tensor
+        # Create dummy inputs. The image dtype follows the loaded model's
+        # parameter dtype (float16 here), so the exported graph and the
+        # weights agree.
+        batch_size = 1
+        model_dtype = next(self.model.parameters()).dtype
+        
         dummy_image = torch.randn(
             batch_size, 3, input_height, input_width,
-            dtype=torch.float16
+            dtype=model_dtype
         ).to(self.model.device)
-        
-        # Some models also need text tokens
         dummy_input_ids = torch.zeros(
+            batch_size, 1,
+            dtype=torch.long
+        ).to(self.model.device)
+        dummy_attention_mask = torch.ones(
             batch_size, 1,
             dtype=torch.long
         ).to(self.model.device)
@@ -191,48 +235,34 @@ class DeepSeekONNXExporter:
         # Output path
         onnx_path = self.output_dir / "deepseek_finetuned.onnx"
         
+        wrapper = VLExportWrapper(self.model).eval()
+        
         try:
-            # Try exporting with image input only
+            # Positional args match VLExportWrapper.forward exactly:
+            # (pixel_values, input_ids, attention_mask) - and input_names
+            # lists that same order.
             torch.onnx.export(
-                self.model,
-                (dummy_image,),
+                wrapper,
+                (dummy_image, dummy_input_ids, dummy_attention_mask),
                 str(onnx_path),
-                input_names=['pixel_values'],
+                input_names=['pixel_values', 'input_ids', 'attention_mask'],
                 output_names=['logits'],
                 dynamic_axes={
                     'pixel_values': {0: 'batch_size'},
+                    'input_ids': {0: 'batch_size', 1: 'sequence'},
+                    'attention_mask': {0: 'batch_size', 1: 'sequence'},
                     'logits': {0: 'batch_size'}
                 },
                 opset_version=opset_version,
                 do_constant_folding=True,
             )
         except Exception as e:
-            print(f"  ⚠ Simple export failed: {e}")
-            print("  Trying with combined inputs...")
-            
-            # Try with both image and text inputs
-            try:
-                torch.onnx.export(
-                    self.model,
-                    (dummy_input_ids, dummy_image),
-                    str(onnx_path),
-                    input_names=['input_ids', 'pixel_values'],
-                    output_names=['logits'],
-                    dynamic_axes={
-                        'input_ids': {0: 'batch_size', 1: 'sequence'},
-                        'pixel_values': {0: 'batch_size'},
-                        'logits': {0: 'batch_size'}
-                    },
-                    opset_version=opset_version,
-                    do_constant_folding=True,
-                )
-            except Exception as e2:
-                print(f"  ✗ ONNX export failed: {e2}")
-                print("\n  Note: Vision-Language models can be complex to export.")
-                print("  Consider using optimum library for better compatibility:")
-                print("    pip install optimum[exporters]")
-                print("    optimum-cli export onnx --model <model_path> --task causal-lm-with-past <output>")
-                raise
+            print(f"  ✗ ONNX export failed: {e}")
+            print("\n  Note: Vision-Language models can be complex to export.")
+            print("  Consider using optimum library for better compatibility:")
+            print("    pip install optimum[exporters]")
+            print("    optimum-cli export onnx --model <model_path> --task causal-lm-with-past <output>")
+            raise
         
         print(f"  ✓ ONNX model saved: {onnx_path}")
         
@@ -284,7 +314,14 @@ class DeepSeekONNXExporter:
         print(f"  ✓ Metadata saved: {metadata_path}")
     
     def test_inference(self, test_image_path: Optional[str] = None):
-        """Test ONNX inference with a sample image."""
+        """
+        Test ONNX inference with dummy inputs built from the graph itself.
+        
+        The feed is constructed from the exported model's OWN input
+        metadata (session.get_inputs() names, shapes, dtypes): a graph
+        exported in float16 rejects a float32 feed, and every declared
+        input needs a tensor - not just the first one.
+        """
         try:
             import onnxruntime as ort
             import numpy as np
@@ -294,21 +331,39 @@ class DeepSeekONNXExporter:
             onnx_path = self.output_dir / "deepseek_finetuned.onnx"
             session = ort.InferenceSession(str(onnx_path))
             
-            # Get input info
-            input_info = session.get_inputs()[0]
-            print(f"  Input: {input_info.name}, shape: {input_info.shape}")
+            onnx_to_numpy = {
+                'tensor(float)': np.float32,
+                'tensor(float16)': np.float16,
+                'tensor(double)': np.float64,
+                'tensor(int64)': np.int64,
+                'tensor(int32)': np.int32,
+                'tensor(bool)': np.bool_,
+            }
             
-            # Create dummy input
-            input_shape = input_info.shape
-            if isinstance(input_shape[2], int) and isinstance(input_shape[3], int):
-                h, w = input_shape[2], input_shape[3]
-            else:
-                h, w = 384, 384
-            
-            dummy_input = np.random.randn(1, 3, h, w).astype(np.float32)
+            feed = {}
+            for input_info in session.get_inputs():
+                print(f"  Input: {input_info.name}, shape: "
+                      f"{input_info.shape}, dtype: {input_info.type}")
+                if input_info.type not in onnx_to_numpy:
+                    raise RuntimeError(
+                        f"ONNX input {input_info.name} has unsupported "
+                        f"dtype {input_info.type}; extend the dtype map "
+                        f"in test_inference."
+                    )
+                dtype = onnx_to_numpy[input_info.type]
+                # Dynamic dims (None / symbolic names) become 1.
+                shape = [dim if isinstance(dim, int) and dim > 0 else 1
+                         for dim in input_info.shape]
+                if np.issubdtype(dtype, np.floating):
+                    feed[input_info.name] = (
+                        np.random.randn(*shape).astype(dtype))
+                else:
+                    # Integer/bool inputs: ones are valid token ids and a
+                    # sane attention mask; zeros-masks can degenerate.
+                    feed[input_info.name] = np.ones(shape, dtype=dtype)
             
             # Run inference
-            outputs = session.run(None, {input_info.name: dummy_input})
+            outputs = session.run(None, feed)
             
             print(f"  ✓ Inference successful")
             print(f"  Output shape: {outputs[0].shape}")

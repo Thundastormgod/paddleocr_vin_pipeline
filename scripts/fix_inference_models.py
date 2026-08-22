@@ -30,6 +30,12 @@ sys.path.insert(0, str(project_root))
 # VIN characters (excludes I, O, Q as per ISO 3779)
 VIN_CHARSET = "0123456789ABCDEFGHJKLMNPRSTUVWXYZ"
 
+# Global.model_name stamped into every yml written by this repository -
+# both by this script (below) and by the trainer's _create_inference_config
+# (src/vin_ocr/training/finetune_paddleocr.py). It marks a repo-trained
+# CUSTOM-architecture checkpoint.
+REPO_CUSTOM_MODEL_NAME = 'VIN_Recognition_Model'
+
 
 def create_inference_yml(inference_dir: Path, num_classes: int = 34) -> bool:
     """
@@ -44,7 +50,7 @@ def create_inference_yml(inference_dir: Path, num_classes: int = 34) -> bool:
     """
     config = {
         'Global': {
-            'model_name': 'VIN_Recognition_Model',
+            'model_name': REPO_CUSTOM_MODEL_NAME,
             'model_type': 'rec',
             'algorithm': 'SVTR_LCNet',
             'Transform': None,
@@ -69,7 +75,11 @@ def create_inference_yml(inference_dir: Path, num_classes: int = 34) -> bool:
         },
         'PostProcess': {
             'name': 'CTCLabelDecode',
-            'character_dict_path': './vin_dict.txt',
+            # Resolved against the yml's own directory, NEVER left as a
+            # CWD-relative './vin_dict.txt': consumers resolve relative
+            # paths against their process CWD, so the old value only
+            # worked when the consumer happened to run inside this dir.
+            'character_dict_path': str((inference_dir / 'vin_dict.txt').resolve()),
             'use_space_char': False,
         },
     }
@@ -82,6 +92,43 @@ def create_inference_yml(inference_dir: Path, num_classes: int = 34) -> bool:
     except Exception as e:
         print(f"  ❌ Failed to create config: {e}")
         return False
+
+
+def checkpoint_is_stock_architecture(inference_dir: Path,
+                                     yml_preexisted: bool) -> bool:
+    """
+    True only when the checkpoint plausibly IS a stock PaddleOCR zoo model
+    that the v5 API can construct and load.
+    
+    Every training pipeline in this repository exports CUSTOM
+    architectures (finetune_paddleocr.py: LCNetV3-SVTR-CTC,
+    HGNetV2-SVTR-CTC, Rosetta-ResNet34vd - the stock API's model zoo
+    cannot construct their parameter structure; the stock names in the
+    yml's Architecture section are boilerplate, not the checkpoint's real
+    graph). Both the trainer and this script stamp
+    Global.model_name = 'VIN_Recognition_Model' into the ymls they write,
+    so:
+    
+    - a yml this script just created  -> repo provenance -> custom;
+    - a pre-existing yml with the repo stamp -> repo provenance -> custom;
+    - only a pre-existing yml WITHOUT the stamp (shipped by official
+      tooling alongside the model) counts as stock.
+    """
+    if not yml_preexisted:
+        return False
+    config_path = inference_dir / 'inference.yml'
+    try:
+        with open(config_path) as f:
+            config = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as e:
+        print(f"  ⚠️  Could not read {config_path}: {e}")
+        return False
+    if not isinstance(config, dict):
+        return False
+    global_section = config.get('Global') or {}
+    if not isinstance(global_section, dict):
+        return False
+    return global_section.get('model_name') != REPO_CUSTOM_MODEL_NAME
 
 
 def create_vin_dict(inference_dir: Path) -> bool:
@@ -110,19 +157,24 @@ def fix_inference_directory(inference_dir: Path) -> dict:
     result = {
         'path': str(inference_dir),
         'has_pdmodel': False,
+        'has_json': False,
         'has_pdiparams': False,
         'has_yml': False,
         'has_dict': False,
         'fixed_yml': False,
         'fixed_dict': False,
+        'stock_architecture': False,
         'usable': False,
     }
     
-    # Check existing files
+    # Check existing files (.json is the PIR-era static graph program)
     result['has_pdmodel'] = (inference_dir / 'inference.pdmodel').exists()
+    result['has_json'] = (inference_dir / 'inference.json').exists()
     result['has_pdiparams'] = (inference_dir / 'inference.pdiparams').exists()
     result['has_yml'] = (inference_dir / 'inference.yml').exists()
     result['has_dict'] = (inference_dir / 'vin_dict.txt').exists()
+    
+    yml_preexisted = result['has_yml']
     
     # Fix missing yml
     if not result['has_yml']:
@@ -136,8 +188,21 @@ def fix_inference_directory(inference_dir: Path) -> dict:
             result['fixed_dict'] = True
             result['has_dict'] = True
     
-    # Check if usable
-    result['usable'] = result['has_pdiparams'] and result['has_yml'] and result['has_dict']
+    # "USABLE with PaddleOCR v5 API" requires a checkpoint the stock API
+    # can actually construct (stock architecture) AND load (a static
+    # graph program plus params plus config plus dict). Repo-trained
+    # custom-architecture checkpoints must never get this verdict: the
+    # stock zoo cannot rebuild their parameter structure, whatever the
+    # boilerplate yml claims.
+    result['stock_architecture'] = checkpoint_is_stock_architecture(
+        inference_dir, yml_preexisted)
+    result['usable'] = (
+        result['stock_architecture']
+        and (result['has_pdmodel'] or result['has_json'])
+        and result['has_pdiparams']
+        and result['has_yml']
+        and result['has_dict']
+    )
     
     return result
 
@@ -203,14 +268,16 @@ def main():
         result = fix_inference_directory(inference_dir)
         
         # Print status
+        has_graph = result['has_pdmodel'] or result['has_json']
         status_icons = {
-            'has_pdmodel': '✅' if result['has_pdmodel'] else '⚠️ ',
+            'has_graph': '✅' if has_graph else '⚠️ ',
             'has_pdiparams': '✅' if result['has_pdiparams'] else '❌',
             'has_yml': '✅' if result['has_yml'] else '❌',
             'has_dict': '✅' if result['has_dict'] else '❌',
         }
         
-        print(f"   {status_icons['has_pdmodel']} inference.pdmodel {'(optional)' if not result['has_pdmodel'] else ''}")
+        graph_name = 'inference.json' if result['has_json'] else 'inference.pdmodel'
+        print(f"   {status_icons['has_graph']} {graph_name} {'(missing static graph)' if not has_graph else ''}")
         print(f"   {status_icons['has_pdiparams']} inference.pdiparams")
         print(f"   {status_icons['has_yml']} inference.yml {'(created)' if result['fixed_yml'] else ''}")
         print(f"   {status_icons['has_dict']} vin_dict.txt {'(created)' if result['fixed_dict'] else ''}")
@@ -221,6 +288,10 @@ def main():
         if result['usable']:
             usable_count += 1
             print(f"   ✅ USABLE with PaddleOCR v5 API")
+        elif not result['stock_architecture'] and result['has_pdiparams']:
+            print(f"   ⚠️  Repo-trained CUSTOM architecture - the stock "
+                  f"PaddleOCR v5 API cannot construct it. Serve it with "
+                  f"this repo's paddle/ONNX inference modules instead.")
         else:
             print(f"   ❌ NOT USABLE - missing required files")
         

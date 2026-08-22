@@ -165,7 +165,7 @@ def run_inference(model_path: str, image_path: str = None, image_dir: str = None
         print(f"{'Image':<40} {'VIN':<20} {'Conf':>8} {'Valid':>6}")
         print("-" * 76)
         
-        for img, result in zip(images, results):
+        for img, result in zip(images, results, strict=True):
             img_name = Path(img).name[:38]
             status = "✅" if result['is_valid'] else "❌"
             print(f"{img_name:<40} {result['vin']:<20} {result['confidence']:>8.4f} {status:>6}")
@@ -275,7 +275,7 @@ def main():
     infer_parser.add_argument('--dir', '-d', help='Directory of images')
     
     # Check command
-    check_parser = subparsers.add_parser('check', help='Check dependencies')
+    subparsers.add_parser('check', help='Check dependencies')
     
     args = parser.parse_args()
     

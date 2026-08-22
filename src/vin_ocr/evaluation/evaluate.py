@@ -32,19 +32,23 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
-# Add parent directory for imports
-sys.path.insert(0, str(Path(__file__).parent))
-
-from src.vin_ocr.pipeline.vin_pipeline import VINOCRPipeline, validate_vin
+# Package-relative imports only. This module previously did
+# sys.path.insert(0, <this evaluation/ directory>), which put the sibling
+# modules metrics.py / errors.py / cli.py at the FRONT of sys.path where
+# they shadowed any top-level package of the same name for the whole
+# process. It also imported the repo-root config.py (unused here), which
+# broke the console entry point from any CWD without the repo root on the
+# path - the documented policy is that config is imported lazily, only
+# where actually needed (see create_splits).
+from ..pipeline.vin_pipeline import VINOCRPipeline
 
 # Import from shared utilities (Single Source of Truth)
-from src.vin_ocr.core.vin_utils import (
+from ..core.vin_utils import (
     extract_vin_from_filename,
     VIN_LENGTH,
     VIN_VALID_CHARS,
     levenshtein_distance,
 )
-from config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -245,7 +249,15 @@ def create_splits(
 def load_splits(split_dir: str, data_dir: str) -> Dict[str, DatasetSplit]:
     """
     Load existing splits from files.
-    
+
+    Label lines are validated AT PARSE TIME: a malformed line (blank VIN,
+    extra tab, or a tab-less filename no VIN can be extracted from) is
+    skipped, logged, counted and reported in the per-split summary, and the
+    evaluation continues over the well-formed rows. Previously a tab-less
+    line stored ``ground_truths[path] = None``, which crashed the evaluator
+    much later - outside any error handling - with ``TypeError: object of
+    type 'NoneType' has no len()``. No ``None`` ground truth can be stored.
+
     Args:
         split_dir: Directory containing split files
         data_dir: Directory containing images
@@ -262,15 +274,31 @@ def load_splits(split_dir: str, data_dir: str) -> Dict[str, DatasetSplit]:
         if split_file.exists():
             image_paths = []
             ground_truths = {}
+            malformed_lines = 0
             
             with open(split_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
+                for line_no, raw_line in enumerate(f, start=1):
+                    line = raw_line.strip()
+                    if not line:
+                        continue
                     if '\t' in line:
-                        filename, vin = line.split('\t')
+                        filename, _, vin = line.partition('\t')
+                        filename = filename.strip()
+                        vin = vin.strip()
+                        if '\t' in vin:
+                            # More than one tab: not "<filename>\t<VIN>".
+                            vin = ''
                     else:
                         filename = line
                         vin = extract_vin_from_filename(filename)
+                    
+                    if not filename or not vin:
+                        malformed_lines += 1
+                        logger.warning(
+                            "Skipping malformed label line %d in %s: %r",
+                            line_no, split_file, line
+                        )
+                        continue
                     
                     img_path = str(data_path / filename)
                     if Path(img_path).exists():
@@ -282,7 +310,10 @@ def load_splits(split_dir: str, data_dir: str) -> Dict[str, DatasetSplit]:
                 image_paths=image_paths,
                 ground_truths=ground_truths
             )
-            print(f"Loaded {split_name} split: {len(image_paths)} samples")
+            summary = f"Loaded {split_name} split: {len(image_paths)} samples"
+            if malformed_lines:
+                summary += f" ({malformed_lines} malformed label line(s) skipped)"
+            print(summary)
     
     return splits
 
@@ -539,9 +570,15 @@ class VINEvaluator:
             edit_distances = [levenshtein_distance(p, r) for p, r in zip(predictions, references, strict=True)]
             metrics.mean_edit_distance = sum(edit_distances) / len(edit_distances)
             
+            # House definition of NED (shared with evaluation.metrics):
+            # per-sample edit_distance / max(len(reference), 1), averaged
+            # with every sample weighing equally. The denominator is the
+            # REFERENCE length - this previously divided by
+            # max(len(pred), len(ref)), publishing different math from
+            # metrics.py under the same field name.
             ned_values = [
-                ed / max(len(p), len(r)) if max(len(p), len(r)) > 0 else 0.0
-                for ed, p, r in zip(edit_distances, predictions, references)
+                ed / max(len(r), 1)
+                for ed, r in zip(edit_distances, references, strict=True)
             ]
             metrics.normalized_edit_distance = sum(ned_values) / len(ned_values)
             

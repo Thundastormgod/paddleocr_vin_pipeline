@@ -47,6 +47,7 @@ Date: January 2026
 import json
 import time
 from dataclasses import dataclass, field, asdict
+from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple, Any, Set
 from collections import defaultdict
 from pathlib import Path
@@ -331,7 +332,10 @@ class CharacterLevelMetrics:
     
     # Core metrics
     char_accuracy: float = 0.0
-    char_error_rate: float = 0.0  # CER
+    # CER is CORPUS-level: sum(edit distances) / sum(reference lengths).
+    # Samples with longer references weigh more; 0.0 when there are no
+    # reference characters (empty set = no measured error).
+    char_error_rate: float = 0.0
     
     # F1 scores
     f1_micro: float = 0.0
@@ -344,7 +348,12 @@ class CharacterLevelMetrics:
     # Edit distance metrics
     total_edit_distance: int = 0
     avg_edit_distance: float = 0.0
-    normalized_edit_distance: float = 0.0  # NED
+    # NED is the mean of PER-SAMPLE normalized edit distance:
+    # mean_i(edit_distance_i / max(len(gt_i), 1)) - every sample weighs
+    # equally (the house definition, shared with evaluate.py). 0.0 when
+    # there are no samples. This deliberately differs from char_error_rate,
+    # which is corpus-weighted by reference length.
+    normalized_edit_distance: float = 0.0
     
     # Per-position accuracy (for VIN: positions 1-17)
     position_accuracy: Dict[int, float] = field(default_factory=dict)
@@ -471,10 +480,24 @@ class EvaluationMetricsCalculator:
         predictions: List[str],
         ground_truth: List[str]
     ) -> None:
-        """Add a batch of predictions."""
+        """
+        Add a batch of predictions.
+
+        Raises:
+            ValueError: If the two lists differ in length (checked BEFORE
+                anything is added, so a mismatch cannot leave the calculator
+                partially updated). The unchecked zip here previously
+                truncated the longer list silently - the exact defect class
+                evaluate.py guards against with strict zips everywhere.
+        """
+        if len(predictions) != len(ground_truth):
+            raise ValueError(
+                f"add_batch length mismatch: {len(predictions)} predictions "
+                f"vs {len(ground_truth)} ground truths"
+            )
         if self.start_time is None:
             self.start_time = time.time()
-        for pred, true in zip(predictions, ground_truth):
+        for pred, true in zip(predictions, ground_truth, strict=True):
             self.add_sample(pred, true)
     
     def compute(self) -> EvaluationMetrics:
@@ -506,7 +529,7 @@ class EvaluationMetricsCalculator:
         """Compute image-level (exact match) metrics."""
         total = len(self.predictions)
         correct = sum(
-            1 for p, t in zip(self.predictions, self.ground_truth)
+            1 for p, t in zip(self.predictions, self.ground_truth, strict=True)
             if p == t
         )
         failed = total - correct
@@ -521,10 +544,36 @@ class EvaluationMetricsCalculator:
         )
     
     def _compute_character_level(self) -> CharacterLevelMetrics:
-        """Compute character-level metrics."""
+        """
+        Compute character-level metrics.
+
+        Error-rate definitions (the house definitions, shared with
+        evaluate.py - keep them in sync):
+
+        - ``char_error_rate`` (CER) is CORPUS-level::
+
+              sum_i(levenshtein(pred_i, gt_i)) / sum_i(len(gt_i))
+
+          Samples with longer references weigh more; the value can exceed
+          1.0 for grossly over-long predictions. Empty set (no reference
+          characters) -> 0.0: no samples means no measured error.
+
+        - ``normalized_edit_distance`` (NED) is the mean of PER-SAMPLE NED::
+
+              mean_i(levenshtein(pred_i, gt_i) / max(len(gt_i), 1))
+
+          Every sample weighs equally regardless of reference length,
+          matching evaluate.py's per-sample semantics. Empty set -> 0.0.
+
+        These two previously shared numerator AND denominator (one number
+        under two names) with contradictory empty-set fallbacks (0.0 vs
+        1.0), while evaluate.py published different math under the same
+        field name.
+        """
         total_chars = 0
         correct_chars = 0
         total_edit_dist = 0
+        sample_edit_distances: List[int] = []
         position_correct: Dict[int, int] = defaultdict(int)
         position_total: Dict[int, int] = defaultdict(int)
         
@@ -533,25 +582,29 @@ class EvaluationMetricsCalculator:
         char_fp: Dict[str, int] = defaultdict(int)
         char_fn: Dict[str, int] = defaultdict(int)
         
-        for pred, true in zip(self.predictions, self.ground_truth):
+        for pred, true in zip(self.predictions, self.ground_truth, strict=True):
             # Edit distance
             edit_dist = self._levenshtein(pred, true)
             total_edit_dist += edit_dist
+            sample_edit_distances.append(edit_dist)
 
             # --- Positional comparison -------------------------------------
             # Used ONLY for per-position accuracy and char_accuracy, which are
             # inherently positional quantities. It is deliberately NOT used for
             # F1: a single insertion shifts every later position and would
             # collapse the score (see _compute_f1_scores docstring).
-            max_len = max(len(pred), len(true))
-            for i in range(max_len):
+            #
+            # Positions are counted over REFERENCE positions only. Iterating
+            # max(len(pred), len(true)) fabricated positions past the
+            # reference (a "position 18+" of a 17-character VIN) whenever a
+            # prediction carried trailing insertions, and those phantom
+            # positions inflated every denominator. Insertions still cost
+            # CER/NED and precision - they just cannot invent positions the
+            # reference does not have.
+            for i, true_char in enumerate(true):
                 position_total[i + 1] += 1
                 total_chars += 1
-
-                pred_char = pred[i] if i < len(pred) else ''
-                true_char = true[i] if i < len(true) else ''
-
-                if pred_char == true_char:
+                if i < len(pred) and pred[i] == true_char:
                     correct_chars += 1
                     position_correct[i + 1] += 1
 
@@ -569,12 +622,12 @@ class EvaluationMetricsCalculator:
         # Calculate metrics
         char_accuracy = correct_chars / total_chars if total_chars > 0 else 0.0
 
-        # Character Error Rate is an EDIT-distance quantity: (S+D+I)/N.
+        # Character Error Rate is an EDIT-distance quantity: (S+D+I)/N,
+        # CORPUS-level (summed distances over summed reference lengths).
         # It was previously defined as 1 - positional_accuracy, which is a
         # different measure entirely: for a single leading insertion that
-        # formula reported CER=0.882 while the correct value (and the NED
-        # computed a few lines below, from the same edit distance) was 0.118.
-        # The object therefore reported two contradictory error rates.
+        # formula reported CER=0.882 while the correct value was 0.118.
+        # Empty set -> 0.0 (no reference characters = no measured error).
         total_true_len_for_cer = sum(len(t) for t in self.ground_truth)
         char_error_rate = (
             total_edit_dist / total_true_len_for_cer
@@ -592,9 +645,22 @@ class EvaluationMetricsCalculator:
             char_tp, char_fp, char_fn
         )
         
-        # Normalized edit distance
-        total_true_len = sum(len(t) for t in self.ground_truth)
-        ned = total_edit_dist / total_true_len if total_true_len > 0 else 1.0
+        # Normalized edit distance: mean of PER-SAMPLE NED (the house
+        # definition, matching evaluate.py) - each sample contributes
+        # edit_distance / max(len(gt), 1) and weighs equally in the mean.
+        # Empty set -> 0.0. This was previously a byte-for-byte duplicate
+        # of char_error_rate above (same numerator, same denominator) with
+        # a contradictory empty-set fallback of 1.0.
+        per_sample_ned = [
+            dist / max(len(true), 1)
+            for dist, true in zip(
+                sample_edit_distances, self.ground_truth, strict=True
+            )
+        ]
+        ned = (
+            sum(per_sample_ned) / len(per_sample_ned)
+            if per_sample_ned else 0.0
+        )
         
         return CharacterLevelMetrics(
             total_characters=total_chars,
@@ -645,33 +711,59 @@ class EvaluationMetricsCalculator:
         return f1_micro, macro_f1(counts), micro_precision, micro_recall
     
     def _compute_per_class(self) -> Tuple[Dict[str, float], Dict[str, int]]:
-        """Compute per-character class accuracy."""
-        class_correct: Dict[str, int] = defaultdict(int)
-        class_total: Dict[str, int] = defaultdict(int)
-        
-        for pred, true in zip(self.predictions, self.ground_truth):
-            for i, true_char in enumerate(true):
-                class_total[true_char] += 1
-                if i < len(pred) and pred[i] == true_char:
-                    class_correct[true_char] += 1
-        
-        per_class_accuracy = {
-            char: class_correct[char] / class_total[char]
-            for char in class_total
-        }
-        
-        return per_class_accuracy, dict(class_total)
+        """
+        Compute per-character class accuracy from ALIGNMENT, not position.
+
+        A reference character counts as correct when the edit alignment
+        (core.char_metrics.alignment_counts - the same opcode mapping used
+        for F1) places it in an 'equal' block, i.e. per-class accuracy is
+        tp / (tp + fn) = per-class recall. The count per class is its
+        support in the references (tp + fn), exactly as before.
+
+        The previous positional ``pred[i] == true[i]`` comparison meant a
+        single leading-artifact insertion shifted every position and marked
+        every subsequent reference character wrong, contradicting this
+        module's own design comment on positional comparison.
+        """
+        totals = AlignmentCounts()
+        for pred, true in zip(self.predictions, self.ground_truth, strict=True):
+            totals.update(alignment_counts(pred, true))
+
+        per_class_accuracy: Dict[str, float] = {}
+        per_class_count: Dict[str, int] = {}
+        for char, bucket in totals.per_class.items():
+            support = bucket['tp'] + bucket['fn']
+            if support > 0:  # classes present in the references only
+                per_class_accuracy[char] = bucket['tp'] / support
+                per_class_count[char] = support
+
+        return per_class_accuracy, per_class_count
     
     def _compute_confusion_pairs(self) -> List[Tuple[str, str, int]]:
-        """Find most commonly confused character pairs."""
+        """
+        Find most commonly confused (predicted, true) SUBSTITUTION pairs.
+
+        Pairs are read off the same SequenceMatcher opcodes that
+        core.char_metrics.alignment_counts uses (same argument order, same
+        autojunk=False): only 'replace' blocks yield confusion pairs, with
+        characters paired positionally WITHIN the block. A length mismatch
+        inside a replace block leaves the overhang as pure insertion or
+        deletion - not a confusion between two characters - so that inner
+        zip is intentionally non-strict.
+
+        The previous positional zip fabricated pairs: one leading-artifact
+        insertion shifted every position and reported a full column of
+        spurious "confusions" between characters the model never confused.
+        """
         confusion: Dict[Tuple[str, str], int] = defaultdict(int)
         
-        for pred, true in zip(self.predictions, self.ground_truth):
-            for i, true_char in enumerate(true):
-                if i < len(pred):
-                    pred_char = pred[i]
-                    if pred_char != true_char:
-                        confusion[(pred_char, true_char)] += 1
+        for pred, true in zip(self.predictions, self.ground_truth, strict=True):
+            matcher = SequenceMatcher(None, pred, true, autojunk=False)
+            for tag, p0, p1, r0, r1 in matcher.get_opcodes():
+                if tag != 'replace':
+                    continue
+                for pred_char, true_char in zip(pred[p0:p1], true[r0:r1]):
+                    confusion[(pred_char, true_char)] += 1
         
         # Sort by frequency
         sorted_pairs = sorted(

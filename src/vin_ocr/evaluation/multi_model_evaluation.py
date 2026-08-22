@@ -32,7 +32,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
-# Add project root to path.
+# Add project root to path (needed for the `src.` imports below when this
+# file is executed as a plain script rather than with `-m`).
 #
 # This file lives at <root>/src/vin_ocr/evaluation/multi_model_evaluation.py,
 # so the repository root is parents[3]. It was previously `Path(__file__).parent`,
@@ -40,8 +41,15 @@ from dataclasses import dataclass
 # from it was therefore wrong: the fine-tuned checkpoint, the DeepSeek and ONNX
 # model search roots, and all three default dataset roots. `load_dataset()`
 # found zero images, `run_evaluation()` returned None, and the CLI still exited 0.
+#
+# APPENDED, not inserted at position 0, and only when absent: putting the
+# repo root AHEAD of everything else made top-level repo modules (config.py
+# and friends) shadow same-named installed packages for every subsequent
+# import in the process. At the end of sys.path the root still satisfies
+# the `src.` imports without granting repo-root modules import priority.
 project_root = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(project_root))
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
 
 # Import shared utilities (Single Source of Truth for VIN extraction)
 from src.vin_ocr.core.vin_utils import (
@@ -499,10 +507,38 @@ class MultiModelEvaluator:
             except Exception as e:
                 print(f"  ✗ ONNX model failed ({onnx_path.name}): {e}")
     
+    @staticmethod
+    def _looks_like_training_path(path_str: str) -> bool:
+        """True when any path component names training data (train*, e.g. train, training, train_images)."""
+        return any(
+            part.lower().startswith('train') for part in Path(path_str).parts
+        )
+
+    @staticmethod
+    def _print_train_contamination_warning(source: str) -> None:
+        """Unmissable banner: the requested evaluation source is training data."""
+        bar = "!" * 78
+        print(f"\n{bar}")
+        print("!!  WARNING: EVALUATION SET CONTAINS TRAINING DATA")
+        print(f"!!  Requested source: {source}")
+        print("!!  For any model FINE-TUNED on this data, every number below is")
+        print("!!  CONTAMINATED: it measures memorisation, not recognition.")
+        print("!!  Use the test/val splits to score fine-tuned models.")
+        print(f"{bar}\n")
+
     def load_dataset(self, custom_folder: Optional[str] = None, labels_file: Optional[str] = None) -> List[Tuple[str, str]]:
         """
         Load VIN images with their ground truth labels.
-        
+
+        The DEFAULT dataset is drawn from held-out locations only
+        (dagshub_data/{test,val}/images and dataset/{test,val}). Training
+        images (dagshub_data/train/images) were previously pooled in here,
+        so every fine-tuned model was partly scored on its own training
+        data and the headline accuracy measured memorisation. Training
+        data is never a default evaluation set: if a train directory is
+        requested explicitly (via custom_folder or a labels file pointing
+        at train images), an unmissable contamination warning is printed.
+
         Args:
             custom_folder: Path to custom image folder (VIN extracted from filename)
             labels_file: Path to labels file with format: image_path\\tVIN
@@ -526,6 +562,10 @@ class MultiModelEvaluator:
                             if Path(img_path).exists() and len(vin) == 17:
                                 dataset.append((img_path, vin))
                 print(f"  Loaded {len(dataset)} images from labels file: {labels_file}")
+                if self._looks_like_training_path(labels_file) or any(
+                    self._looks_like_training_path(p) for p, _ in dataset
+                ):
+                    self._print_train_contamination_warning(labels_file)
                 return dataset
             else:
                 print(f"  WARNING: Labels file not found: {labels_file}")
@@ -541,35 +581,26 @@ class MultiModelEvaluator:
                         if vin and len(vin) == 17:
                             dataset.append((str(img_path), vin))
                 print(f"  Found {len(dataset)} images in custom folder: {custom_folder}")
+                if self._looks_like_training_path(custom_folder):
+                    self._print_train_contamination_warning(custom_folder)
                 return dataset
             else:
                 print(f"  WARNING: Custom folder not found: {custom_folder}")
         
-        # Default: Load from standard dataset locations
-        # Check dagshub_data/test/images
-        test_dir = project_root / "dagshub_data" / "test" / "images"
-        if test_dir.exists():
-            for img_path in test_dir.glob("*.jpg"):
+        # Default: held-out TEST/VAL locations ONLY - never train
+        # (dagshub_data/train/images used to be pooled in here; see the
+        # docstring for why that invalidated every fine-tuned score).
+        default_dirs = [
+            project_root / "dagshub_data" / "test" / "images",
+            project_root / "dagshub_data" / "val" / "images",
+            project_root / "dataset" / "test",
+            project_root / "dataset" / "val",
+        ]
+        for eval_dir in default_dirs:
+            if not eval_dir.exists():
+                continue
+            for img_path in eval_dir.glob("*.jpg"):
                 # Extract VIN from filename (format: VIN_...-VIN_-_VIN_.jpg)
-                filename = img_path.stem
-                # Try to extract VIN from filename
-                vin = extract_vin_from_filename(filename)
-                if vin and len(vin) == 17:
-                    dataset.append((str(img_path), vin))
-        
-        # Check dagshub_data/train/images  
-        train_dir = project_root / "dagshub_data" / "train" / "images"
-        if train_dir.exists():
-            for img_path in train_dir.glob("*.jpg"):
-                filename = img_path.stem
-                vin = extract_vin_from_filename(filename)
-                if vin and len(vin) == 17:
-                    dataset.append((str(img_path), vin))
-        
-        # Check original dataset folder
-        orig_test = project_root / "dataset" / "test"
-        if orig_test.exists():
-            for img_path in orig_test.glob("*.jpg"):
                 filename = img_path.stem
                 vin = extract_vin_from_filename(filename)
                 if vin and len(vin) == 17:
@@ -757,7 +788,9 @@ class MultiModelEvaluator:
         Raises:
             ModelExecutionError: If the image cannot be read.
             ModelUnavailableError: If the exported model's input contract is
-                not the expected 4-D vision input.
+                not the expected 4-D vision input, or its output is not an
+                interpretable logits tensor ([T, C] or [1, T, C] with the
+                canonical charset's class count).
         """
         import cv2
         import numpy as np
@@ -807,49 +840,58 @@ class MultiModelEvaluator:
         output_names = [o.name for o in session.get_outputs()]
         outputs = session.run(output_names, {input_name: input_data})
 
-        # Decode output
-        # For VLM models, output is typically token IDs that need decoding
-        output = outputs[0]
+        # Decode output through the canonical CTC convention (blank at
+        # index 0, core.charset). Accepted output contracts: a logits
+        # tensor [T, C] or [N, T, C] with N == 1 (we fed a batch of one)
+        # whose class dimension matches the canonical charset. Anything
+        # else is an uninterpretable export contract and is reported as an
+        # explicit error - never turned into a fabricated prediction.
+        #
+        # The previous branches: cast raw logit FLOATS to int as CTC class
+        # ids (no argmax) whenever C <= 100; "decoded" vocabulary token ids
+        # as ASCII bytes, silently dropping every id >= 127; fell back to
+        # str(output), handing extract_vin_from_text an ndarray repr to
+        # fabricate a VIN from; and reported the mean raw logit as a
+        # probability (printed as e.g. 830%).
+        from src.vin_ocr.core.charset import BLANK_INDEX, ctc_greedy_decode
 
-        # If output is logits, decode them
-        if len(output.shape) >= 2:
-            if output.shape[-1] > 100:  # Likely vocabulary logits
-                # Use argmax to get token IDs
-                pred_indices = np.argmax(output, axis=-1)
+        logits = np.asarray(outputs[0])
+        if logits.ndim == 3 and logits.shape[0] == 1:
+            logits = logits[0]
+        if logits.ndim != 2:
+            raise ModelUnavailableError(
+                f"exported DeepSeek model output has shape "
+                f"{np.asarray(outputs[0]).shape}; expected logits [T, C] or "
+                f"[1, T, C] - cannot decode honestly"
+            )
 
-                # Simple ASCII-based decoding for VIN characters
-                # Fine-tuned model should output VIN-like text
-                decoded_chars = []
-                for idx in pred_indices.flatten():
-                    if 32 <= idx < 127:  # Printable ASCII
-                        decoded_chars.append(chr(idx))
-                raw_text = ''.join(decoded_chars)
-            else:
-                # Small output dimension: treat as CTC class indices and
-                # decode with the canonical dict (blank at index 0). The
-                # previous branch indexed a blankless local charset, which
-                # shifts every character for models trained with the
-                # canonical mapping.
-                from src.vin_ocr.core.charset import (
-                    BLANK_INDEX,
-                    ctc_greedy_decode,
-                )
-                raw_text, _ = ctc_greedy_decode(
-                    [int(i) for i in output.flatten()],
-                    self._get_ctc_char_dict(),
-                    blank_index=BLANK_INDEX,
-                )
-        else:
-            raw_text = str(output)
+        idx_to_char = self._get_ctc_char_dict()
+        n_classes = logits.shape[-1]
+        if n_classes != len(idx_to_char):
+            raise ModelUnavailableError(
+                f"exported DeepSeek model emits {n_classes} classes but the "
+                f"canonical charset has {len(idx_to_char)} (blank at index "
+                f"0); re-export with the repo charset - refusing to decode "
+                f"with a mismatched alphabet"
+            )
+
+        pred_indices = np.argmax(logits, axis=-1)
+        raw_text, kept_positions = ctc_greedy_decode(
+            pred_indices, idx_to_char, blank_index=BLANK_INDEX
+        )
+
+        # Confidence: mean softmax probability of the argmax path over the
+        # emitted characters - a genuine probability in [0, 1].
+        exp = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        probs = exp / exp.sum(axis=-1, keepdims=True)
+        step_max = probs.max(axis=-1)
+        confidence = (
+            float(np.mean([step_max[t] for t in kept_positions]))
+            if kept_positions else 0.0
+        )
 
         # Extract VIN from decoded text
         vin = VINCharValidator.extract_vin_from_text(raw_text)
-
-        # Calculate confidence from output probabilities
-        if len(outputs) > 0 and hasattr(outputs[0], 'shape'):
-            confidence = float(np.mean(np.max(outputs[0], axis=-1))) if outputs[0].size > 0 else 0.0
-        else:
-            confidence = 0.5  # Default confidence
 
         return vin[:17] if vin else '', confidence
     
@@ -1001,12 +1043,28 @@ class MultiModelEvaluator:
                 # An evaluation crash is an absence of measurement, not an
                 # observation of an empty prediction. Record it as an error
                 # and keep it OUT of every metric denominator.
+                #
+                # The row still carries the FULL result schema with neutral
+                # values: _print_comparison and the CSV writers index these
+                # keys directly, and a reduced-schema row used to KeyError
+                # both consumers mid-report - losing the results for the
+                # exact case the error machinery exists to survive.
+                # 'status' == 'error' remains the discriminator; the neutral
+                # values are placeholders, never measurements (this row is
+                # excluded from every denominator above).
                 evaluation_errors += 1
                 sample_results.append({
                     'image': Path(img_path).name,
                     'ground_truth': gt_vin,
                     'status': 'error',
                     'error': f"{type(exc).__name__}: {exc}",
+                    'prediction': '',
+                    'exact_match': False,
+                    'chars_correct': 0,
+                    'char_accuracy': 0.0,
+                    'match_pattern': '',
+                    'confidence': 0.0,
+                    'processing_time': 0.0,
                     'model_name': model_info['name'],
                     'model_type': model_info['type'],
                     'model_key': model_key,
@@ -1293,11 +1351,21 @@ class MultiModelEvaluator:
         if all_metrics:
             best = max(all_metrics.values(), key=lambda m: m.f1_micro)
             print(f"\n📋 SAMPLE RESULTS ({best.model_name}):")
+            # Defensive .get with typed defaults: an error row (or a row
+            # from an older results schema) must degrade to neutral values,
+            # never KeyError the report mid-print.
             for i, s in enumerate(best.sample_results[:10]):
-                status = "✓ EXACT" if s['exact_match'] else f"✗ {s['chars_correct']}/17"
-                print(f"   {i+1}. GT:   {s['ground_truth']}")
-                print(f"      Pred: {s['prediction']}")
-                print(f"      {s['match_pattern']} [{status}]")
+                print(f"   {i+1}. GT:   {s.get('ground_truth', '')}")
+                if s.get('status') == 'error':
+                    print(f"      [⚠ ERROR: {s.get('error', 'unknown')}]")
+                    print()
+                    continue
+                status = (
+                    "✓ EXACT" if s.get('exact_match', False)
+                    else f"✗ {s.get('chars_correct', 0)}/17"
+                )
+                print(f"      Pred: {s.get('prediction', '')}")
+                print(f"      {s.get('match_pattern', '')} [{status}]")
                 print()
     
     def _save_results(
@@ -1381,22 +1449,32 @@ class MultiModelEvaluator:
         
         print(f"📁 CSV saved to: {csv_path}")
         
-        # Save combined sample results CSV with model information
+        # Save combined sample results CSV with model information.
+        # Every field is read with .get and a typed default so an error row
+        # (or a row from an older schema) can never KeyError and truncate
+        # the CSV mid-write; 'status' and 'error' columns keep error rows
+        # distinguishable from genuine empty predictions.
         sample_results_path = self.output_dir / 'sample_results.csv'
         with open(sample_results_path, 'w') as f:
-            f.write("model_name,model_type,image,ground_truth,prediction,exact_match,chars_correct,char_accuracy,confidence,processing_time\n")
+            f.write("model_name,model_type,image,ground_truth,prediction,exact_match,chars_correct,char_accuracy,confidence,processing_time,status,error\n")
             for model_key, metrics in all_metrics.items():
                 for sample in metrics.sample_results:
+                    # Error text may contain the CSV delimiter or newlines.
+                    error_text = str(sample.get('error', '') or '')
+                    error_text = error_text.replace(',', ';')
+                    error_text = error_text.replace('\n', ' ').replace('\r', ' ')
                     f.write(f"{sample.get('model_name', metrics.model_name)},"
                            f"{sample.get('model_type', 'unknown')},"
-                           f"{sample['image']},"
-                           f"{sample['ground_truth']},"
-                           f"{sample['prediction']},"
-                           f"{sample['exact_match']},"
-                           f"{sample['chars_correct']},"
-                           f"{sample['char_accuracy']:.4f},"
-                           f"{sample['confidence']:.4f},"
-                           f"{sample['processing_time']:.4f}\n")
+                           f"{sample.get('image', '')},"
+                           f"{sample.get('ground_truth', '')},"
+                           f"{sample.get('prediction', '')},"
+                           f"{sample.get('exact_match', False)},"
+                           f"{sample.get('chars_correct', 0)},"
+                           f"{sample.get('char_accuracy', 0.0):.4f},"
+                           f"{sample.get('confidence', 0.0):.4f},"
+                           f"{sample.get('processing_time', 0.0):.4f},"
+                           f"{sample.get('status', 'measured')},"
+                           f"{error_text}\n")
         
         print(f"📁 Sample results saved to: {sample_results_path}")
 

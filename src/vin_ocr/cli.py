@@ -109,9 +109,10 @@ def cmd_serve(args):
     cmd = [sys.executable, "-m", "streamlit", "run", str(app_path), "--server.port", str(port)]
     
     print(f"Starting VIN OCR Web UI on port {port}...")
-    subprocess.run(cmd)
-    
-    return 0
+    # Propagate streamlit's exit status: a serve that failed (port in use,
+    # missing dependency, app crash) must not report success (W-L6).
+    proc = subprocess.run(cmd)
+    return proc.returncode
 
 
 def cmd_export(args):
@@ -188,9 +189,17 @@ def main():
     serve_parser = subparsers.add_parser('serve', help='Start web UI')
     serve_parser.add_argument('--port', '-p', type=int, default=8501, help='Port number')
     
-    # Export command
+    # Export command. The help documents what export_paddle_to_onnx actually
+    # accepts: an inference-model directory (or a .pdparams WITH a sibling
+    # .pdmodel). A bare training checkpoint (.pdparams alone) raises
+    # NotImplementedError in the exporter, so it must not be advertised.
     export_parser = subparsers.add_parser('export', help='Export model to ONNX')
-    export_parser.add_argument('model', help='Path to Paddle model (.pdparams)')
+    export_parser.add_argument(
+        'model',
+        help='Path to a Paddle inference model: a directory containing '
+             'inference.pdmodel + inference.pdiparams, or a .pdparams file '
+             'with a sibling .pdmodel. Bare training checkpoints (.pdparams '
+             'only) are not supported — export an inference model first.')
     export_parser.add_argument('output', help='Output directory for ONNX')
     export_parser.add_argument('--opset', type=int, default=11,
                                help='ONNX opset version (default: 11)')

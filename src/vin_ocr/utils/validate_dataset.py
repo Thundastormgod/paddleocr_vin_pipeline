@@ -27,8 +27,11 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# Add parent directory for imports
-sys.path.insert(0, str(Path(__file__).parent))
+# Add the repo root so `src.` imports resolve when run as a script
+# (this file lives at src/vin_ocr/utils/, three levels below the root).
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from src.vin_ocr.pipeline.vin_pipeline import validate_vin, VIN_LENGTH
 
@@ -51,7 +54,12 @@ class ValidationReport:
     vins_from_labels: int = 0
     filename_extraction_failed: int = 0
     
-    # VIN validity
+    # VIN validity - counted per UNIQUE VIN over both ground-truth sources
+    # (filename-derived and label-file VINs), NOT per image. invalid_checksum
+    # counts VINs whose ISO 3779 check digit fails; per the policy documented
+    # in validate_dataset(), checksum failure alone does not make a VIN
+    # invalid, so it can exceed the difference between checked and valid.
+    unique_vins_validated: int = 0
     valid_vins: int = 0
     invalid_length: int = 0
     invalid_chars: int = 0
@@ -61,7 +69,7 @@ class ValidationReport:
     filename_label_matches: int = 0
     filename_label_mismatches: int = 0
     
-    # Duplicates
+    # Duplicates - per-image effective VINs (filename first, label fallback)
     unique_vins: int = 0
     duplicate_vins: int = 0
     
@@ -111,9 +119,14 @@ def parse_label_file(filepath: str) -> Optional[str]:
         with open(filepath, 'r') as f:
             content = f.read().strip()
         
-        # Check if plain text VIN format
-        if content.startswith('*') or ('SAL' in content and len(content) < 30):
-            return content.replace('*', '').strip()
+        # Plain-text detection is STRUCTURAL, not keyed on a manufacturer
+        # prefix: either the starred plain format ('*<text>*') or a bare
+        # 17-character token from the VIN charset (I/O/Q excluded per
+        # ISO 3779). Uppercased so comparisons with filename-derived VINs
+        # (always uppercase) do not report spurious mismatches.
+        stripped = content.replace('*', '').strip().upper()
+        if content.startswith('*') or re.fullmatch(r'[A-HJ-NPR-Z0-9]{17}', stripped):
+            return stripped
         
         # Try YOLO format
         chars = []
@@ -153,6 +166,13 @@ def validate_vin_format_detailed(vin: str) -> Dict:
     Unlike vin_utils.validate_vin_format() which returns a simple bool,
     this function returns a detailed dict with specific issues found.
     
+    Checksum policy: an ISO 3779 checksum failure is recorded in 'issues'
+    but does NOT set is_valid=False. EU-market VINs (e.g. this dataset's
+    Land Rover 'SAL...' plates) do not reserve position 9 as a check digit
+    - that is a North American (49 CFR 565) requirement - so a checksum
+    failure is a data-quality signal, not proof of a wrong ground truth.
+    validate_dataset() counts every such VIN in report.invalid_checksum.
+    
     Args:
         vin: VIN string to validate
         
@@ -173,9 +193,10 @@ def validate_vin_format_detailed(vin: str) -> Dict:
     # Character check
     invalid_chars = set()
     for c in vin.upper():
-        if c in 'IOQ':
-            invalid_chars.add(c)
-        elif c not in '0123456789ABCDEFGHJKLMNPRSTUVWXYZ':
+        # I/O/Q are excluded from the valid charset below, so one
+        # membership test covers both the ISO 3779 exclusions and any
+        # other out-of-charset character.
+        if c not in '0123456789ABCDEFGHJKLMNPRSTUVWXYZ':
             invalid_chars.add(c)
     
     if invalid_chars:
@@ -208,6 +229,20 @@ def validate_dataset(
         data_dir: Directory containing images (and optionally labels)
         labels_dir: Separate labels directory (if not in data_dir)
         verbose: Print detailed output
+        
+    Counting policy:
+    - total_images/total_labels, vins_from_filename/vins_from_labels and
+      the duplicate stats are IMAGE-level counts (one observation per file;
+      the per-image effective VIN is the filename VIN, falling back to the
+      label-file VIN).
+    - The validity counters (unique_vins_validated, valid_vins,
+      invalid_length, invalid_chars, invalid_checksum) are per UNIQUE VIN
+      over BOTH sources: filename-derived and label-file VINs. Label VINs
+      are validated even when they disagree with the filename VIN, so a
+      corrupt label file shows up in the charset/length/checksum counters.
+    - invalid_checksum increments for every unique VIN failing the ISO 3779
+      check digit, but checksum failure alone does not mark a VIN invalid
+      (see validate_vin_format_detailed for the rationale).
         
     Returns:
         ValidationReport with findings
@@ -261,18 +296,24 @@ def validate_dataset(
         if vin_from_filename:
             filename_vins[stem] = vin_from_filename
             report.vins_from_filename += 1
-            all_vins.append(vin_from_filename)
         else:
             report.filename_extraction_failed += 1
             if verbose:
                 print(f"  Warning: Could not extract VIN from filename: {img_path.name}")
         
         # Extract VIN from label file (if exists)
+        vin_from_label = None
         if stem in labels:
             vin_from_label = parse_label_file(str(labels[stem]))
             if vin_from_label:
                 label_vins[stem] = vin_from_label
                 report.vins_from_labels += 1
+        
+        # Per-image effective VIN (filename first, label as fallback) feeds
+        # the image-level duplicate statistics.
+        effective_vin = vin_from_filename or vin_from_label
+        if effective_vin:
+            all_vins.append(effective_vin)
     
     # Check for missing files
     image_stems = set(images.keys())
@@ -303,18 +344,25 @@ def validate_dataset(
                     'label_vin': lbl_vin
                 })
     
-    # Validate VIN formats
-    for vin in set(all_vins):
+    # Validate VIN formats - per unique VIN, over BOTH sources (filename
+    # and label-file VINs; the latter previously went unvalidated).
+    vins_to_validate = set(all_vins) | set(label_vins.values())
+    report.unique_vins_validated = len(vins_to_validate)
+    for vin in sorted(vins_to_validate):
         validation = validate_vin_format_detailed(vin)
+        issues_text = str(validation['issues'])
+        # Checksum is counted UNCONDITIONALLY: it does not flip is_valid
+        # (see validate_vin_format_detailed), so counting it only inside
+        # the invalid branch left this counter permanently at 0.
+        if 'Invalid checksum' in issues_text:
+            report.invalid_checksum += 1
         if validation['is_valid']:
             report.valid_vins += 1
         else:
-            if 'Invalid length' in str(validation['issues']):
+            if 'Invalid length' in issues_text:
                 report.invalid_length += 1
-            if 'Invalid characters' in str(validation['issues']):
+            if 'Invalid characters' in issues_text:
                 report.invalid_chars += 1
-            if 'Invalid checksum' in str(validation['issues']):
-                report.invalid_checksum += 1
             
             if len(report.invalid_vin_details) < 20:
                 report.invalid_vin_details.append(validation)
@@ -342,11 +390,13 @@ def print_report(report: ValidationReport):
     print(f"VINs from Labels:    {report.vins_from_labels}")
     print(f"Filename Extraction Failed: {report.filename_extraction_failed}")
     
-    print("\n--- VIN VALIDITY ---")
+    print("\n--- VIN VALIDITY (unique VINs, filename + label sources) ---")
+    print(f"Unique VINs Checked: {report.unique_vins_validated}")
     print(f"Valid VINs:          {report.valid_vins}")
     print(f"Invalid Length:      {report.invalid_length}")
     print(f"Invalid Characters:  {report.invalid_chars}")
-    print(f"Invalid Checksum:    {report.invalid_checksum}")
+    print(f"Invalid Checksum:    {report.invalid_checksum} "
+          f"(counted, not invalidating: EU VINs lack a check digit)")
     
     print("\n--- FILENAME vs LABEL CONSISTENCY ---")
     total_compared = report.filename_label_matches + report.filename_label_mismatches
@@ -357,7 +407,7 @@ def print_report(report: ValidationReport):
     else:
         print("No labels to compare")
     
-    print("\n--- DUPLICATES ---")
+    print("\n--- DUPLICATES (per-image VINs) ---")
     print(f"Unique VINs:         {report.unique_vins}")
     print(f"Duplicate VINs:      {report.duplicate_vins}")
     

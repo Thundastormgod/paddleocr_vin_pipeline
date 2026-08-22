@@ -194,7 +194,9 @@ def create_dataset_config(output_dir: Path, train_file: str, val_file: str, test
         "test_label_file": test_file,
         "charset": "0123456789ABCDEFGHJKLMNPRSTUVWXYZ",
         "max_text_length": 17,
-        "image_shape": [3, 32, 320],
+        # Training contract: VINRecognitionDataset preprocesses to
+        # img_height=48, img_width=320, 3 channels (finetune_paddleocr.py).
+        "image_shape": [3, 48, 320],
         "created_at": "2026-01-23"
     }
     

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import ast
 import sys
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
@@ -142,38 +142,100 @@ def complexity_census(modules: Dict[str, Path]) -> List[Tuple[str, str, int, int
 # 3. Call graph reachability / dead-function candidates
 # ---------------------------------------------------------------------------
 
+def _name_refs(node: ast.AST) -> Set[str]:
+    """Every name a subtree reads: identifiers, attribute names, and
+    string constants (dispatch tables mapping name strings)."""
+    refs: Set[str] = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name):
+            refs.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            refs.add(n.attr)
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+            refs.add(n.value)
+    return refs
+
+
+def _module_level_refs(tree: ast.Module) -> Set[str]:
+    """
+    Names referenced by code that executes at IMPORT time: everything
+    outside function bodies (module statements, class bodies, __main__
+    guards) plus function decorators and argument defaults, which are
+    evaluated when the `def` statement runs. Function BODIES are excluded
+    - they only execute when the function is called, which is exactly the
+    edge the reachability walk models.
+    """
+    refs: Set[str] = set()
+    pending: List[ast.AST] = list(ast.iter_child_nodes(tree))
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for dec in node.decorator_list:
+                refs |= _name_refs(dec)
+            defaults = list(node.args.defaults)
+            defaults += [d for d in node.args.kw_defaults if d is not None]
+            for default in defaults:
+                refs |= _name_refs(default)
+            continue  # body runs only when called
+        if isinstance(node, ast.Name):
+            refs.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            refs.add(node.attr)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            refs.add(node.value)
+        pending.extend(ast.iter_child_nodes(node))
+    return refs
+
+
 def call_reachability(modules: Dict[str, Path]):
     """
-    Name-based static call graph. Honest limits: dynamic dispatch
-    (getattr, dispatch tables, framework callbacks) is approximated by
-    treating any read of a function's NAME anywhere (call, reference,
-    dict value, decorator) as a use. Results are therefore candidates,
-    not verdicts.
+    Name-based static call-graph reachability from ENTRY_POINTS.
+
+    Roots: the entry-point functions listed in ENTRY_POINTS, every name
+    referenced by import-time code in any module (see _module_level_refs),
+    and every name referenced anywhere in tests/. Edges: function name ->
+    names referenced inside that function's body. A defined function whose
+    name is neither a root nor reached by BFS over these edges is a
+    dead-function candidate.
+
+    Honest limits: dynamic dispatch (getattr with runtime-built strings,
+    framework callbacks) is approximated by treating any read of a
+    function's NAME (call, reference, dict value, string constant) as a
+    use, and same-named functions are merged into one node. Results are
+    therefore candidates, not verdicts.
     """
     defs: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
-    uses: Set[str] = set()
+    refs_by_func: Dict[str, Set[str]] = defaultdict(set)
+    roots: Set[str] = set()
+
+    entry_files = {(REPO / rel).resolve() for rel, _ in ENTRY_POINTS}
+    entry_funcs = {func for _, func in ENTRY_POINTS}
 
     for mod, path in modules.items():
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 defs[node.name].append((mod, node.lineno))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name):
-                uses.add(node.id)
-            elif isinstance(node, ast.Attribute):
-                uses.add(node.attr)
-            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-                uses.add(node.value)  # dispatch tables mapping name strings
+                refs_by_func[node.name] |= _name_refs(node)
+                if path.resolve() in entry_files and node.name in entry_funcs:
+                    roots.add(node.name)
+        roots |= _module_level_refs(tree)
 
     # tests also legitimise a function
     for test in (REPO / "tests").rglob("*.py"):
-        tree = ast.parse(test.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name):
-                uses.add(node.id)
-            elif isinstance(node, ast.Attribute):
-                uses.add(node.attr)
+        roots |= _name_refs(ast.parse(test.read_text(encoding="utf-8")))
+
+    # BFS over the uses graph: expand every root that is a defined function.
+    reachable: Set[str] = set()
+    queue = deque(name for name in roots if name in refs_by_func)
+    while queue:
+        name = queue.popleft()
+        if name in reachable:
+            continue
+        reachable.add(name)
+        for ref in refs_by_func[name]:
+            if ref in refs_by_func and ref not in reachable:
+                queue.append(ref)
 
     dunder_or_hooks = {
         "main", "load_context", "predict",  # entry points / framework hooks
@@ -182,12 +244,9 @@ def call_reachability(modules: Dict[str, Path]):
     for name, sites in sorted(defs.items()):
         if name.startswith("__") or name in dunder_or_hooks:
             continue
-        if name not in uses - {name} and all(
-            name not in uses or True for _ in [0]
-        ):
-            # name never read anywhere except its own definition line(s)
-            if name not in uses:
-                dead.extend((name, mod, line) for mod, line in sites)
+        if name in roots or name in reachable:
+            continue
+        dead.extend((name, mod, line) for mod, line in sites)
     return defs, dead
 
 
@@ -249,7 +308,8 @@ def main() -> int:
 
     print("\n### SECTION 3: dead-function candidates")
     _, dead = call_reachability(modules)
-    print(f"candidates={len(dead)} (name never read anywhere incl. tests/dispatch strings)")
+    print(f"candidates={len(dead)} (unreachable from ENTRY_POINTS, import-time "
+          f"code, and tests via the name-use graph)")
     for name, mod, line in dead:
         print(f"  {mod}:{line}  {name}")
 

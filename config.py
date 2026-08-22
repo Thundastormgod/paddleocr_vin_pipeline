@@ -211,29 +211,39 @@ class PipelineConfig:
     
     @classmethod
     def load(cls, path: Path) -> 'PipelineConfig':
-        """Load configuration from JSON file."""
+        """Load configuration from JSON file.
+
+        Restores EVERY section that save() writes (preprocessing, ocr,
+        training, logging) plus the top-level vin_length/vin_charset, and
+        converts JSON lists back to tuples where the dataclass declares
+        tuples, so save -> load -> save round-trips losslessly (audit L46).
+        """
         with open(path) as f:
             data = json.load(f)
         
         config = cls()
         
-        # Update preprocessing
-        if 'preprocessing' in data:
-            for key, value in data['preprocessing'].items():
-                if hasattr(config.preprocessing, key):
-                    setattr(config.preprocessing, key, value)
+        sections = {
+            'preprocessing': config.preprocessing,
+            'ocr': config.ocr,
+            'training': config.training,
+            'logging': config.logging,
+        }
+        for section_name, section_obj in sections.items():
+            for key, value in data.get(section_name, {}).items():
+                if not hasattr(section_obj, key):
+                    continue
+                # JSON has no tuple type: fields declared as tuples come back
+                # as lists and must be converted so to_dict()/asdict() and
+                # tuple-expecting consumers see the declared type again.
+                if isinstance(getattr(section_obj, key), tuple) and isinstance(value, list):
+                    value = tuple(value)
+                setattr(section_obj, key, value)
         
-        # Update OCR
-        if 'ocr' in data:
-            for key, value in data['ocr'].items():
-                if hasattr(config.ocr, key):
-                    setattr(config.ocr, key, value)
-        
-        # Update training
-        if 'training' in data:
-            for key, value in data['training'].items():
-                if hasattr(config.training, key):
-                    setattr(config.training, key, value)
+        if 'vin_length' in data:
+            config.vin_length = data['vin_length']
+        if 'vin_charset' in data:
+            config.vin_charset = data['vin_charset']
         
         return config
 

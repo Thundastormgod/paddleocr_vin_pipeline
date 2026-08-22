@@ -29,11 +29,36 @@ Date: February 2026
 import os
 import platform
 import logging
+import subprocess
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple
 from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+
+def _paddle_cuda_device_present(paddle_module) -> bool:
+    """
+    True only when paddle is compiled with CUDA AND at least one CUDA
+    device is actually present at runtime.
+
+    is_compiled_with_cuda() is a build flag: it is True for GPU wheels
+    running on GPU-less machines. Consumers use this value as `use_gpu`,
+    so it must reflect runtime reality - selecting the 'gpu' device on a
+    machine without one makes trainer init fail.
+    """
+    try:
+        if not paddle_module.is_compiled_with_cuda():
+            return False
+        return paddle_module.device.cuda.device_count() > 0
+    except AttributeError as exc:
+        # Paddle build without the device-count API: report no usable GPU
+        # rather than guessing from the compile flag.
+        logger.warning("Paddle CUDA device-count API unavailable: %s", exc)
+        return False
+    except Exception:
+        logger.exception("Paddle GPU probe failed; reporting CPU-only")
+        return False
 
 
 class DeviceType(str, Enum):
@@ -160,18 +185,22 @@ class HardwareDetector:
             cpu_count=os.cpu_count() or 1,
         )
         
-        # Try to get CPU name
-        try:
-            if platform.system() == "Darwin":
-                import subprocess
+        # Try to get the CPU name (macOS); failure only leaves cpu_name None.
+        if platform.system() == "Darwin":
+            try:
                 result = subprocess.run(
                     ["sysctl", "-n", "machdep.cpu.brand_string"],
-                    capture_output=True, text=True
+                    capture_output=True, text=True, timeout=5
                 )
                 if result.returncode == 0:
                     info.cpu_name = result.stdout.strip()
-        except:
-            pass
+                else:
+                    logger.debug(
+                        "sysctl machdep.cpu.brand_string failed (rc=%s): %s",
+                        result.returncode, result.stderr.strip()
+                    )
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.debug("Could not query CPU name: %s", exc)
         
         # Check PyTorch
         try:
@@ -214,43 +243,65 @@ class HardwareDetector:
                 info.mps_available = True
                 info.device_type = DeviceType.MPS
                 
-                # Estimate Apple Silicon memory (unified memory)
+                # Estimate Apple Silicon memory (unified memory). If the
+                # sysctl probe fails - by exception OR nonzero exit - fall
+                # back to a conservative estimate rather than reporting no
+                # GPU memory at all.
+                gpu_mem_gb = 8.0  # conservative fallback
                 try:
-                    import subprocess
                     result = subprocess.run(
                         ["sysctl", "-n", "hw.memsize"],
-                        capture_output=True, text=True
+                        capture_output=True, text=True, timeout=5
                     )
                     if result.returncode == 0:
                         total_mem_bytes = int(result.stdout.strip())
                         # Apple Silicon shares memory, estimate ~70% available for GPU
                         gpu_mem_gb = (total_mem_bytes / (1024**3)) * 0.7
-                        info.gpus.append(GPUInfo(
-                            index=0,
-                            name="Apple Silicon (MPS)",
-                            total_memory_gb=gpu_mem_gb,
-                            device_type=DeviceType.MPS
-                        ))
-                        info.total_gpu_memory_gb = gpu_mem_gb
-                except:
-                    # Default estimate
-                    info.gpus.append(GPUInfo(
-                        index=0,
-                        name="Apple Silicon (MPS)",
-                        total_memory_gb=8.0,  # Conservative estimate
-                        device_type=DeviceType.MPS
-                    ))
-        except Exception:
+                    else:
+                        logger.debug(
+                            "sysctl hw.memsize failed (rc=%s): %s",
+                            result.returncode, result.stderr.strip()
+                        )
+                except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                    logger.debug("Could not query hw.memsize: %s", exc)
+                info.gpus.append(GPUInfo(
+                    index=0,
+                    name="Apple Silicon (MPS)",
+                    total_memory_gb=gpu_mem_gb,
+                    device_type=DeviceType.MPS
+                ))
+                info.total_gpu_memory_gb = gpu_mem_gb
+        except ImportError as torch_error:
+            # A torch submodule imported lazily during the probe is missing:
+            # an availability signal, handled as unavailable (and said so).
+            logger.warning("PyTorch unavailable: %s", torch_error)
             info.torch_available = False
-        except ImportError:
-            pass
+        except Exception:
+            # Real bug or driver fault inside the capability probe. Never
+            # swallow it silently: log the full traceback, then explicitly
+            # degrade to CPU-safe values so detect() keeps its contract of
+            # always returning a usable HardwareInfo.
+            logger.exception(
+                "Unexpected error while probing PyTorch capabilities; "
+                "treating PyTorch as unavailable"
+            )
+            info.torch_available = False
+            info.torch_version = None
+            info.cuda_available = False
+            info.cuda_version = None
+            info.mps_available = False
+            info.gpus = []
+            info.total_gpu_memory_gb = 0.0
+            info.device_type = DeviceType.CPU
         
         # Check PaddlePaddle
         try:
             import paddle
             info.paddle_available = True
             info.paddle_version = paddle.__version__
-            info.paddle_gpu = paddle.is_compiled_with_cuda()
+            # Runtime device presence, not just the compile flag (compiled
+            # with CUDA != a CUDA device exists on this machine).
+            info.paddle_gpu = _paddle_cuda_device_present(paddle)
         except ImportError:
             pass
         

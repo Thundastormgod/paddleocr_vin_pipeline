@@ -150,12 +150,23 @@ class GPUManager:
                         props = torch.cuda.get_device_properties(i)
                         total_mem = props.total_memory / (1024**3)
                         
-                        # Get available memory
+                        # Available memory must be DEVICE-LEVEL (what the
+                        # driver reports as free across ALL processes).
+                        # total - memory_allocated() only subtracts THIS
+                        # process's allocations and overstates free memory
+                        # on shared GPUs.
                         try:
-                            torch.cuda.set_device(i)
+                            free_bytes, _ = torch.cuda.mem_get_info(i)
+                            free_mem = free_bytes / (1024**3)
+                        except (RuntimeError, AttributeError) as mem_error:
+                            # Fallback is a PROCESS-LOCAL estimate - label
+                            # it as such where consumers can see it.
                             free_mem = (props.total_memory - torch.cuda.memory_allocated(i)) / (1024**3)
-                        except:
-                            free_mem = total_mem
+                            note = (f"CUDA device {i}: memory_available_gb is a "
+                                    f"process-local estimate (mem_get_info "
+                                    f"failed: {mem_error})")
+                            logger.warning(note)
+                            status.errors.append(note)
                         
                         gpu_info = GPUInfo(
                             device_type=DeviceType.CUDA,
@@ -184,16 +195,18 @@ class GPUManager:
                 try:
                     if hasattr(torch.backends.mps, 'is_built') and torch.backends.mps.is_built():
                         status.mps_info.name = "Apple Silicon GPU (MPS Built)"
-                except:
-                    pass
+                except (AttributeError, RuntimeError) as exc:
+                    logger.debug("MPS is_built probe failed: %s", exc)
             
-            # ROCm detection
-            if hasattr(torch, 'hip') or 'rocm' in torch.__version__.lower():
+            # ROCm detection: the real signal is torch.version.hip (the HIP
+            # version string on ROCm builds, None otherwise).
+            # hasattr(torch, 'hip') is never true on any torch build.
+            if getattr(torch.version, "hip", None) or 'rocm' in torch.__version__.lower():
                 try:
                     if torch.cuda.is_available():  # ROCm uses CUDA interface
                         status.rocm_available = True
-                except:
-                    pass
+                except RuntimeError as exc:
+                    status.errors.append(f"ROCm probe error: {exc}")
                     
         except ImportError:
             status.errors.append("PyTorch not installed")

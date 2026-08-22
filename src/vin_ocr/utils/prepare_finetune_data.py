@@ -26,6 +26,7 @@ import sys
 import shutil
 import random
 import logging
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -33,10 +34,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2
 import numpy as np
 
-# Add parent directory for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add the repo root so `src.` imports resolve when run as a script
+# (this file lives at src/vin_ocr/utils/, three levels below the root).
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from src.vin_ocr.core.vin_utils import extract_vin_from_filename, VIN_LENGTH, VIN_VALID_CHARS
+from src.vin_ocr.utils.prepare_dataset import assert_no_vin_leakage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -218,6 +223,53 @@ def process_single_image(
         return None
 
 
+def split_samples_by_vin(
+    samples: List[Tuple[str, str]],
+    train_ratio: float,
+    seed: int
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    """
+    Split (image_path, vin_label) samples into train/val, GROUPED BY VIN.
+
+    A physical VIN plate frequently appears in several images (multiple
+    shots, crops). Shuffling and splitting image rows scatters those copies
+    across train and val, so validation scores plates the model saw in
+    training - leakage that inflates accuracy by memorization. The shuffle
+    and split therefore operate on unique VINs, and every image of a VIN
+    lands in exactly one split (same policy as utils/prepare_dataset.
+    create_splits). The result is verified by assert_no_vin_leakage()
+    before being returned.
+
+    Args:
+        samples: (image_path, vin_label) tuples
+        train_ratio: proportion of VIN groups assigned to train
+        seed: shuffle seed; the VIN list is sorted before shuffling so the
+            same seed produces the same split on every machine
+
+    Returns:
+        (train_samples, val_samples), each a list of (image_path, vin_label)
+    """
+    vin_to_paths: Dict[str, List[str]] = defaultdict(list)
+    for img_path, vin in samples:
+        vin_to_paths[vin].append(img_path)
+
+    vins = sorted(vin_to_paths)  # deterministic order before the seeded shuffle
+    random.seed(seed)
+    random.shuffle(vins)
+
+    n_train_vins = int(len(vins) * train_ratio)
+    train_samples = [(p, v) for v in vins[:n_train_vins] for p in vin_to_paths[v]]
+    val_samples = [(p, v) for v in vins[n_train_vins:] for p in vin_to_paths[v]]
+
+    assert_no_vin_leakage(
+        train=dict(train_samples),
+        val=dict(val_samples),
+        test={},
+    )
+
+    return train_samples, val_samples
+
+
 def prepare_dataset(
     input_dir: str,
     output_dir: str,
@@ -258,7 +310,11 @@ def prepare_dataset(
     
     logger.info(f"Collecting samples from {input_dir}...")
     samples = collect_samples(input_dir)
-    logger.info(f"Found {len(samples)} valid samples")
+    # True source total: everything collected BEFORE image validation
+    # filters anything out (stats['total_source'] must not shrink with
+    # the filter, or failures become invisible in the report).
+    total_source = len(samples)
+    logger.info(f"Found {total_source} valid samples")
     
     if len(samples) == 0:
         raise ValueError("No valid samples found!")
@@ -276,15 +332,11 @@ def prepare_dataset(
         samples = valid_samples
         logger.info(f"{len(samples)} valid images after validation")
     
-    # Shuffle and split
-    random.seed(seed)
-    random.shuffle(samples)
+    # Split grouped by VIN so no VIN straddles train/val; leakage-checked.
+    train_samples, val_samples = split_samples_by_vin(samples, train_ratio, seed)
     
-    n_train = int(len(samples) * train_ratio)
-    train_samples = samples[:n_train]
-    val_samples = samples[n_train:]
-    
-    logger.info(f"Split: {len(train_samples)} train, {len(val_samples)} val")
+    logger.info(f"Split: {len(train_samples)} train, {len(val_samples)} val "
+                f"(grouped by VIN, leakage-checked)")
     
     # Process training samples
     logger.info("Processing training samples...")
@@ -337,7 +389,7 @@ def prepare_dataset(
             f.write(f"val/{rel_path}\t{vin}\n")
     
     stats = {
-        'total_source': len(samples),
+        'total_source': total_source,
         'train_processed': len(train_results),
         'val_processed': len(val_results),
         'train_failed': len(train_samples) - len(train_results),

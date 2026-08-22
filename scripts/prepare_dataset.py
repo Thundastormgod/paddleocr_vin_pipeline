@@ -86,8 +86,20 @@ def extract_vin_from_filename(filename: str) -> Optional[str]:
 
 
 def load_existing_labels(label_file: str) -> Dict[str, str]:
-    """Load existing label file into dict {filename: vin}."""
-    labels = {}
+    """
+    Load existing label file into dict {key: vin}.
+
+    Label files key entries by relative path ('train/x.jpg',
+    'dagshub/data/ocr_train/images/x.jpg', ...) while callers may look up
+    by bare filename. Each entry is therefore indexed BOTH ways: under the
+    path exactly as written AND under its basename, so lookups work for
+    'train/x.jpg' and 'x.jpg' alike. A basename that maps to two different
+    VINs is ambiguous and gets no basename alias (keys written verbatim in
+    the file always stay authoritative).
+    """
+    labels: Dict[str, str] = {}
+    aliases: Dict[str, str] = {}
+    ambiguous = set()
     if not Path(label_file).exists():
         return labels
     
@@ -102,22 +114,55 @@ def load_existing_labels(label_file: str) -> Dict[str, str]:
             else:
                 parts = line.split(None, 1)
             
-            if len(parts) >= 2:
-                labels[parts[0].strip()] = parts[1].strip()
+            if len(parts) < 2:
+                continue
+            key = parts[0].strip()
+            vin = parts[1].strip()
+            labels[key] = vin
+            base = Path(key).name
+            if base == key:
+                continue
+            if base in aliases and aliases[base] != vin:
+                ambiguous.add(base)
+            else:
+                aliases[base] = vin
+    
+    for base in sorted(ambiguous):
+        aliases.pop(base, None)
+        print(f"⚠️ Ambiguous basename in {label_file}: '{base}' maps to "
+              f"multiple VINs; only full-path lookups will match it")
+    for base, vin in aliases.items():
+        labels.setdefault(base, vin)
     
     return labels
 
 
 def get_all_images(data_dir: str) -> List[str]:
-    """Get all image files in directory."""
+    """
+    Get all image files under data_dir, RECURSIVELY, as sorted paths
+    relative to data_dir in posix form (e.g. 'train/x.jpg').
+
+    Deduplicates by case-normalized resolved path: on case-insensitive
+    filesystems (macOS/Windows), globbing '*.jpg' and '*.JPG' separately
+    returns the same physical file twice. A single walk with a
+    lowercased-suffix check plus a seen-set counts each file once while
+    still matching any extension casing.
+    """
     data_path = Path(data_dir)
-    extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.JPG', '.JPEG', '.PNG', '.BMP'}
+    extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
     
+    seen = set()
     images = []
-    for ext in extensions:
-        images.extend(data_path.glob(f'*{ext}'))
+    for path in data_path.rglob('*'):
+        if not path.is_file() or path.suffix.lower() not in extensions:
+            continue
+        resolved_key = str(path.resolve()).lower()
+        if resolved_key in seen:
+            continue
+        seen.add(resolved_key)
+        images.append(path.relative_to(data_path).as_posix())
     
-    return [img.name for img in images]
+    return sorted(images)
 
 
 def group_by_vin(images: List[str], labels: Dict[str, str]) -> Dict[str, List[str]]:
@@ -125,8 +170,11 @@ def group_by_vin(images: List[str], labels: Dict[str, str]) -> Dict[str, List[st
     vin_to_images = defaultdict(list)
     
     for img in images:
-        # Get VIN from labels or filename
-        vin = labels.get(img) or extract_vin_from_filename(img)
+        # Get VIN from labels (full relative key first, then basename
+        # alias) or fall back to extraction from the filename itself.
+        vin = (labels.get(img)
+               or labels.get(Path(img).name)
+               or extract_vin_from_filename(Path(img).name))
         if vin:
             vin_to_images[vin].append(img)
         else:
@@ -152,8 +200,10 @@ def stratified_split(
     """
     random.seed(seed)
     
-    # Get all unique VINs
-    vins = list(vin_to_images.keys())
+    # Get all unique VINs, sorted BEFORE the seeded shuffle: dict order
+    # depends on insertion (filesystem enumeration), so without sorting
+    # the same seed gives different splits on different machines.
+    vins = sorted(vin_to_images.keys())
     random.shuffle(vins)
     
     # Calculate split indices
@@ -170,6 +220,8 @@ def stratified_split(
     val_samples = []
     test_samples = []
     
+    # train_vins/val_vins/test_vins partition `vins`, so every VIN matches
+    # exactly one branch.
     for vin, images in vin_to_images.items():
         for img in images:
             sample = (img, vin)
@@ -177,7 +229,7 @@ def stratified_split(
                 train_samples.append(sample)
             elif vin in val_vins:
                 val_samples.append(sample)
-            else:
+            elif vin in test_vins:
                 test_samples.append(sample)
     
     return train_samples, val_samples, test_samples

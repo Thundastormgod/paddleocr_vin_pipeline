@@ -363,9 +363,22 @@ def register_checkpoint_version(
             dataset=eval_dataset,
         )
 
+        # The version comes from THIS registration's return value: log_model
+        # registers the model and reports the created version on ModelInfo.
+        # The previous post-hoc max(search_model_versions(...)) attached the
+        # tags to whichever version happened to be newest at query time (a
+        # concurrent registration wins the race) and raised a bare ValueError
+        # on an empty registry.
+        registered_version = model_info.registered_model_version
+        if registered_version is None:
+            raise RuntimeError(
+                f"model was logged but no registry version was created for "
+                f"'{registered_name}': log_model returned "
+                f"registered_model_version=None; refusing to tag a guessed "
+                f"version"
+            )
+        version = int(registered_version)
         client = mlflow.tracking.MlflowClient()
-        versions = client.search_model_versions(f"name='{registered_name}'")
-        version = max(int(v.version) for v in versions)
         tags = {
             "checkpoint_path": str(checkpoint_path),
             "stage": stage_label,

@@ -143,9 +143,22 @@ class DataState:
 
 
 def _slug(value: str) -> str:
-    """Reduce a path to a compact MLflow-safe parameter key fragment."""
+    """
+    Reduce a path to a collision-proof, MLflow-safe parameter key fragment.
+
+    The readable part keeps only alphanumerics (anything else becomes "_"),
+    so distinct paths can clean to identical text - "data/train_images" and
+    "data_train_images" both clean to "data_train_images" - and a fragment
+    built from the readable part alone would let one dataset's provenance
+    param silently overwrite another's. An 8-hex-char SHA-256 of the
+    original string is therefore always appended: equal fragments imply
+    equal inputs. The readable part is truncated so keys built from the
+    fragment stay well inside MLflow's 250-character key limit.
+    """
     cleaned = "".join(ch if ch.isalnum() else "_" for ch in value.strip("./"))
-    return cleaned.strip("_") or "root"
+    cleaned = cleaned.strip("_") or "root"
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    return f"{cleaned[:200]}_{digest}"
 
 
 def _outs_from_mapping(

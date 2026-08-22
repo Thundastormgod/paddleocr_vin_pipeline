@@ -164,6 +164,32 @@ warn_unused_configs = true
 ignore_missing_imports = true
 exclude = ["venv", "PaddleOCR", "tests"]
 
+# Deterministic analysis surface: optional heavy backends are treated as
+# untyped (Any) EVERYWHERE, whether or not they happen to be installed.
+# Without this, a dev venv with torch/onnxruntime produces errors the CI
+# typecheck env (which installs only numpy/cv2/PIL/yaml/rapidfuzz/tqdm/
+# paddle/paddleocr/streamlit/mlflow) never sees, and the committed
+# mypy-baseline ratchet diverges between machines. Measured 2026-08-22:
+# 15 local-only errors from torch/onnxruntime typing before this pin.
+[[tool.mypy.overrides]]
+module = [
+    "torch", "torch.*",
+    "torchvision", "torchvision.*",
+    "onnx", "onnx.*",
+    "onnxruntime", "onnxruntime.*",
+    "transformers", "transformers.*",
+    "peft", "peft.*",
+    "bitsandbytes", "bitsandbytes.*",
+    "vllm", "vllm.*",
+    "datasets", "datasets.*",
+    "optuna", "optuna.*",
+    "paddle2onnx", "paddle2onnx.*",
+    "dagshub", "dagshub.*",
+    "playwright", "playwright.*",
+]
+follow_imports = "skip"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]

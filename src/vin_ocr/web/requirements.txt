@@ -86,7 +86,7 @@ fsspec==2024.6.1
 funcy==2.0
 future==1.0.0
 gitdb==4.0.12
-GitPython==3.1.46
+GitPython==3.1.58
 google-auth==2.48.0
 gql==4.0.0
 grandalf==0.8

@@ -85,8 +85,10 @@ def export_model_to_onnx(pdiparams_path: str, output_dir: str):
     temp_model_path = temp_dir / "inference"
     
     print("   Exporting to static graph...")
+    # Batch dim is dynamic (None): pinning it to 1 exported graphs that
+    # rejected every recognize_batch() call with batch size > 1.
     input_spec = [
-        paddle.static.InputSpec(shape=[1, 3, 48, 320], dtype='float32', name='x')
+        paddle.static.InputSpec(shape=[None, 3, 48, 320], dtype='float32', name='x')
     ]
     
     try:
@@ -170,8 +172,19 @@ def convert_all():
     print("Converting All Models to ONNX")
     print("=" * 60)
     
-    # Find all latest.pdparams files (actual model checkpoints)
-    pdiparams_files = list(output_base.glob("*/latest.pdparams"))
+    # Convert the BEST checkpoint of each run when it exists;
+    # latest.pdparams is merely the last epoch, not the selected model.
+    pdiparams_files = []
+    for run_dir in sorted(p for p in output_base.iterdir() if p.is_dir()):
+        best_path = run_dir / "best_accuracy.pdparams"
+        latest_path = run_dir / "latest.pdparams"
+        if best_path.is_file():
+            pdiparams_files.append(best_path)
+        elif latest_path.is_file():
+            print(f"⚠️  {run_dir.name}: no best_accuracy.pdparams found - "
+                  f"falling back to latest.pdparams (LAST epoch, not the "
+                  f"best-validation checkpoint)")
+            pdiparams_files.append(latest_path)
     print(f"Found {len(pdiparams_files)} models to convert\n")
     
     converted = []

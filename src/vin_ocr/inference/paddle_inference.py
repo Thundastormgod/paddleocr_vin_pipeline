@@ -259,9 +259,22 @@ class VINInference:
             result['raw_text'] = text
             result['confidence'] = confidence
             
-            # Extract VIN (should be 17 chars)
-            # Filter to valid VIN characters only
-            vin_chars = ''.join(c for c in text.upper() if c in VIN_CHARSET)
+            # Extract VIN (should be 17 chars).
+            # I/O/Q - the three characters ISO 3779 forbids - are MAPPED to
+            # their look-alike digits (I->1, O->0, Q->0), the policy used
+            # everywhere else in this repo (RuleBasedCorrector.
+            # INVALID_CHAR_RULES is the single source of that mapping).
+            # They were previously FILTERED OUT instead: every character
+            # after a misread I/O/Q shifted left one position and the [:17]
+            # cut dropped the true final character - producing a
+            # plausible-but-wrong VIN with no error raised.
+            from src.vin_ocr.core.vin_utils import RuleBasedCorrector
+
+            mapped = ''.join(
+                RuleBasedCorrector.INVALID_CHAR_RULES.get(c, c)
+                for c in text.upper()
+            )
+            vin_chars = ''.join(c for c in mapped if c in VIN_CHARSET)
             result['vin'] = vin_chars[:17] if len(vin_chars) >= 17 else vin_chars
             
         except Exception as e:

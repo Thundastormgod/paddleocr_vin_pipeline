@@ -99,8 +99,45 @@ def convert_all_models(output_base: str = "output", onnx_dir: str = "output/onnx
                     config, num_classes=34, legacy_batch_axis_attention=True,
                 )
                 
-                # Load weights
+                # Load weights - and VERIFY them. A bare inference.pdiparams
+                # usually comes from paddle.jit.save (static graph): its
+                # keys are graph-internal names matching NOTHING in a fresh
+                # dygraph model, and set_state_dict silently skips unmatched
+                # keys - the randomly-initialized model would then be
+                # exported and reported "✅ Converted".
                 state_dict = paddle.load(str(pdiparams_path))
+                if not isinstance(state_dict, dict):
+                    raise RuntimeError(
+                        f"{pdiparams_path} did not load as a parameter dict "
+                        f"(got {type(state_dict).__name__}); cannot verify "
+                        f"weights, refusing to export."
+                    )
+                model_state = model.state_dict()
+                missing = [k for k in model_state if k not in state_dict]
+                if missing:
+                    raise RuntimeError(
+                        f"{pdiparams_path} matches only "
+                        f"{len(model_state) - len(missing)}/{len(model_state)} "
+                        f"model parameter names (first missing: "
+                        f"{missing[:3]}). set_state_dict would keep RANDOM "
+                        f"weights for the unmatched ones - refusing to "
+                        f"export. This file is likely a static-graph export; "
+                        f"convert the training checkpoint (.pdparams) with "
+                        f"scripts/reexport_and_convert_onnx.py instead."
+                    )
+                mismatched = [
+                    (k, tuple(state_dict[k].shape), tuple(model_state[k].shape))
+                    for k in model_state
+                    if tuple(state_dict[k].shape) != tuple(model_state[k].shape)
+                ]
+                if mismatched:
+                    key, got, want = mismatched[0]
+                    raise RuntimeError(
+                        f"{pdiparams_path}: {len(mismatched)} parameter "
+                        f"shape mismatch(es), e.g. {key}: file {got} vs "
+                        f"model {want} - refusing to export unverified "
+                        f"weights."
+                    )
                 model.set_state_dict(state_dict)
                 model.eval()
                 
@@ -111,9 +148,16 @@ def convert_all_models(output_base: str = "output", onnx_dir: str = "output/onnx
                 ]
                 paddle.jit.save(model, str(temp_model_path), input_spec=input_spec)
                 
+                # PIR-era Paddle writes <name>.json instead of <name>.pdmodel
+                # (same handling as reexport_and_convert_onnx.py).
+                temp_pdmodel = str(temp_model_path) + '.pdmodel'
+                temp_pdjson = str(temp_model_path) + '.json'
+                if os.path.exists(temp_pdjson) and not os.path.exists(temp_pdmodel):
+                    temp_pdmodel = temp_pdjson
+                
                 # Now convert to ONNX
                 paddle2onnx.export(
-                    str(temp_model_path) + '.pdmodel',
+                    temp_pdmodel,
                     str(temp_model_path) + '.pdiparams',
                     str(onnx_path),
                     opset_version=11,
@@ -121,8 +165,8 @@ def convert_all_models(output_base: str = "output", onnx_dir: str = "output/onnx
                     verbose=False,
                 )
                 
-                # Clean up temp files
-                for ext in ['.pdmodel', '.pdiparams', '.pdiparams.info']:
+                # Clean up temp files (.json included for PIR exports)
+                for ext in ['.pdmodel', '.json', '.pdiparams', '.pdiparams.info']:
                     temp_file = Path(str(temp_model_path) + ext)
                     if temp_file.exists():
                         temp_file.unlink()
@@ -181,11 +225,11 @@ def test_onnx_inference(onnx_path: str, test_image: str = None):
     else:
         batch = input_info.shape[0]
     
-    # Handle dynamic shapes
+    # Handle dynamic shapes (batch resolved above from input metadata)
     shape = []
     for dim in input_info.shape:
         if dim is None or isinstance(dim, str):
-            shape.append(1 if len(shape) == 0 else 48 if len(shape) == 2 else 320 if len(shape) == 3 else 3)
+            shape.append(batch if len(shape) == 0 else 48 if len(shape) == 2 else 320 if len(shape) == 3 else 3)
         else:
             shape.append(dim)
     

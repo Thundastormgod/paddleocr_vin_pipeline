@@ -67,7 +67,7 @@ def export_paddle_to_onnx(
     output_dir: str,
     model_name: str = None,
     opset_version: int = 11,
-    input_shape: tuple = (1, 1, 32, 320),
+    input_shape: tuple = (1, 3, 48, 320),
 ) -> str:
     """
     Export PaddleOCR model to ONNX format.
@@ -77,7 +77,12 @@ def export_paddle_to_onnx(
         output_dir: Directory to save ONNX model
         model_name: Optional name for the exported model
         opset_version: ONNX opset version (default: 11)
-        input_shape: Input shape (batch, channels, height, width)
+        input_shape: Input shape (batch, channels, height, width). The
+            default matches this repo's recognition contract [N, 3, 48,
+            320] (see inference/paddle_inference.py and
+            inference/onnx_inference.py); the old (1, 1, 32, 320) default
+            made the post-export self-test fail against every repo model
+            and recorded the wrong shape in the metadata.
     
     Returns:
         Path to the exported ONNX model
@@ -254,8 +259,8 @@ Examples:
     parser.add_argument(
         '--input-height',
         type=int,
-        default=32,
-        help='Input image height (default: 32)'
+        default=48,
+        help='Input image height (default: 48, the repo model contract)'
     )
     parser.add_argument(
         '--input-width',
@@ -270,8 +275,9 @@ Examples:
     if not check_dependencies():
         sys.exit(1)
     
-    # Export model
-    input_shape = (1, 1, args.input_height, args.input_width)
+    # Export model. Repo recognition models take [N, 3, 48, 320]
+    # (3-channel); a 1-channel self-test input cannot match any of them.
+    input_shape = (1, 3, args.input_height, args.input_width)
     
     try:
         onnx_path = export_paddle_to_onnx(

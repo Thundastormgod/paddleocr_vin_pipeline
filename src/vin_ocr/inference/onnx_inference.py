@@ -43,8 +43,11 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 # VIN valid characters (excludes I, O, Q as per ISO 3779)
+# NOTE: there is deliberately NO "charset + blank" constant here. The repo
+# convention (enforced by core.charset.load_char_dict) is blank at INDEX 0;
+# a constant that appended the blank at index 33 lived here as a loaded
+# trap - any decoder built on it would shift every character.
 VIN_CHARSET = "0123456789ABCDEFGHJKLMNPRSTUVWXYZ"
-VIN_CHARSET_WITH_BLANK = VIN_CHARSET + " "  # Blank token for CTC
 
 
 @dataclass
@@ -303,6 +306,29 @@ class ONNXVINRecognizer:
         exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
         return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
     
+    def _build_result(self, raw_text: str, confidence: float) -> Dict[str, Any]:
+        """
+        Assemble a recognition result dict from decoded text.
+
+        VIN extraction uses the checksum-scored window search
+        (core.vin_utils.extract_vin_from_text, the verified single source
+        of truth): every 17-character window is scored and a valid ISO 3779
+        check digit is decisive. The previous ``raw_text[:17]`` took the
+        FIRST 17 characters, so a single leading artifact yielded a
+        shifted, plausible-but-wrong "valid" VIN with no error.
+        """
+        from src.vin_ocr.core.vin_utils import extract_vin_from_text
+
+        vin = extract_vin_from_text(raw_text)
+        is_valid = len(vin) == 17 and all(c in VIN_CHARSET for c in vin)
+        return {
+            'vin': vin,
+            'raw_text': raw_text,
+            'confidence': confidence,
+            'is_valid': is_valid,
+            'error': None
+        }
+
     def recognize(self, image: Union[str, np.ndarray]) -> Dict[str, Any]:
         """
         Recognize VIN from a single image.
@@ -323,17 +349,7 @@ class ONNXVINRecognizer:
             # Decode
             raw_text, confidence = self.decode_ctc(outputs[0])
             
-            # Extract VIN (17 characters)
-            vin = raw_text[:17] if len(raw_text) >= 17 else raw_text
-            is_valid = len(vin) == 17 and all(c in VIN_CHARSET for c in vin)
-            
-            return {
-                'vin': vin,
-                'raw_text': raw_text,
-                'confidence': confidence,
-                'is_valid': is_valid,
-                'error': None
-            }
+            return self._build_result(raw_text, confidence)
             
         except Exception as e:
             logger.error(f"Recognition failed: {e}")
@@ -352,33 +368,48 @@ class ONNXVINRecognizer:
     ) -> List[Dict[str, Any]]:
         """
         Recognize VINs from multiple images.
-        
+
+        Results are INDEX-ALIGNED with ``images``: ``results[k]`` is always
+        the outcome for ``images[k]``. Every slot is preallocated and each
+        outcome (preprocess failure, inference failure, success) is written
+        at its input's index. The previous implementation appended
+        preprocess failures during the preprocess loop and successes after
+        inference, so a mid-batch failure re-ordered every later result and
+        silently attributed VINs to the wrong images.
+
         Args:
             images: List of image paths or numpy arrays
             batch_size: Batch size for inference (default: config.batch_size)
             
         Returns:
-            List of recognition results
+            List of recognition results, one per input image, same order.
+
+        Raises:
+            RuntimeError: If any input ends up without a result (broken
+                internal invariant - listed by index).
         """
         batch_size = batch_size or self.config.batch_size
-        results = []
+        results: List[Optional[Dict[str, Any]]] = [None] * len(images)
         
         for i in range(0, len(images), batch_size):
             batch_images = images[i:i + batch_size]
             
-            # Preprocess batch
+            # Preprocess batch, remembering the ORIGINAL index of each
+            # successfully preprocessed image.
             batch_tensors = []
-            for img in batch_images:
+            tensor_indices: List[int] = []
+            for offset, img in enumerate(batch_images):
+                idx = i + offset
                 try:
                     tensor = self.preprocess(img)
                     batch_tensors.append(tensor[0])  # Remove batch dim
+                    tensor_indices.append(idx)
                 except Exception as e:
-                    logger.warning(f"Failed to preprocess image: {e}")
-                    results.append({
+                    logger.warning(f"Failed to preprocess image at index {idx}: {e}")
+                    results[idx] = {
                         'vin': '', 'raw_text': '', 'confidence': 0.0,
                         'is_valid': False, 'error': str(e)
-                    })
-                    continue
+                    }
             
             if not batch_tensors:
                 continue
@@ -386,32 +417,32 @@ class ONNXVINRecognizer:
             # Stack into batch
             batch_input = np.stack(batch_tensors, axis=0)
             
-            # Run inference
+            # Run inference; write each outcome at its input's index.
             try:
                 outputs = self.session.run(self.output_names, {self.input_name: batch_input})
                 
-                # Decode each result
-                for j in range(len(batch_tensors)):
+                for j, idx in enumerate(tensor_indices):
                     raw_text, confidence = self.decode_ctc(outputs[0][j:j+1])
-                    vin = raw_text[:17] if len(raw_text) >= 17 else raw_text
-                    is_valid = len(vin) == 17 and all(c in VIN_CHARSET for c in vin)
-                    
-                    results.append({
-                        'vin': vin,
-                        'raw_text': raw_text,
-                        'confidence': confidence,
-                        'is_valid': is_valid,
-                        'error': None
-                    })
+                    results[idx] = self._build_result(raw_text, confidence)
                     
             except Exception as e:
                 logger.error(f"Batch inference failed: {e}")
-                for _ in batch_tensors:
-                    results.append({
-                        'vin': '', 'raw_text': '', 'confidence': 0.0,
-                        'is_valid': False, 'error': str(e)
-                    })
+                for idx in tensor_indices:
+                    # Only fill slots not already decoded: a failure after
+                    # partial decoding must not overwrite real results.
+                    if results[idx] is None:
+                        results[idx] = {
+                            'vin': '', 'raw_text': '', 'confidence': 0.0,
+                            'is_valid': False, 'error': str(e)
+                        }
         
+        missing = [k for k, r in enumerate(results) if r is None]
+        if missing:
+            raise RuntimeError(
+                f"recognize_batch produced no result for input indices "
+                f"{missing} of {len(images)} - results would misalign with "
+                f"inputs"
+            )
         return results
     
     def get_model_info(self) -> Dict[str, Any]:
@@ -527,7 +558,10 @@ Examples:
         valid_count = sum(1 for r in results if r['is_valid'])
         error_count = sum(1 for r in results if r['error'])
         
-        for img, result in zip(images, results):
+        # strict=True: recognize_batch guarantees one result per image in
+        # input order; a length mismatch here is a broken invariant and
+        # must raise, not silently misattribute VINs to filenames.
+        for img, result in zip(images, results, strict=True):
             status = "✓" if result['is_valid'] else "✗"
             print(f"  {status} {Path(img).name}: {result['vin']} ({result['confidence']:.2f})")
         

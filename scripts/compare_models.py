@@ -89,9 +89,24 @@ def eval_stock_pipeline_on_split(label_file: str,
     )
     pairs: List[Tuple[str, str]] = []
     errors = 0
+    malformed = 0
     started = time.time()
-    for line in Path(label_file).read_text().splitlines():
-        rel_path, gt = line.split("\t")
+    for line_no, raw_line in enumerate(
+            Path(label_file).read_text().splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        # Tolerant "<path>\t<VIN>" parsing, mirroring evaluate.py's
+        # malformed-label convention: skip + log instead of crashing the
+        # whole run on one bad line.
+        rel_path, _, gt = line.partition("\t")
+        rel_path = rel_path.strip()
+        gt = gt.strip()
+        if not rel_path or not gt or "\t" in gt:
+            malformed += 1
+            print(f"  WARNING: skipping malformed label line {line_no} "
+                  f"in {label_file}: {line!r}")
+            continue
         image_path = str(Path("finetune_data") / rel_path)
         try:
             result = pipeline.recognize(image_path)
@@ -103,6 +118,8 @@ def eval_stock_pipeline_on_split(label_file: str,
             continue
         pairs.append(((result.get("vin") or "")[:17], gt))
     seconds = round(time.time() - started, 1)
+    if malformed:
+        print(f"  {malformed} malformed label line(s) skipped in {label_file}")
 
     n = len(pairs)
     metrics = char_level_metrics(pairs)

@@ -47,6 +47,7 @@ import sys
 import yaml
 import json
 import time
+import random
 import logging
 import argparse
 import shutil
@@ -136,6 +137,9 @@ class PaddleOCRScratchConfig:
     use_amp: bool = True  # Automatic Mixed Precision
     num_workers: int = 0  # Use 0 for macOS compatibility
     
+    # Reproducibility: seeds python's random, numpy and paddle (M11)
+    seed: int = 42
+    
     # Checkpointing
     save_epoch_step: int = 10
     eval_batch_step: int = 500
@@ -200,6 +204,15 @@ class DeepSeekScratchConfig:
 
 VIN_CHARACTERS = "0123456789ABCDEFGHJKLMNPRSTUVWXYZ"  # 33 chars (no I, O, Q)
 
+# Special token ids shared by the DeepSeek-style trainer's dataset encoding
+# and the model's autoregressive generation (M8): teacher forcing feeds
+# target sequences that START with <SOS>, so generation must be seeded with
+# the SAME token. Seeding with 0 fed <PAD> as the first decoder input - a
+# token the decoder never saw in that position during training.
+PAD_TOKEN_ID = 0
+SOS_TOKEN_ID = 1
+EOS_TOKEN_ID = 2
+
 
 def create_vin_dict(output_path: str = "./configs/vin_dict.txt"):
     """Create VIN character dictionary file."""
@@ -235,6 +248,11 @@ class PaddleOCRScratchTrainer:
         self.train_losses = []
         self.val_accuracies = []
         self.best_accuracy = 0.0
+        # Whether a best_model checkpoint has been written yet. The first
+        # validation always writes one: early CTC training sits at 0.0
+        # exact-match for many epochs, and a strict val_acc > 0.0 gate
+        # would leave the whole run without any loadable checkpoint (M10).
+        self._best_checkpoint_written = False
         
     def setup(self):
         """Setup training environment."""
@@ -279,6 +297,15 @@ class PaddleOCRScratchTrainer:
             paddle.set_device('cpu')
             logger.info("Using CPU for training (PaddlePaddle does not support MPS)")
         
+        # Seed every RNG the training path draws from (M11): python's
+        # random, numpy (augmentation noise/probabilities) and paddle
+        # (weight init, data shuffling). The `seed` config field was
+        # previously parsed and never used.
+        random.seed(self.config.seed)
+        np.random.seed(self.config.seed)
+        paddle.seed(self.config.seed)
+        logger.info(f"Random seed: {self.config.seed}")
+        
         # Override config with hardware-detected optimal settings
         if self.config.batch_size == 64 and hw_config.get('recommended_batch_size'):
             logger.info(f"Note: Recommended batch size for your hardware: {hw_config.get('recommended_batch_size')}")
@@ -297,8 +324,9 @@ class PaddleOCRScratchTrainer:
         # Build model from scratch
         self._build_model()
         
-        # Setup optimizer
-        self._setup_optimizer()
+        # NOTE: the optimizer and LR schedule are built in train(), where the
+        # real len(train_loader) is known. Building them here forced the
+        # schedule horizon onto a guessed steps-per-epoch (C4).
         
         # Setup AMP
         if self.config.use_amp:
@@ -357,6 +385,18 @@ class PaddleOCRScratchTrainer:
         import paddle.nn as nn
         
         logger.info(f"Building {self.config.architecture} model from scratch...")
+        
+        # The `backbone` knob predates this trainer's architecture dispatch:
+        # every architecture below hard-codes its own backbone and there is
+        # no alternative implementation to select. Reject non-default values
+        # loudly instead of silently ignoring them (L22).
+        if self.config.backbone != "PPLCNetV3":
+            raise ValueError(
+                "backbone config not supported by this trainer: got "
+                f"{self.config.backbone!r}. Each architecture "
+                "(PP-OCRv5/CRNN/SVTR_LCNet/SVTR_Tiny) hard-codes its own "
+                "backbone; select the model via `architecture` instead."
+            )
         
         num_classes = len(self.char_dict)
         
@@ -600,7 +640,10 @@ class PaddleOCRScratchTrainer:
                     num_layers=depth
                 )
                 
-                # Reshape for sequence output
+                # Pools the WIDTH axis (image columns) to the fixed CTC
+                # timestep count. Applied only AFTER the height axis has
+                # been collapsed, so every timestep is a contiguous span of
+                # image columns (M9).
                 self.reshape_out = nn.AdaptiveAvgPool1D(80)  # Fixed output length
                 
                 # Output head
@@ -620,10 +663,18 @@ class PaddleOCRScratchTrainer:
                 # Transformer
                 x = self.transformer(x)
                 
-                # Reshape for CTC
-                x = x.transpose([0, 2, 1])  # (b, c, seq)
-                x = self.reshape_out(x)  # (b, c, 80)
-                x = x.transpose([0, 2, 1])  # (b, 80, c)
+                # Reshape for CTC (M9). flatten(2) built an h-major sequence
+                # (index = row * w + col), so pooling it straight to 80 bins
+                # mixed pixels from DIFFERENT ROWS into single timesteps and
+                # broke CTC's premise that timesteps advance monotonically
+                # along the writing direction. Restore the 2-D grid, collapse
+                # HEIGHT first so each position is one image COLUMN, then
+                # pool along width only.
+                x = x.reshape([-1, h, w, c])  # (b, h, w, c)
+                x = x.mean(axis=1)            # (b, w, c) - per-column features
+                x = x.transpose([0, 2, 1])    # (b, c, w)
+                x = self.reshape_out(x)       # (b, c, 80) - columns -> timesteps
+                x = x.transpose([0, 2, 1])    # (b, 80, c)
                 
                 # Output
                 output = self.fc(x)
@@ -796,15 +847,29 @@ class PaddleOCRScratchTrainer:
         
         return PPOCRv5(num_classes, self.config.image_height, self.config.image_width)
     
-    def _setup_optimizer(self):
-        """Setup optimizer and learning rate scheduler."""
+    def _setup_optimizer(self, steps_per_epoch: int):
+        """Setup optimizer and learning rate scheduler.
+        
+        Args:
+            steps_per_epoch: REAL number of optimizer steps per epoch,
+                i.e. len(train_loader). The schedule horizon is built in
+                STEP units and train() calls scheduler.step() once per
+                batch, so `warmup_epochs` and `lr_scheduler` take effect
+                exactly as configured. Previously the horizon came from a
+                guessed max(100, 1000 // batch_size) and the scheduler was
+                never stepped at all (C4), so every warmup run trained at
+                start_lr (1% of the configured LR) forever.
+        """
         import paddle
         
-        # Learning rate scheduler
-        # Estimate total steps based on epochs (minimum 100 steps per epoch for small datasets)
-        estimated_steps_per_epoch = max(100, 1000 // self.config.batch_size)
-        total_steps = max(self.config.num_epochs * estimated_steps_per_epoch, 100)
-        warmup_steps = min(self.config.warmup_epochs * estimated_steps_per_epoch, total_steps // 2)
+        if steps_per_epoch <= 0:
+            raise ValueError(
+                f"steps_per_epoch must be positive, got {steps_per_epoch}"
+            )
+        
+        # Schedule horizon in real optimizer steps.
+        total_steps = max(self.config.num_epochs * steps_per_epoch, 1)
+        warmup_steps = min(self.config.warmup_epochs * steps_per_epoch, total_steps // 2)
         
         # Ensure T_max is at least 1
         t_max = max(total_steps - warmup_steps, 1)
@@ -815,7 +880,9 @@ class PaddleOCRScratchTrainer:
                 T_max=t_max,
             )
         elif self.config.lr_scheduler == "step":
-            step_size = max(self.config.num_epochs // 3, 1)
+            # Decay every ~third of the run. step_size is in scheduler
+            # steps, which advance once per batch.
+            step_size = max(self.config.num_epochs // 3, 1) * steps_per_epoch
             lr_scheduler = paddle.optimizer.lr.StepDecay(
                 learning_rate=self.config.learning_rate,
                 step_size=step_size,
@@ -858,6 +925,10 @@ class PaddleOCRScratchTrainer:
         logger.info(f"Optimizer: {self.config.optimizer}")
         logger.info(f"Learning rate: {self.config.learning_rate}")
         logger.info(f"LR scheduler: {self.config.lr_scheduler}")
+        logger.info(
+            f"Schedule horizon: {total_steps} steps "
+            f"({steps_per_epoch} steps/epoch), warmup {warmup_steps} steps"
+        )
     
     def train(self):
         """Run training from scratch."""
@@ -881,8 +952,56 @@ class PaddleOCRScratchTrainer:
             is_training=False
         )
         
+        # Guard the epoch averages and the schedule horizon (L22): with
+        # drop_last=True a dataset smaller than batch_size yields ZERO
+        # batches, which previously surfaced as ZeroDivisionError at the
+        # end of the first epoch.
+        steps_per_epoch = len(train_loader)
+        if steps_per_epoch == 0:
+            raise RuntimeError(
+                f"Training loader is empty: every epoch would run 0 batches "
+                f"(batch_size={self.config.batch_size} with drop_last=True "
+                f"drops the final partial batch). Reduce batch_size or add "
+                f"training data."
+            )
+        
+        # Build optimizer + LR schedule from the REAL steps-per-epoch (C4).
+        self._setup_optimizer(steps_per_epoch)
+        # Constant-LR configs store a plain float in self.scheduler; only
+        # real schedulers are stepped.
+        scheduler_is_steppable = isinstance(
+            self.scheduler, paddle.optimizer.lr.LRScheduler
+        )
+        
         # Loss function
         loss_fn = paddle.nn.CTCLoss(blank=0, reduction='mean')
+        
+        label_smoothing = float(self.config.label_smoothing)
+        if not 0.0 <= label_smoothing < 1.0:
+            raise ValueError(
+                f"label_smoothing must be in [0, 1), got {label_smoothing}"
+            )
+        
+        def _compute_loss(images, labels, label_lengths):
+            """CTC loss with optional uniform label smoothing (L22).
+            
+            Standard label smoothing rewrites one-hot CE targets as
+            (1-eps)*one_hot + eps*uniform, which decomposes into
+            (1-eps)*CE + eps*CE(uniform). The CTC analogue blends the CTC
+            loss with the cross-entropy of every timestep's distribution
+            against the uniform distribution. At eps=0 this is exactly the
+            plain CTC loss. The `label_smoothing` knob was previously
+            parsed and never used.
+            """
+            outputs = self.model(images)
+            # Reshape for CTC: (T, N, C)
+            outputs = outputs.transpose([1, 0, 2])
+            input_lengths = paddle.full([outputs.shape[1]], outputs.shape[0], dtype='int64')
+            loss = loss_fn(outputs, labels, input_lengths, label_lengths)
+            if label_smoothing > 0.0:
+                uniform_ce = -paddle.nn.functional.log_softmax(outputs, axis=2).mean()
+                loss = (1.0 - label_smoothing) * loss + label_smoothing * uniform_ce
+            return loss
         
         # Progress file path for UI monitoring
         progress_file = Path(self.config.output_dir) / "training_progress.json"
@@ -906,9 +1025,36 @@ class PaddleOCRScratchTrainer:
             except Exception as e:
                 logger.warning(f"Failed to write progress file: {e}")
         
+        def _validate_and_save_best(epoch, batch, avg_loss):
+            """Validate, log, persist progress and save best_model (M10).
+            
+            Runs the FULL best-model logic on every validation, wherever it
+            was triggered from (periodic step boundary or end of epoch).
+            """
+            val_acc, val_metrics = self._evaluate(val_loader)
+            logger.info(f"Validation Accuracy: {val_acc:.2%}")
+            
+            # Print comprehensive metrics
+            if val_metrics:
+                m = val_metrics
+                logger.info(f"  📊 Image-Level: {m.get('correct_images', 0)}/{m.get('total_images', 0)} correct ({m.get('image_accuracy', 0)*100:.2f}%)")
+                logger.info(f"  📝 Char-Level: Acc={m.get('char_accuracy', 0)*100:.2f}%, F1-micro={m.get('f1_micro', 0):.4f}, F1-macro={m.get('f1_macro', 0):.4f}")
+                logger.info(f"  🏭 Industry: CER={m.get('cer', 1)*100:.2f}%, ValidVIN={m.get('valid_vin_rate', 0)*100:.2f}%")
+            
+            # Write progress with accuracy
+            _write_progress(epoch+1, batch, total_batches, avg_loss, val_acc, f"Validation: {val_acc:.2%}")
+            
+            # First validation writes the baseline best_model; afterwards
+            # only strict improvement overwrites it.
+            if val_acc > self.best_accuracy or not self._best_checkpoint_written:
+                self.best_accuracy = max(self.best_accuracy, val_acc)
+                self._save_checkpoint("best_model", epoch, val_acc)
+                self._best_checkpoint_written = True
+            return val_acc
+        
         # Training loop
         global_step = 0
-        total_batches = len(train_loader) if hasattr(train_loader, '__len__') else 1000
+        total_batches = steps_per_epoch
         for epoch in range(self.config.num_epochs):
             self.model.train()
             epoch_loss = 0.0
@@ -920,26 +1066,26 @@ class PaddleOCRScratchTrainer:
                 # Forward pass with AMP
                 if self.config.use_amp:
                     with auto_cast():
-                        outputs = self.model(images)
-                        # Reshape for CTC: (T, N, C)
-                        outputs = outputs.transpose([1, 0, 2])
-                        input_lengths = paddle.full([outputs.shape[1]], outputs.shape[0], dtype='int64')
-                        loss = loss_fn(outputs, labels, input_lengths, label_lengths)
+                        loss = _compute_loss(images, labels, label_lengths)
                     
                     # Backward with scaler
                     scaled_loss = self.scaler.scale(loss)
                     scaled_loss.backward()
                     self.scaler.minimize(self.optimizer, scaled_loss)
                 else:
-                    outputs = self.model(images)
-                    outputs = outputs.transpose([1, 0, 2])
-                    input_lengths = paddle.full([outputs.shape[1]], outputs.shape[0], dtype='int64')
-                    loss = loss_fn(outputs, labels, input_lengths, label_lengths)
+                    loss = _compute_loss(images, labels, label_lengths)
                     
                     loss.backward()
                     self.optimizer.step()
                 
                 self.optimizer.clear_grad()
+                
+                # Advance the LR schedule once per optimizer step - the
+                # horizon in _setup_optimizer is built in step units.
+                # Without this call the schedule never moved and the whole
+                # run trained at the warmup start LR (C4).
+                if scheduler_is_steppable:
+                    self.scheduler.step()
                 
                 epoch_loss += require_finite_loss(
                     loss.item(),
@@ -957,29 +1103,21 @@ class PaddleOCRScratchTrainer:
                                f"Loss: {avg_loss:.4f} | LR: {lr:.6f}")
                     _write_progress(epoch+1, batch_idx+1, total_batches, avg_loss)
                 
-                # Evaluate
-                if global_step % self.config.eval_batch_step == 0:
-                    val_acc, val_metrics = self._evaluate(val_loader)
-                    logger.info(f"Validation Accuracy: {val_acc:.2%}")
-                    
-                    # Print comprehensive metrics
-                    if val_metrics:
-                        m = val_metrics
-                        logger.info(f"  📊 Image-Level: {m.get('correct_images', 0)}/{m.get('total_images', 0)} correct ({m.get('image_accuracy', 0)*100:.2f}%)")
-                        logger.info(f"  📝 Char-Level: Acc={m.get('char_accuracy', 0)*100:.2f}%, F1-micro={m.get('f1_micro', 0):.4f}, F1-macro={m.get('f1_macro', 0):.4f}")
-                        logger.info(f"  🏭 Industry: CER={m.get('cer', 1)*100:.2f}%, ValidVIN={m.get('valid_vin_rate', 0)*100:.2f}%")
-                    
-                    # Write progress with accuracy
-                    _write_progress(epoch+1, batch_idx+1, total_batches, epoch_loss/num_batches, val_acc, f"Validation: {val_acc:.2%}")
-                    
-                    if val_acc > self.best_accuracy:
-                        self.best_accuracy = val_acc
-                        self._save_checkpoint("best_model", epoch, val_acc)
+                # Periodic evaluation (kept); the end-of-epoch evaluation
+                # below runs regardless, so short runs still validate (M10).
+                if self.config.eval_batch_step > 0 and global_step % self.config.eval_batch_step == 0:
+                    _validate_and_save_best(epoch, batch_idx + 1, epoch_loss / num_batches)
             
             # End of epoch
             avg_epoch_loss = epoch_loss / num_batches
             self.train_losses.append(avg_epoch_loss)
             logger.info(f"Epoch {epoch+1} complete. Avg Loss: {avg_epoch_loss:.4f}")
+            
+            # End-of-epoch validation - ALWAYS runs, so runs shorter than
+            # eval_batch_step global steps still validate and still write
+            # best_model (M10).
+            _validate_and_save_best(epoch, total_batches, avg_epoch_loss)
+            
             _write_progress(epoch+1, total_batches, total_batches, avg_epoch_loss, self.best_accuracy, f"Epoch {epoch+1} complete")
             
             # Save checkpoint
@@ -1025,18 +1163,31 @@ class PaddleOCRScratchTrainer:
         vin_preprocessor = VINPreprocessor(config=vin_preprocess_config)
         
         class VINDataset(Dataset):
+            #: Fraction of distinct unreadable images above which the run
+            #: aborts: past that point the epoch is substantially built from
+            #: duplicated neighbour samples and no longer measures the
+            #: dataset. Mirrors finetune_paddleocr.VINRecognitionDataset.
+            MAX_CORRUPT_FRACTION = 0.05
+            
             def __init__(self, data_dir, label_file, char_dict, img_h, img_w, 
-                         max_len, augment=False, preprocessor=None):
+                         max_len, augment=False, aug_prob=0.5, preprocessor=None):
                 self.data_dir = Path(data_dir)
                 self.char_dict = char_dict
                 self.img_h = img_h
                 self.img_w = img_w
                 self.max_len = max_len
                 self.augment = augment
+                self.aug_prob = float(aug_prob)
+                if not 0.0 <= self.aug_prob <= 1.0:
+                    raise ValueError(f"aug_prob must be in [0, 1], got {aug_prob}")
                 self.preprocessor = preprocessor
+                # Unreadable paths already warned about, so each is logged
+                # once rather than once per epoch (M12).
+                self._corrupt_paths = set()
                 
                 # Load samples
                 self.samples = []
+                rejected_unknown = 0
                 if os.path.exists(label_file):
                     with open(label_file, 'r') as f:
                         for line in f:
@@ -1052,7 +1203,29 @@ class PaddleOCRScratchTrainer:
                             
                             if len(parts) == 2:
                                 img_path, label = parts
-                                self.samples.append((img_path.strip(), label.strip()))
+                                img_path, label = img_path.strip(), label.strip()
+                                # Reject labels with characters outside the
+                                # training charset (L22): silently dropping
+                                # the characters shortened the CTC target and
+                                # supervised the model on text that is NOT
+                                # the image's text. Policy matches the M13
+                                # fix direction in finetune_paddleocr:
+                                # reject the sample with a warning.
+                                unknown = sorted({c for c in label if c not in self.char_dict})
+                                if unknown:
+                                    rejected_unknown += 1
+                                    logger.warning(
+                                        f"Rejecting sample {img_path}: label {label!r} "
+                                        f"contains characters outside the charset: {unknown}"
+                                    )
+                                    continue
+                                self.samples.append((img_path, label))
+                
+                if rejected_unknown:
+                    logger.warning(
+                        f"Rejected {rejected_unknown} sample(s) with "
+                        f"out-of-charset labels from {label_file}"
+                    )
                 
                 # Validate we have samples
                 if len(self.samples) == 0:
@@ -1068,19 +1241,39 @@ class PaddleOCRScratchTrainer:
                 return len(self.samples)
             
             def __getitem__(self, idx):
-                img_path, label = self.samples[idx]
-                
-                # Load image with proper error handling
-                full_path = self.data_dir / img_path
-                if not full_path.exists():
-                    full_path = Path(img_path)
-                
-                img = cv2.imread(str(full_path))
+                # Skip unreadable images by advancing to the next sample
+                # with a bounded LOOP, not recursion (M12): recursing on
+                # (idx + 1) % len is a RecursionError on a run of bad files
+                # and silently duplicates neighbours otherwise. Every skipped
+                # path is logged (once); an all-corrupt dataset raises.
+                img = None
+                for offset in range(len(self.samples)):
+                    img_path, label = self.samples[(idx + offset) % len(self.samples)]
+                    full_path = self.data_dir / img_path
+                    if not full_path.exists():
+                        full_path = Path(img_path)
+                    img = cv2.imread(str(full_path))
+                    if img is not None:
+                        break
+                    if img_path not in self._corrupt_paths:
+                        self._corrupt_paths.add(img_path)
+                        logger.warning(f"Unreadable image skipped: {full_path}")
                 if img is None:
-                    # Fail fast: Skip corrupted samples by returning next valid sample
-                    # This maintains data integrity - never train on fake data
-                    logger.warning(f"Failed to load image: {full_path}, trying next sample")
-                    return self.__getitem__((idx + 1) % len(self.samples))
+                    raise RuntimeError(
+                        f"No readable image in the entire dataset "
+                        f"({len(self.samples)} samples); first path: "
+                        f"{self.samples[idx][0]}"
+                    )
+                max_corrupt = max(1, int(len(self.samples) * self.MAX_CORRUPT_FRACTION))
+                if len(self._corrupt_paths) > max_corrupt:
+                    raise RuntimeError(
+                        f"{len(self._corrupt_paths)} of {len(self.samples)} "
+                        f"images are unreadable "
+                        f"(>{self.MAX_CORRUPT_FRACTION:.0%}); aborting - a "
+                        f"run padded with duplicated neighbours would measure "
+                        f"the loader, not the dataset. Corrupt paths logged "
+                        f"above."
+                    )
                 
                 # Apply VIN-optimized preprocessing (CLAHE, morphology, etc.)
                 if self.preprocessor is not None:
@@ -1092,15 +1285,14 @@ class PaddleOCRScratchTrainer:
                 img = (img - 0.5) / 0.5  # Normalize to [-1, 1]
                 img = img.transpose([2, 0, 1])  # HWC -> CHW
                 
-                # Augmentation
-                if self.augment:
+                # Augmentation, gated by the configured probability (L22:
+                # aug_prob was previously parsed and ignored).
+                if self.augment and np.random.random() < self.aug_prob:
                     img = self._augment(img)
                 
-                # Encode label
-                label_encoded = []
-                for char in label[:self.max_len]:
-                    if char in self.char_dict:
-                        label_encoded.append(self.char_dict[char])
+                # Encode label. Labels were validated against the charset at
+                # load time, so every character maps.
+                label_encoded = [self.char_dict[char] for char in label[:self.max_len]]
                 
                 # Pad label
                 label_length = len(label_encoded)
@@ -1129,6 +1321,7 @@ class PaddleOCRScratchTrainer:
             self.config.image_height, self.config.image_width,
             self.config.max_text_length,
             augment=is_training and self.config.use_augmentation,
+            aug_prob=self.config.aug_prob,
             preprocessor=vin_preprocessor
         )
         
@@ -1226,7 +1419,7 @@ class PaddleOCRScratchTrainer:
             
         except ImportError:
             # Fallback to basic accuracy
-            correct = sum(1 for p, t in zip(all_predictions, all_targets) if p == t)
+            correct = sum(1 for p, t in zip(all_predictions, all_targets, strict=True) if p == t)
             total = len(all_predictions)
             accuracy = correct / total if total > 0 else 0.0
             return accuracy, {'image_accuracy': accuracy, 'correct_images': correct, 'total_images': total}
@@ -1259,10 +1452,8 @@ class PaddleOCRScratchTrainer:
         
         logger.info("Exporting model to ONNX...")
         
-        # Create dummy input
-        dummy_input = paddle.randn([1, 3, self.config.image_height, self.config.image_width])
-        
-        # Export
+        # Export (the input contract is carried by input_spec below; a
+        # dead `dummy_input` tensor used to be created here and never used)
         onnx_path = Path(self.config.output_dir) / "model.onnx"
         
         try:
@@ -1321,6 +1512,15 @@ class DeepSeekScratchTrainer:
                 logger.info("Using CPU")
         except ImportError:
             raise RuntimeError("PyTorch not installed. Run: pip install torch")
+        
+        # Seed every RNG this trainer draws from (M11): python's random,
+        # numpy (preprocessing) and torch (weight init, DataLoader
+        # shuffling; manual_seed also seeds the CUDA/MPS generators). The
+        # `seed` config field was previously parsed and never used.
+        random.seed(self.config.seed)
+        np.random.seed(self.config.seed)
+        torch.manual_seed(self.config.seed)
+        logger.info(f"Random seed: {self.config.seed}")
         
         # Create output directory
         os.makedirs(self.config.output_dir, exist_ok=True)
@@ -1400,9 +1600,16 @@ class DeepSeekScratchTrainer:
                     logits = self.output_proj(decoded)
                     return logits
                 else:
-                    # Autoregressive generation
+                    # Autoregressive generation, seeded with <SOS> exactly
+                    # like the teacher-forced training sequences (M8).
+                    # Seeding with zeros fed <PAD> as the first decoder
+                    # input - a token the decoder never saw in that position
+                    # during training.
                     batch_size = images.size(0)
-                    generated = torch.zeros(batch_size, 1, dtype=torch.long, device=images.device)
+                    generated = torch.full(
+                        (batch_size, 1), SOS_TOKEN_ID,
+                        dtype=torch.long, device=images.device,
+                    )
                     
                     for _ in range(max_len):
                         tgt_embed = self.token_embed(generated)
@@ -1456,11 +1663,18 @@ class DeepSeekScratchTrainer:
         )
         
         # Loss function
-        loss_fn = nn.CrossEntropyLoss(ignore_index=0)  # 0 is PAD
+        loss_fn = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
         
         # Create dataloaders
         train_loader = self._create_dataloader(is_training=True)
         val_loader = self._create_dataloader(is_training=False)
+        
+        accumulation_steps = int(self.config.gradient_accumulation_steps)
+        if accumulation_steps < 1:
+            raise ValueError(
+                f"gradient_accumulation_steps must be >= 1, "
+                f"got {accumulation_steps}"
+            )
         
         # Training loop
         for epoch in range(self.config.num_epochs):
@@ -1481,11 +1695,14 @@ class DeepSeekScratchTrainer:
                     labels[:, 1:].reshape(-1)  # Shift targets
                 )
                 
-                # Backward pass
-                loss.backward()
+                # Backward pass. Dividing by the accumulation window makes
+                # the accumulated gradient the gradient of the MEAN loss
+                # over the window (M7); without it every accumulated step
+                # was accumulation_steps times larger than configured.
+                (loss / accumulation_steps).backward()
                 
                 # Gradient accumulation
-                if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
+                if (batch_idx + 1) % accumulation_steps == 0:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
                         self.config.max_grad_norm
@@ -1502,6 +1719,23 @@ class DeepSeekScratchTrainer:
                 
                 if batch_idx % 50 == 0:
                     logger.info(f"Epoch {epoch+1}/{self.config.num_epochs} | Batch {batch_idx} | Loss: {loss.item():.4f}")
+            
+            if num_batches == 0:
+                raise RuntimeError(
+                    "Training loader produced zero batches; cannot compute "
+                    "an epoch average. Check the dataset and batch size."
+                )
+            
+            # Flush the leftover partial accumulation window (M7): stepping
+            # here keeps its gradients from silently leaking into the first
+            # update of the NEXT epoch.
+            if num_batches % accumulation_steps != 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.max_grad_norm
+                )
+                self.optimizer.step()
+                self.optimizer.zero_grad()
             
             # End of epoch
             scheduler.step()
@@ -1545,17 +1779,26 @@ class DeepSeekScratchTrainer:
         vin_preprocessor = VINPreprocessor(config=vin_preprocess_config)
         
         class VINVLMDataset(Dataset):
+            #: Fraction of distinct unreadable images above which the run
+            #: aborts (M12) - mirrors the paddle dataset above and
+            #: finetune_paddleocr.VINRecognitionDataset.
+            MAX_CORRUPT_FRACTION = 0.05
+            
             def __init__(self, data_path, data_dir, img_size, max_len, is_train, preprocessor=None):
                 self.data_dir = Path(data_dir)
                 self.img_size = img_size
                 self.max_len = max_len
                 self.preprocessor = preprocessor
+                # Unreadable paths already warned about (logged once each).
+                self._corrupt_paths = set()
                 
-                # Create vocab
+                # Create vocab. The special ids are the module-level
+                # constants so the model's generation seed (SOS_TOKEN_ID)
+                # can never drift from this encoding (M8).
                 self.char_to_idx = {c: i + 3 for i, c in enumerate(VIN_CHARACTERS)}
-                self.char_to_idx['<PAD>'] = 0
-                self.char_to_idx['<SOS>'] = 1
-                self.char_to_idx['<EOS>'] = 2
+                self.char_to_idx['<PAD>'] = PAD_TOKEN_ID
+                self.char_to_idx['<SOS>'] = SOS_TOKEN_ID
+                self.char_to_idx['<EOS>'] = EOS_TOKEN_ID
                 
                 # Load samples
                 self.samples = []
@@ -1565,6 +1808,18 @@ class DeepSeekScratchTrainer:
                             line = line.strip()
                             if '\t' in line:
                                 img_path, label = line.split('\t', 1)
+                                img_path, label = img_path.strip(), label.strip()
+                                # Reject labels with characters outside the
+                                # charset (L22): silently dropping them
+                                # supervised the model on text that is NOT
+                                # the image's text.
+                                unknown = sorted({c for c in label if c not in self.char_to_idx})
+                                if unknown:
+                                    logger.warning(
+                                        f"Rejecting sample {img_path}: label {label!r} "
+                                        f"contains characters outside the charset: {unknown}"
+                                    )
+                                    continue
                                 self.samples.append((img_path, label))
             
             def __len__(self):
@@ -1579,18 +1834,38 @@ class DeepSeekScratchTrainer:
                 if not self.samples:
                     raise ValueError("Dataset is empty. Cannot retrieve samples from empty dataset.")
                 
-                img_path, label_text = self.samples[idx]
-                
-                # Load and preprocess image with proper error handling
-                full_path = self.data_dir / img_path
-                if not full_path.exists():
-                    full_path = Path(img_path)
-                
-                img = cv2.imread(str(full_path))
+                # Skip unreadable images by advancing to the next sample
+                # with a bounded LOOP, not recursion (M12): recursing on
+                # (idx + 1) % len is a RecursionError on a run of bad files
+                # and silently duplicates neighbours otherwise.
+                img = None
+                for offset in range(len(self.samples)):
+                    img_path, label_text = self.samples[(idx + offset) % len(self.samples)]
+                    full_path = self.data_dir / img_path
+                    if not full_path.exists():
+                        full_path = Path(img_path)
+                    img = cv2.imread(str(full_path))
+                    if img is not None:
+                        break
+                    if img_path not in self._corrupt_paths:
+                        self._corrupt_paths.add(img_path)
+                        logger.warning(f"Unreadable image skipped: {full_path}")
                 if img is None:
-                    # Fail fast: Skip corrupted samples by returning next valid sample
-                    logger.warning(f"Failed to load image: {full_path}, trying next sample")
-                    return self.__getitem__((idx + 1) % len(self.samples))
+                    raise RuntimeError(
+                        f"No readable image in the entire dataset "
+                        f"({len(self.samples)} samples); first path: "
+                        f"{self.samples[idx][0]}"
+                    )
+                max_corrupt = max(1, int(len(self.samples) * self.MAX_CORRUPT_FRACTION))
+                if len(self._corrupt_paths) > max_corrupt:
+                    raise RuntimeError(
+                        f"{len(self._corrupt_paths)} of {len(self.samples)} "
+                        f"images are unreadable "
+                        f"(>{self.MAX_CORRUPT_FRACTION:.0%}); aborting - a "
+                        f"run padded with duplicated neighbours would measure "
+                        f"the loader, not the dataset. Corrupt paths logged "
+                        f"above."
+                    )
                 
                 # Apply VIN-optimized preprocessing (CLAHE, morphology, etc.)
                 if self.preprocessor is not None:
@@ -1600,11 +1875,11 @@ class DeepSeekScratchTrainer:
                 img = img.astype(np.float32) / 255.0
                 img = torch.from_numpy(img).permute(2, 0, 1)
                 
-                # Encode label: <SOS> + chars + <EOS> + <PAD>
+                # Encode label: <SOS> + chars + <EOS> + <PAD>. Labels were
+                # validated against the charset at load time.
                 label = [self.char_to_idx['<SOS>']]
                 for c in label_text[:self.max_len]:
-                    if c in self.char_to_idx:
-                        label.append(self.char_to_idx[c])
+                    label.append(self.char_to_idx[c])
                 label.append(self.char_to_idx['<EOS>'])
                 
                 # Pad
@@ -1688,7 +1963,7 @@ class DeepSeekScratchTrainer:
             }
             return metrics['image_accuracy'], metrics
         except ImportError:
-            correct = sum(1 for p, t in zip(all_predictions, all_targets) if p == t)
+            correct = sum(1 for p, t in zip(all_predictions, all_targets, strict=True) if p == t)
             total = len(all_predictions)
             accuracy = correct / total if total > 0 else 0.0
             return accuracy, {'image_accuracy': accuracy}

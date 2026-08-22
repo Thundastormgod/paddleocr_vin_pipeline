@@ -32,6 +32,7 @@ Date: January 2026
 """
 
 import argparse
+import difflib
 import json
 import logging
 import os
@@ -44,7 +45,7 @@ from typing import Dict, List, Optional, Tuple
 import warnings
 
 # Import from shared utilities (Single Source of Truth)
-from src.vin_ocr.core.vin_utils import VIN_LENGTH, VIN_VALID_CHARS
+from src.vin_ocr.core.vin_utils import VIN_LENGTH, VIN_VALID_CHARS, validate_checksum
 from config import get_config
 
 warnings.filterwarnings('ignore')
@@ -56,6 +57,12 @@ class VINTrainingPipeline:
     
     # Use shared constants from vin_utils
     VIN_CHARSET = VIN_VALID_CHARS
+
+    # Learned-rule acceptance thresholds: a pred->gt confusion becomes a rule
+    # only if seen at least MIN_RULE_ERRORS times AND the predicted character
+    # is wrong in at least MIN_RULE_PURITY of its aligned occurrences.
+    MIN_RULE_ERRORS = 2
+    MIN_RULE_PURITY = 0.8
     
     def __init__(
         self,
@@ -175,7 +182,7 @@ class VINTrainingPipeline:
         paths, labels = self.load_dataset("train")
         aug_labels = []
         
-        for img_path, vin in zip(paths, labels):
+        for img_path, vin in zip(paths, labels, strict=True):
             img = cv2.imread(img_path)
             if img is None:
                 continue
@@ -201,7 +208,7 @@ class VINTrainingPipeline:
             (aug_dir / "val").mkdir(exist_ok=True)
             val_labels = []
             vp, vl = self.load_dataset("val")
-            for p, v in zip(vp, vl):
+            for p, v in zip(vp, vl, strict=True):
                 shutil.copy(p, aug_dir / "val" / Path(p).name)
                 val_labels.append((f"val/{Path(p).name}", v))
             with open(aug_dir / "val_labels.txt", 'w') as f:
@@ -240,7 +247,7 @@ class VINTrainingPipeline:
         
         print("\nCollecting OCR predictions...")
         results = []
-        for i, (p, gt) in enumerate(zip(train_paths, train_labels)):
+        for i, (p, gt) in enumerate(zip(train_paths, train_labels, strict=True)):
             try:
                 r = self.pipeline.recognize(p)
                 pred = r.get('vin', '')
@@ -288,26 +295,55 @@ class VINTrainingPipeline:
         return model
     
     def _build_correction_rules(self, results: List[Dict]) -> Dict:
-        rules = {"I": "1", "O": "0", "Q": "0", "l": "1", "o": "0", "S": "5", "B": "8", "G": "6", "Z": "2"}
-        mappings = {}
+        """
+        Build character-correction rules from OCR results.
+
+        Seed rules map ONLY the three characters that can never appear in a
+        VIN (I, O, Q) to their look-alike digits. S/B/G/Z and every other
+        letter are LEGAL VIN characters and must never be seeded: a seeded
+        S->5 rewrote every correct 'SAL...' read to '5AL...' (audit C1).
+
+        Learned rules are mined from edit-distance alignments
+        (difflib.SequenceMatcher opcodes), never positional zip, so a single
+        insertion/deletion cannot misalign every subsequent position (M33).
+        Only equal-length 'replace' opcodes yield char->char pairings.
+        A candidate rule pred_char -> gt_char is accepted only if:
+          - the confusion was observed >= MIN_RULE_ERRORS times, and
+          - errors / (errors + times pred_char was read correctly at aligned
+            positions) >= MIN_RULE_PURITY.
+        """
+        rules = {"I": "1", "O": "0", "Q": "0"}
+        confusions: Dict[str, Dict[str, int]] = {}
+        correct_reads: Dict[str, int] = {}
         for r in results:
-            if r['correct']:
+            gt = r['gt'].upper()
+            pred = r['pred'].upper()
+            matcher = difflib.SequenceMatcher(None, gt, pred, autojunk=False)
+            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                if tag == 'equal':
+                    for c in pred[j1:j2]:
+                        correct_reads[c] = correct_reads.get(c, 0) + 1
+                elif tag == 'replace' and (i2 - i1) == (j2 - j1):
+                    for g, p in zip(gt[i1:i2], pred[j1:j2], strict=True):
+                        if g != p:
+                            confusions.setdefault(p, {})
+                            confusions[p][g] = confusions[p].get(g, 0) + 1
+        for pred_char, gt_counts in confusions.items():
+            if pred_char in rules:
+                continue  # I/O/Q policy mappings are fixed, not data-driven
+            best_gt = max(gt_counts, key=gt_counts.get)
+            if best_gt not in self.VIN_CHARSET:
                 continue
-            for g, p in zip(r['gt'], r['pred']):
-                if g != p:
-                    if p not in mappings:
-                        mappings[p] = {}
-                    mappings[p][g] = mappings[p].get(g, 0) + 1
-        for pc, corr in mappings.items():
-            if corr:
-                best = max(corr, key=corr.get)
-                if best in self.VIN_CHARSET:
-                    rules[pc] = best
+            errors = gt_counts[best_gt]
+            correct = correct_reads.get(pred_char, 0)
+            error_ratio = errors / (errors + correct)
+            if errors >= self.MIN_RULE_ERRORS and error_ratio >= self.MIN_RULE_PURITY:
+                rules[pred_char] = best_gt
         return rules
     
     def _evaluate(self, paths, labels, rules) -> Dict:
         results = []
-        for p, gt in zip(paths, labels):
+        for p, gt in zip(paths, labels, strict=True):
             try:
                 r = self.pipeline.recognize(p)
                 pred = r.get('vin', '')
@@ -325,15 +361,30 @@ class VINTrainingPipeline:
         }
     
     def _apply_rules(self, vin: str, rules: Dict) -> str:
+        """
+        Apply correction rules, gated by the ISO 3779 checksum.
+
+        A checksum-valid input is already a plausible VIN and is returned
+        unchanged (rules must never corrupt a correct read). For invalid
+        inputs the rules are applied; the rewrite is kept only if it becomes
+        checksum-valid, otherwise the original input is returned unchanged.
+        Characters with no rule that are not legal VIN characters are
+        DROPPED, not passed through (audit AST01/L8).
+        """
+        if validate_checksum(vin):
+            return vin
         out = ""
         for c in vin:
-            if c in rules:
-                out += rules[c]
-            elif c.upper() in self.VIN_CHARSET:
-                out += c.upper()
-            else:
-                out += c.upper()
-        return out[:17]
+            cu = c.upper()
+            if cu in rules:
+                out += rules[cu]
+            elif cu in self.VIN_CHARSET:
+                out += cu
+            # else: not correctable and not a legal VIN character - drop it
+        out = out[:VIN_LENGTH]
+        if validate_checksum(out):
+            return out
+        return vin
     
     def train(self, method: str = "rules", verbose: bool = True) -> Dict:
         """
@@ -421,7 +472,7 @@ class VINTrainingPipeline:
         
         # Create label files in PaddleOCR format
         with open(finetune_data_dir / "train_labels.txt", 'w') as f:
-            for i, (src_path, label) in enumerate(zip(train_paths, train_labels)):
+            for i, (src_path, label) in enumerate(zip(train_paths, train_labels, strict=True)):
                 ext = Path(src_path).suffix
                 dest_name = f"train_{i:06d}{ext}"
                 dest_path = train_dir / dest_name
@@ -433,7 +484,7 @@ class VINTrainingPipeline:
                 f.write(f"train/{dest_name}\t{label}\n")
         
         with open(finetune_data_dir / "val_labels.txt", 'w') as f:
-            for i, (src_path, label) in enumerate(zip(val_paths, val_labels)):
+            for i, (src_path, label) in enumerate(zip(val_paths, val_labels, strict=True)):
                 ext = Path(src_path).suffix
                 dest_name = f"val_{i:06d}{ext}"
                 dest_path = val_dir / dest_name
@@ -482,15 +533,14 @@ class VINTrainingPipeline:
         print(f"   GPU: {'Enabled' if self.use_gpu else 'Disabled'}")
         print(f"   Config: {runtime_config_path}")
         
-        # Run fine-tuning
+        # Run fine-tuning. GPU intent travels via config['Global']['use_gpu']
+        # (written into runtime_config above); finetune_paddleocr.py's argparse
+        # accepts no --cpu flag and would exit code 2 on it (audit H7).
         cmd = [
             sys.executable,
             str(finetune_script),
             "--config", str(runtime_config_path),
         ]
-        
-        if not self.use_gpu:
-            cmd.append("--cpu")
         
         print(f"\n   Running: {' '.join(cmd)}")
         print("=" * 60)

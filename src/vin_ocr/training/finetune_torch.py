@@ -352,6 +352,7 @@ class TorchVINTrainer:
             "best_val_loss": (None if math.isinf(self.best_val_loss)
                               else self.best_val_loss),
             "best_val_char_accuracy": self.best_val_char_accuracy,
+            "epochs_without_improvement": self.epochs_without_improvement,
             "framework": f"torch-{torch.__version__}",
             "device": str(self.device),
             "config": self.config,
@@ -389,6 +390,10 @@ class TorchVINTrainer:
             stored_loss = info.get("best_val_loss")
             self.best_val_loss = (float("inf") if stored_loss is None
                                   else float(stored_loss))
+            # Early-stop patience must survive resume: a counter silently
+            # reset to 0 grants every resumed run a fresh patience budget.
+            self.epochs_without_improvement = int(
+                info.get("epochs_without_improvement", 0))
         print(f"Resumed from epoch {self.current_epoch}", flush=True)
 
     # -- core loops -----------------------------------------------------------
@@ -430,6 +435,8 @@ class TorchVINTrainer:
 
     def validate(self) -> Tuple[float, float, float]:
         """Returns (val_loss, exact_match, char_accuracy) - canonical metrics."""
+        from src.vin_ocr.training.finetune_paddleocr import ctc_input_lengths
+
         self.model.eval()
         total_loss, batches = 0.0, 0
         pairs: List[Tuple[str, str]] = []
@@ -443,8 +450,19 @@ class TorchVINTrainer:
                 total_loss += float(loss)
                 batches += 1
                 ids = logits.argmax(-1).cpu().numpy()
-                for row, ground_truth in zip(ids, batch["text"]):
-                    text, _ = ctc_greedy_decode(row, self.idx_to_char)
+                # Decode only the timesteps training supervises: the SAME
+                # per-sample input lengths the CTC loss uses mask the pad
+                # region, so padding can never emit characters here while
+                # being unsupervised in the loss (repo decode contract).
+                input_lengths = ctc_input_lengths(
+                    valid_widths=batch["valid_width"],
+                    total_timesteps=int(logits.shape[1]),
+                    image_width=INPUT_WIDTH,
+                    label_lengths=[int(n) for n in batch["length"]],
+                )
+                for row, n_valid, ground_truth in zip(
+                        ids, input_lengths, batch["text"], strict=True):
+                    text, _ = ctc_greedy_decode(row[:n_valid], self.idx_to_char)
                     pairs.append((text[:17], ground_truth))
         metrics = char_level_metrics(pairs)
         exact = sum(1 for p, g in pairs if p == g) / max(1, len(pairs))
@@ -566,6 +584,7 @@ def evaluate_torch_checkpoint(checkpoint_path: str, label_file: str,
     (single-image basis; same metric keys) so comparison rows line up.
     """
     from src.vin_ocr.core.vin_utils import validate_vin
+    from src.vin_ocr.training.finetune_paddleocr import ctc_input_lengths
 
     config = load_config(config_path)
     char_to_idx, idx_to_char = load_char_dict(
@@ -593,8 +612,16 @@ def evaluate_torch_checkpoint(checkpoint_path: str, label_file: str,
         for i in range(len(dataset)):
             item = dataset[i]
             logits = model(item["image"][None].to(device))
+            # Same pad-timestep masking as training/validate (M19): only
+            # the sample's valid timesteps may emit characters.
+            n_valid = ctc_input_lengths(
+                valid_widths=[item["valid_width"]],
+                total_timesteps=int(logits.shape[1]),
+                image_width=INPUT_WIDTH,
+                label_lengths=[item["length"]],
+            )[0]
             ids = logits.argmax(-1).cpu().numpy()[0]
-            text, _ = ctc_greedy_decode(ids, idx_to_char)
+            text, _ = ctc_greedy_decode(ids[:n_valid], idx_to_char)
             pred = (post.process(text)["vin"] or "") if post else text[:17]
             pairs.append((pred, item["text"]))
             checksum_ok += validate_vin(pred).checksum_valid
@@ -617,6 +644,31 @@ def evaluate_torch_checkpoint(checkpoint_path: str, label_file: str,
 # =============================================================================
 # TRACKED ENTRYPOINT - MLflow 3 LoggedModel workflow
 # =============================================================================
+
+def _parse_label_file(label_file: str) -> List[Tuple[str, str]]:
+    """
+    Parse (path, vin) pairs with the loaders' tab-OR-space contract.
+
+    Mirrors `VINRecognitionDataset._load_samples` (finetune_paddleocr.py):
+    tab-separated lines split on tab, otherwise on any whitespace (first
+    field only). A tab-only parser here fed whole space-separated lines
+    into the MLflow Dataset entity's `path` column and None into `vin`.
+    """
+    pairs: List[Tuple[str, str]] = []
+    with open(label_file, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if "\t" in line:
+                parts = line.split("\t")
+            else:
+                parts = line.split(None, 1)
+            if len(parts) < 2:
+                continue
+            pairs.append((parts[0].strip(), parts[1].strip()))
+    return pairs
+
 
 def _run_tracked(trainer: TorchVINTrainer, config: Dict[str, Any],
                  args: argparse.Namespace) -> None:
@@ -679,9 +731,12 @@ def _run_tracked(trainer: TorchVINTrainer, config: Dict[str, Any],
         run.log_metrics({k: v for k, v in final.items()})
 
         # MLflow 3 LoggedModel: model + params, metrics linked to
-        # model_id + Dataset entity, then a registry version.
-        labels_df = pd.read_csv(val_label_file, sep="\t",
-                                names=["path", "vin"], dtype=str)
+        # model_id + Dataset entity, then a registry version. The label
+        # file is parsed with the loaders' tab-OR-space contract so the
+        # `vin` column matches what training actually consumed.
+        labels_df = pd.DataFrame(
+            _parse_label_file(val_label_file), columns=["path", "vin"],
+        ).astype(str)
         eval_dataset = mlflow.data.from_pandas(
             labels_df, name=Path(val_label_file).stem, targets="vin")
         mlflow.log_input(eval_dataset, context="evaluation")

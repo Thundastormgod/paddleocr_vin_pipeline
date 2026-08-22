@@ -107,8 +107,12 @@ def ctc_prefix_beam_search(
         new_beams: Dict[Tuple[int, ...], Tuple[float, float]] = {}
 
         def add(prefix: Tuple[int, ...], p_b: float, p_nb: float) -> None:
-            old_b, old_nb = new_beams.get(prefix, (NEG_INF, NEG_INF))
-            new_beams[prefix] = (
+            # B023 false positive (triaged in docs/LOGIC_AUDIT_AST.md §4):
+            # `add` is redefined and fully consumed within THIS loop
+            # iteration, so closing over the current `new_beams` is exactly
+            # the intended behavior - late binding cannot bite.
+            old_b, old_nb = new_beams.get(prefix, (NEG_INF, NEG_INF))  # noqa: B023
+            new_beams[prefix] = (  # noqa: B023
                 _logsumexp2(old_b, p_b), _logsumexp2(old_nb, p_nb)
             )
 

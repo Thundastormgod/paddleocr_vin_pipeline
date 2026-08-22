@@ -24,7 +24,6 @@ from src.vin_ocr.pipeline.vin_pipeline import (
     VINOCRPipeline,
     VINImagePreprocessor,
     VINPostProcessor,
-    VINResult,
     validate_vin,
     decode_vin,
     calculate_check_digit,
@@ -532,6 +531,105 @@ class TestConfiguration:
     def test_vin_length_constant(self):
         """Test that VIN_LENGTH is 17."""
         assert VIN_LENGTH == 17
+
+
+# =============================================================================
+# MULTI-PROVIDER PIPELINE CONSTRUCTION
+# =============================================================================
+
+class TestMultiProviderConstruction:
+    """
+    Regression pins for MultiProviderVINPipeline provider construction.
+
+    Pins two defects found in adversarial review:
+      - use_gpu was passed to _create_provider BOTH explicitly and via
+        **provider_kwargs -> TypeError on the DEFAULT provider path;
+      - paddle-only defaults (det_db_box_thresh/rec_thresh) were injected for
+        ANY ensemble, so deepseek-only ensembles failed strict option routing.
+
+    The factory is stubbed: these tests pin the CONSTRUCTION contract
+    (which kwargs reach which provider), not engine behavior.
+    """
+
+    class _RecordingProvider:
+        def __init__(self, provider_type, kwargs):
+            self.provider_type = provider_type
+            self.kwargs = kwargs
+            self.name = f"stub-{provider_type}"
+            self.is_initialized = True
+            self.is_available = True
+
+    @pytest.fixture
+    def stub_factory(self, monkeypatch):
+        """Replace OCRProviderFactory.create with a kwargs recorder."""
+        from src.vin_ocr.providers import ocr_providers as providers_module
+        created = []
+
+        def fake_create(provider_type, auto_initialize=True, **kwargs):
+            provider = self._RecordingProvider(str(provider_type), kwargs)
+            created.append(provider)
+            return provider
+
+        monkeypatch.setattr(
+            providers_module.OCRProviderFactory, "create", staticmethod(fake_create)
+        )
+        return created
+
+    def test_default_paddleocr_constructor_does_not_raise(self, stub_factory):
+        """The DEFAULT path must not die on duplicate use_gpu kwargs."""
+        from src.vin_ocr.pipeline.vin_pipeline import MultiProviderVINPipeline
+        pipeline = MultiProviderVINPipeline(provider="paddleocr", use_gpu=False)
+        assert pipeline.ocr_provider is stub_factory[0]
+        # use_gpu travels exactly once, via _create_provider's setdefault
+        assert stub_factory[0].kwargs.get("use_gpu") is False
+        # pipeline owns preprocessing: provider-side chain defaults OFF (M2)
+        assert stub_factory[0].kwargs.get("preprocess_enabled") is False
+
+    def test_deepseek_only_ensemble_constructs(self, stub_factory):
+        """Paddle-only defaults must not poison deepseek-only ensembles."""
+        from src.vin_ocr.pipeline.vin_pipeline import MultiProviderVINPipeline
+        pipeline = MultiProviderVINPipeline(
+            provider="ensemble", ensemble_providers=["deepseek"], use_gpu=False
+        )
+        assert len(stub_factory) == 1
+        member_kwargs = stub_factory[0].kwargs
+        assert "det_db_box_thresh" not in member_kwargs
+        assert "rec_thresh" not in member_kwargs
+        assert pipeline.ocr_provider.name.startswith("Ensemble")
+
+    def test_mixed_ensemble_routes_paddle_only_keys(self, stub_factory):
+        """Paddle-only keys reach the paddle member, never the deepseek one."""
+        from src.vin_ocr.pipeline.vin_pipeline import MultiProviderVINPipeline
+        MultiProviderVINPipeline(
+            provider="ensemble",
+            ensemble_providers=["paddleocr", "deepseek"],
+            use_gpu=False,
+        )
+        by_type = {p.provider_type: p.kwargs for p in stub_factory}
+        paddle_kwargs = by_type[str("paddleocr")]
+        deepseek_kwargs = by_type[str("deepseek")]
+        assert "det_db_box_thresh" in paddle_kwargs
+        assert "det_db_box_thresh" not in deepseek_kwargs
+        assert deepseek_kwargs.get("use_gpu") is False
+
+    def test_unknown_provider_option_raises(self, stub_factory):
+        """A key no ensemble member accepts is a typo and must raise."""
+        from src.vin_ocr.pipeline.vin_pipeline import MultiProviderVINPipeline
+        with pytest.raises(ConfigurationError, match="det_db_box_tresh"):
+            MultiProviderVINPipeline(
+                provider="ensemble",
+                ensemble_providers=["paddleocr"],
+                use_gpu=False,
+                det_db_box_tresh=0.3,  # deliberate typo
+            )
+
+    def test_explicit_preprocess_override_respected(self, stub_factory):
+        """Callers can opt back into provider-side preprocessing."""
+        from src.vin_ocr.pipeline.vin_pipeline import MultiProviderVINPipeline
+        MultiProviderVINPipeline(
+            provider="paddleocr", use_gpu=False, preprocess_enabled=True
+        )
+        assert stub_factory[0].kwargs.get("preprocess_enabled") is True
 
 
 # =============================================================================

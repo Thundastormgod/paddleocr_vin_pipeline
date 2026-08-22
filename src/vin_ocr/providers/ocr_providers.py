@@ -14,11 +14,8 @@ Usage:
     provider = OCRProviderFactory.create(OCRProviderType.PADDLEOCR)
     result = provider.recognize(image)
     
-    # Or use DeepSeek
-    provider = OCRProviderFactory.create(
-        OCRProviderType.DEEPSEEK,
-        api_key="your-api-key"
-    )
+    # Or use DeepSeek-OCR (local model, no API key)
+    provider = OCRProviderFactory.create(OCRProviderType.DEEPSEEK)
     result = provider.recognize(image)
 
 Author: JRL-VIN Project
@@ -27,6 +24,7 @@ Date: January 2026
 
 import os
 import base64
+import dataclasses
 import time
 import logging
 import numpy as np
@@ -39,8 +37,8 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import cv2
 
-# Import VIN constants from Single Source of Truth
-from ..core.vin_utils import VINConstants
+# Import VIN constants and the checksum-scored extractor (Single Source of Truth)
+from ..core.vin_utils import VINConstants, extract_vin_from_text
 from config import get_config
 
 # Import VIN preprocessing module
@@ -199,9 +197,15 @@ class DeepSeekOCRConfig(ProviderConfig):
     
     def __post_init__(self):
         """Auto-detect best device if not specified."""
-        # Handle legacy use_vllm flag
+        # Keep `backend` and the legacy `use_vllm` flag coherent in BOTH
+        # directions. Historically only use_vllm -> backend was mapped, so
+        # DeepSeekOCRConfig(backend="vllm") loaded vLLM in initialize() but
+        # recognize() still routed to the (never-loaded) transformers model
+        # and crashed with AttributeError.
         if self.use_vllm and self.backend == "pytorch":
             self.backend = "vllm"
+        if self.backend == "vllm":
+            self.use_vllm = True
         
         # Set default cache directory
         if self.cache_dir is None:
@@ -490,6 +494,27 @@ class PaddleOCRProvider(OCRProvider):
         try:
             from paddleocr import PaddleOCR
             
+            # Honor config.use_gpu (previously stored and never acted on -
+            # logic-audit L16). Same mechanism as VINOCRPipeline: select the
+            # paddle device before constructing the engine, downgrading loudly
+            # when a GPU is requested but not present.
+            try:
+                import paddle
+                if self.config.use_gpu:
+                    if paddle.device.cuda.device_count() > 0:
+                        paddle.device.set_device('gpu')
+                        logger.info("PaddleOCR provider using GPU")
+                    else:
+                        paddle.device.set_device('cpu')
+                        logger.warning(
+                            "use_gpu=True but no CUDA device is present; "
+                            "PaddleOCR provider falling back to CPU"
+                        )
+                else:
+                    paddle.device.set_device('cpu')
+            except Exception as e:
+                logger.warning(f"Could not set paddle device explicitly: {e}")
+            
             logger.info(f"Initializing PaddleOCR with {self.config.ocr_version}...")
             self._ocr = PaddleOCR(
                 lang=self.config.lang,
@@ -704,8 +729,10 @@ class DeepSeekOCRProvider(OCRProvider):
                     "gpu_name": torch.cuda.get_device_name(0) if self._device.type == "cuda" else None,
                     "gpu_memory_gb": round(torch.cuda.get_device_properties(0).total_memory / 1e9, 2) if self._device.type == "cuda" else None
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            # Diagnostics-only path: fall through to the config-derived
+            # fallback below, but never silently.
+            logger.debug(f"device_info probe failed, using config fallback: {e}")
         return {"device": self.config.device, "dtype": None}
     
     def _check_flash_attention(self) -> bool:
@@ -761,136 +788,15 @@ class DeepSeekOCRProvider(OCRProvider):
         else:
             self._initialize_transformers()
     
-    def _initialize_onnx(self) -> None:
-        """Initialize using ONNX Runtime backend for optimized inference."""
-        try:
-            import onnxruntime as ort
-            from transformers import AutoTokenizer
-            
-            logger.info(f"Initializing DeepSeek-OCR with ONNX Runtime backend")
-            print("Loading DeepSeek-OCR with ONNX Runtime (optimized for GPU)...")
-            
-            # Load tokenizer from HuggingFace
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                self.config.model_name,
-                trust_remote_code=True
-            )
-            
-            # Check for existing ONNX model or export
-            onnx_path = self.config.onnx_model_path
-            if onnx_path is None or not Path(onnx_path).exists():
-                # Need to export model to ONNX first
-                onnx_path = self._export_to_onnx()
-            
-            # Configure ONNX Runtime session options
-            sess_options = ort.SessionOptions()
-            if self.config.onnx_optimize:
-                sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                sess_options.intra_op_num_threads = 4
-            
-            # Select execution providers based on device
-            providers = self._get_onnx_providers()
-            
-            # Create inference session
-            self._onnx_session = ort.InferenceSession(
-                onnx_path,
-                sess_options,
-                providers=providers
-            )
-            
-            self._initialized = True
-            actual_provider = self._onnx_session.get_providers()[0]
-            logger.info(f"DeepSeek-OCR (ONNX) loaded with {actual_provider}")
-            print(f"DeepSeek-OCR model loaded with ONNX Runtime ({actual_provider})!")
-            
-        except ImportError as e:
-            raise OCRProviderError(
-                f"ONNX Runtime not installed: {e}. "
-                "Run: pip install onnxruntime-gpu  # for GPU support\n"
-                "  or: pip install onnxruntime     # for CPU only",
-                provider=self.name,
-                details={"error": str(e), "backend": "onnx"}
-            ) from e
-        except Exception as e:
-            raise OCRProviderError(
-                f"Failed to initialize ONNX backend: {e}",
-                provider=self.name,
-                details={"error": str(e)}
-            ) from e
-    
-    def _get_onnx_providers(self) -> List[str]:
-        """Get ONNX Runtime execution providers based on config."""
-        provider = self.config.onnx_provider
-        
-        if provider == "CUDAExecutionProvider":
-            return ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        elif provider == "TensorrtExecutionProvider":
-            return ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
-        elif provider == "CoreMLExecutionProvider":
-            return ['CoreMLExecutionProvider', 'CPUExecutionProvider']
-        else:
-            return ['CPUExecutionProvider']
-    
-    def _export_to_onnx(self) -> str:
-        """Export the PyTorch model to ONNX format."""
-        import torch
-        from transformers import AutoModel
-        
-        logger.info("Exporting DeepSeek-OCR to ONNX format (first-time setup)...")
-        print("Exporting model to ONNX (this may take a few minutes on first run)...")
-        
-        # Create export directory
-        export_dir = Path.home() / ".cache" / "deepseek-ocr" / "onnx"
-        export_dir.mkdir(parents=True, exist_ok=True)
-        onnx_path = str(export_dir / "deepseek_ocr.onnx")
-        
-        # Load PyTorch model
-        model = AutoModel.from_pretrained(
-            self.config.model_name,
-            trust_remote_code=True,
-            torch_dtype=torch.float32  # ONNX needs float32 for export
-        )
-        model.eval()
-        
-        # Create dummy inputs for tracing
-        # Note: DeepSeek-OCR uses custom inputs, we'll export the encoder part
-        dummy_input = torch.randn(1, 3, self.config.image_size, self.config.image_size)
-        
-        try:
-            # Export to ONNX
-            torch.onnx.export(
-                model.vision_model if hasattr(model, 'vision_model') else model,
-                dummy_input,
-                onnx_path,
-                export_params=True,
-                opset_version=14,
-                do_constant_folding=True,
-                input_names=['image'],
-                output_names=['features'],
-                dynamic_axes={
-                    'image': {0: 'batch_size'},
-                    'features': {0: 'batch_size'}
-                }
-            )
-            
-            logger.info(f"ONNX model exported to: {onnx_path}")
-            print(f"ONNX model saved to: {onnx_path}")
-            
-            # Store path for future use
-            self.config.onnx_model_path = onnx_path
-            
-            return onnx_path
-            
-        except Exception as e:
-            logger.warning(f"ONNX export failed: {e}. Falling back to PyTorch backend.")
-            # Fall back to PyTorch
-            self.config.backend = "pytorch"
-            self._initialize_transformers()
-            raise OCRProviderError(
-                f"ONNX export failed: {e}. Using PyTorch backend instead.",
-                provider=self.name
-            )
-    
+    # NOTE: The former _initialize_onnx/_get_onnx_providers/_export_to_onnx
+    # methods were removed (logic-audit L21). They were unreachable
+    # (initialize() routes backend=="onnx" to transformers with a warning),
+    # referenced config fields that do not exist on DeepSeekOCRConfig
+    # (onnx_model_path/onnx_optimize/onnx_provider - guaranteed
+    # AttributeError if ever wired), and the export fallback both fell back
+    # AND raised. VLMs need vision encoder + language decoder and cannot be
+    # exported to a single usable ONNX graph here.
+
     def _initialize_transformers(self) -> None:
         """Initialize using HuggingFace transformers backend."""
         try:
@@ -1003,8 +909,15 @@ class DeepSeekOCRProvider(OCRProvider):
                 details={"error": str(e)}
             ) from e
     
-    def _select_device(self, torch_module) -> 'torch.device':
-        """Select the optimal compute device."""
+    def _select_device(self, torch_module) -> Any:
+        """
+        Select the optimal compute device.
+
+        Returns a torch.device. Annotated as Any because torch is imported
+        lazily inside method bodies; a 'torch.device' string annotation made
+        any annotation introspection (typing.get_type_hints) raise NameError
+        (logic-audit A1).
+        """
         if self.config.device == "cuda" and torch_module.cuda.is_available():
             return torch_module.device("cuda")
         elif self.config.device == "mps" and hasattr(torch_module.backends, 'mps') and torch_module.backends.mps.is_available():
@@ -1081,22 +994,33 @@ class DeepSeekOCRProvider(OCRProvider):
         if not self._initialized:
             self.initialize()
         
-        # Load and preprocess image if it's numpy array
-        if isinstance(image, np.ndarray):
-            img = image
-            should_preprocess = preprocess if preprocess is not None else self.config.preprocess_enabled
-            if should_preprocess:
-                if preprocess_strategy and self._preprocessor:
-                    img = self._preprocessor.process(img, strategy=preprocess_strategy)
-                else:
-                    img = self._preprocess_image(img)
+        # Preprocess when enabled - for BOTH ndarray and path inputs. Path
+        # inputs previously bypassed preprocessing entirely, making
+        # preprocess_enabled silently inert for the most common call form
+        # (logic-audit L18). Paths are only loaded/re-encoded when
+        # preprocessing actually runs; otherwise they pass through untouched.
+        should_preprocess = preprocess if preprocess is not None else self.config.preprocess_enabled
+        if should_preprocess and self._preprocessor is not None:
+            img = image if isinstance(image, np.ndarray) else self._load_image(image)
+            if preprocess_strategy:
+                img = self._preprocessor.process(img, strategy=preprocess_strategy)
+            else:
+                img = self._preprocess_image(img)
             image = img
+        elif should_preprocess and self._preprocessor is None:
+            logger.debug(
+                "Preprocess requested but preprocessor is disabled in config; "
+                "image passed through unchanged"
+            )
         
         # Prepare image
         image_path, needs_cleanup = self._prepare_image(image)
         
         try:
-            if self.config.use_vllm and self._vllm_model:
+            # Route on which backend actually initialized, not on config flags:
+            # the flags select the backend at initialize() time, but the loaded
+            # model is the ground truth for dispatch (see H2 in the logic audit).
+            if self._vllm_model is not None:
                 return self._recognize_vllm(image_path, prompt, **kwargs)
             else:
                 return self._recognize_transformers(image_path, prompt, **kwargs)
@@ -1138,7 +1062,10 @@ class DeepSeekOCRProvider(OCRProvider):
             # VIN-specific post-processing
             vin_text = self._extract_vin(text)
             
-            # Calculate confidence
+            # Calculate confidence. The custom model.infer() API returns text
+            # only - it exposes no token scores - so this backend can only use
+            # the format heuristic. The metadata says so explicitly, so
+            # downstream consumers never mistake it for model confidence.
             confidence = self._calculate_confidence(vin_text, text)
             
             return OCRResult(
@@ -1154,6 +1081,7 @@ class DeepSeekOCRProvider(OCRProvider):
                     "crop_mode": crop_mode,
                     "backend": "transformers",
                     "raw_text": text,
+                    "confidence_source": "format_heuristic (model.infer exposes no scores)",
                 }
             )
             
@@ -1186,10 +1114,14 @@ class DeepSeekOCRProvider(OCRProvider):
                 "multi_modal_data": {"image": pil_image}
             }]
             
-            # Configure sampling
+            # Configure sampling. logprobs=1 makes vLLM return the chosen
+            # token's log-probability at every step, which is the model
+            # confidence signal _calculate_confidence needs (H1: without it,
+            # every format-valid read got a flat heuristic constant).
             sampling_params = SamplingParams(
                 temperature=0.0,
                 max_tokens=self.config.max_tokens,
+                logprobs=1,
                 extra_args={
                     "ngram_size": self.config.vllm_ngram_size,
                     "window_size": self.config.vllm_window_size,
@@ -1201,10 +1133,14 @@ class DeepSeekOCRProvider(OCRProvider):
             # Run inference
             outputs = self._vllm_model.generate(model_input, sampling_params)
             raw_text = outputs[0].outputs[0].text if outputs else ""
+            model_conf = self._vllm_sequence_confidence(outputs[0]) if outputs else None
             
             # Post-process
             vin_text = self._extract_vin(raw_text)
-            confidence = self._calculate_confidence(vin_text, raw_text)
+            confidence = self._calculate_confidence(
+                vin_text, raw_text,
+                model_logits={"confidence": model_conf} if model_conf is not None else None,
+            )
             
             return OCRResult(
                 text=vin_text if vin_text else raw_text.upper().strip(),
@@ -1215,6 +1151,10 @@ class DeepSeekOCRProvider(OCRProvider):
                     "model": self.config.model_name,
                     "backend": "vllm",
                     "raw_text": raw_text,
+                    "confidence_source": (
+                        "model_logprobs" if model_conf is not None else "format_heuristic"
+                    ),
+                    "model_confidence": model_conf,
                 }
             )
             
@@ -1248,7 +1188,7 @@ class DeepSeekOCRProvider(OCRProvider):
         if not self._initialized:
             self.initialize()
         
-        if self.config.use_vllm and self._vllm_model:
+        if self._vllm_model is not None:
             return self._batch_recognize_vllm(images, prompt, **kwargs)
         
         # Sequential processing for transformers backend
@@ -1295,10 +1235,11 @@ class DeepSeekOCRProvider(OCRProvider):
                     "multi_modal_data": {"image": pil_image}
                 })
             
-            # Configure sampling
+            # Configure sampling (logprobs=1: see _recognize_vllm / H1)
             sampling_params = SamplingParams(
                 temperature=0.0,
                 max_tokens=self.config.max_tokens,
+                logprobs=1,
                 extra_args={
                     "ngram_size": self.config.vllm_ngram_size,
                     "window_size": self.config.vllm_window_size,
@@ -1314,15 +1255,26 @@ class DeepSeekOCRProvider(OCRProvider):
             results = []
             for output in outputs:
                 raw_text = output.outputs[0].text if output.outputs else ""
+                model_conf = self._vllm_sequence_confidence(output)
                 vin_text = self._extract_vin(raw_text)
-                confidence = self._calculate_confidence(vin_text, raw_text)
+                confidence = self._calculate_confidence(
+                    vin_text, raw_text,
+                    model_logits={"confidence": model_conf} if model_conf is not None else None,
+                )
                 
                 results.append(OCRResult(
                     text=vin_text if vin_text else raw_text.upper().strip(),
                     confidence=confidence,
                     raw_response=raw_text,
                     provider=self.name,
-                    metadata={"backend": "vllm", "batch": True}
+                    metadata={
+                        "backend": "vllm",
+                        "batch": True,
+                        "confidence_source": (
+                            "model_logprobs" if model_conf is not None else "format_heuristic"
+                        ),
+                        "model_confidence": model_conf,
+                    }
                 ))
             
             return results
@@ -1332,6 +1284,45 @@ class DeepSeekOCRProvider(OCRProvider):
             for temp_path in temp_files:
                 self._cleanup_temp(temp_path)
     
+    def _vllm_sequence_confidence(self, request_output: Any) -> Optional[float]:
+        """
+        Compute the model's own sequence confidence from vLLM logprobs.
+
+        Uses the geometric mean of the chosen tokens' probabilities
+        (exp of the mean logprob), which is length-normalized and lives in
+        (0, 1]. Returns None when logprobs are unavailable (older vLLM,
+        logprobs not requested, or an API change), in which case the caller
+        falls back to the format heuristic and says so in metadata.
+        """
+        try:
+            completion = request_output.outputs[0]
+            token_ids = completion.token_ids
+            logprob_dicts = completion.logprobs
+            if not logprob_dicts or not token_ids:
+                return None
+
+            chosen_logprobs: List[float] = []
+            # strict: a token/logprob length mismatch means the vLLM API
+            # changed shape - fall back to the heuristic (via the except
+            # below) instead of silently computing over a truncated pair.
+            for token_id, step in zip(token_ids, logprob_dicts, strict=True):
+                if step is None or token_id not in step:
+                    continue
+                entry = step[token_id]
+                # vLLM >= 0.4 wraps values in a Logprob object; older
+                # versions used bare floats. Support both.
+                chosen_logprobs.append(
+                    float(entry.logprob if hasattr(entry, "logprob") else entry)
+                )
+
+            if not chosen_logprobs:
+                return None
+            mean_logprob = sum(chosen_logprobs) / len(chosen_logprobs)
+            return float(min(1.0, max(0.0, np.exp(mean_logprob))))
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as e:
+            logger.debug(f"Could not extract vLLM logprobs for confidence: {e}")
+            return None
+
     def _extract_text(self, result: Any) -> str:
         """Extract text from model output."""
         if isinstance(result, str):
@@ -1344,26 +1335,41 @@ class DeepSeekOCRProvider(OCRProvider):
     
     def _extract_vin(self, text: str) -> str:
         """
-        Extract VIN from OCR text using pattern matching.
-        
-        VIN rules:
-        - Exactly 17 characters
-        - No I, O, Q (confusion with 1, 0)
-        - Alphanumeric only
+        Extract the best VIN candidate from OCR text.
+
+        Delegates to core.vin_utils.extract_vin_from_text, which scores EVERY
+        17-character window (known-WMI bonus, decisive ISO 3779 checksum
+        bonus) instead of taking the first regex match. The first-match
+        approach shifted the VIN by one for any leading artifact character
+        and silently dropped its last character (logic-audit M5).
+
+        Returns:
+            A 17-character VIN-charset string, or "" when no plausible
+            candidate exists.
         """
-        import re
-        
         if not text:
             return ""
-        
-        # Clean text
-        text = text.strip().replace('`', '').replace('*', '').replace('\n', ' ')
-        
-        # VIN pattern: 17 chars, no I/O/Q
-        vin_pattern = r'[A-HJ-NPR-Z0-9]{17}'
-        match = re.search(vin_pattern, text.upper())
-        
-        return match.group(0) if match else ""
+
+        # Clean obvious non-VIN noise; keep letters (a VIN may legitimately
+        # start with X/Y/T/F/A, so nothing alphabetic is stripped here).
+        cleaned = text.strip().replace('`', '').replace('*', '').replace('\n', ' ').upper()
+        cleaned = ''.join(cleaned.split())
+        if len(cleaned) < VINConstants.LENGTH:
+            return ""
+
+        candidate = extract_vin_from_text(cleaned)
+        if len(candidate) != VINConstants.LENGTH:
+            return ""
+
+        if all(c in VINConstants.VALID_CHARS for c in candidate):
+            return candidate
+
+        # Window may carry I/O/Q misreads; apply the documented policy
+        # (I->1, O->0, Q->0) and accept only if that makes it charset-valid.
+        mapped = candidate.translate(str.maketrans("IOQ", "100"))
+        if all(c in VINConstants.VALID_CHARS for c in mapped):
+            return mapped
+        return ""
     
     def _calculate_confidence(
         self,
@@ -1374,24 +1380,30 @@ class DeepSeekOCRProvider(OCRProvider):
         """
         Calculate confidence score using MODEL OUTPUT when available.
         
-        This is a PRODUCTION-READY confidence calculation that:
-        1. Uses actual model logits/probabilities when available
-        2. Falls back to heuristic scoring for format validation
-        3. Applies checksum validation for highest confidence tier
+        Two regimes, deliberately distinct:
+        1. Model confidence available (vLLM logprobs, CTC softmax, ...):
+           format/checksum tiers are scaled by the model's own probability.
+        2. No model signal: a FORMAT HEURISTIC. Being well-formed is weak
+           evidence of being correct (wrong OCR reads are usually well-formed
+           too), so the format-only value sits BELOW the typical softmax of a
+           genuine engine and cannot outrank a calibrated competitor in an
+           ensemble. A valid ISO 3779 check digit is strong evidence
+           (a random wrong-but-well-formed read passes with p~=1/11), so it
+           earns a high - but sub-calibrated-band - value.
         
         Confidence Tiers:
-        - 0.95-1.00: Valid checksum + high model confidence
-        - 0.85-0.95: Valid format + high model confidence  
-        - 0.70-0.85: Valid format + medium model confidence
-        - 0.50-0.70: Valid format + low model confidence
+        - 0.95-1.00: Valid checksum + model confidence
+        - 0.70-0.95: Valid format + model confidence
+        - 0.90:      Valid checksum, no model signal (heuristic)
+        - 0.50:      Valid format only, no model signal (heuristic)
         - 0.30-0.50: 17 chars but invalid characters
-        - 0.10-0.30: Wrong length
+        - 0.10-0.30: Wrong length (symmetric distance from 17)
         - 0.00: Empty or failed
         
         Args:
             vin_text: Extracted VIN string
             raw_text: Raw OCR output
-            model_logits: Optional model output (logits/probabilities)
+            model_logits: Optional model output (logits/probabilities/scores)
             
         Returns:
             Confidence score between 0.0 and 1.0
@@ -1406,8 +1418,12 @@ class DeepSeekOCRProvider(OCRProvider):
         
         # Length check
         if len(text) != VINConstants.LENGTH:
-            # Wrong length: 0.10-0.30 based on how close
-            length_ratio = min(len(text), VINConstants.LENGTH) / VINConstants.LENGTH
+            # Wrong length: 0.10-0.30, decreasing with SYMMETRIC distance from
+            # 17. The previous min(len,17)/17 formula scored every too-long
+            # text at the band maximum, outranking a 16-char near miss.
+            length_ratio = max(
+                0.0, 1.0 - abs(len(text) - VINConstants.LENGTH) / VINConstants.LENGTH
+            )
             return 0.10 + (0.20 * length_ratio)
         
         # Character validity check
@@ -1433,11 +1449,14 @@ class DeepSeekOCRProvider(OCRProvider):
                 # Valid format + model confidence: 0.70-0.95
                 return 0.70 + (0.25 * model_confidence)
         else:
-            # No model confidence available - use heuristic
+            # No model confidence available - format heuristic (uncalibrated).
+            # These values are intentionally below the model-confidence bands
+            # so a fabricated constant can never beat a genuine engine score
+            # in ensemble comparison (logic-audit H1).
             if checksum_valid:
-                return 0.95  # Valid checksum
+                return 0.90  # Valid checksum: strong structural evidence
             else:
-                return 0.85  # Valid format only
+                return 0.50  # Valid format only: weak evidence
     
     def _extract_model_confidence(self, logits: Optional[Any]) -> Optional[float]:
         """
@@ -1521,7 +1540,7 @@ class OCRProviderFactory:
     
     Usage:
         provider = OCRProviderFactory.create(OCRProviderType.PADDLEOCR)
-        provider = OCRProviderFactory.create("deepseek", api_key="...")
+        provider = OCRProviderFactory.create("deepseek", model_name="deepseek-ai/DeepSeek-OCR")
     """
     
     # Registry of available providers (properly typed)
@@ -1579,40 +1598,84 @@ class OCRProviderFactory:
         
         return provider
     
+    # Accepted for backward compatibility and IGNORED with a warning:
+    # DeepSeek-OCR runs locally and never needed an API key, but older docs
+    # and call sites pass one.
+    _LEGACY_IGNORED_KWARGS = frozenset({"api_key"})
+
     @classmethod
     def _create_config(
         cls,
         provider_type: OCRProviderType,
         **kwargs
     ) -> ProviderConfig:
-        """Create provider-specific config from kwargs."""
+        """
+        Create provider-specific config from kwargs.
+
+        Every kwarg must be a real field of the target config dataclass
+        (including inherited ProviderConfig fields such as timeout,
+        max_retries, retry_delay and the preprocess_* flags). Unknown kwargs
+        raise ValueError instead of being silently dropped - silent dropping
+        made typos invisible and made preprocess_enabled impossible to set
+        through the factory (logic-audit L20). Defaults come from the
+        dataclass itself, so there is a single source of truth (L19: the
+        factory used to override max_tokens=128 against the documented 8192
+        default, truncating output before the VIN appeared).
+        """
         config = get_config()
         if provider_type == OCRProviderType.PADDLEOCR:
-            return PaddleOCRConfig(
-                lang=kwargs.get('lang', config.ocr.language),
-                use_gpu=kwargs.get('use_gpu', config.ocr.use_gpu),
-                det_db_box_thresh=kwargs.get('det_db_box_thresh', config.ocr.det_db_box_thresh),
-                rec_thresh=kwargs.get('rec_thresh', config.ocr.rec_thresh),
-            )
+            config_cls: Type[ProviderConfig] = PaddleOCRConfig
+            provider_defaults: Dict[str, Any] = {
+                "lang": config.ocr.language,
+                "use_gpu": config.ocr.use_gpu,
+                "det_db_box_thresh": config.ocr.det_db_box_thresh,
+                "rec_thresh": config.ocr.rec_thresh,
+            }
         elif provider_type == OCRProviderType.DEEPSEEK:
-            return DeepSeekOCRConfig(
-                model_name=kwargs.get('model_name', 'deepseek-ai/DeepSeek-OCR'),
-                finetuned_model_path=kwargs.get('finetuned_model_path'),
-                adapter_path=kwargs.get('adapter_path'),
-                merge_adapter=kwargs.get('merge_adapter', False),
-                use_gpu=kwargs.get('use_gpu', config.ocr.use_gpu),
-                use_flash_attention=kwargs.get('use_flash_attention', True),
-                device=kwargs.get('device'),  # Auto-detect if None
-                base_size=kwargs.get('base_size', 1024),
-                image_size=kwargs.get('image_size', 640),
-                crop_mode=kwargs.get('crop_mode', True),
-                max_tokens=kwargs.get('max_tokens', 128),
-                prompt=kwargs.get('prompt', "<image>\nFree OCR."),
-                use_vllm=kwargs.get('use_vllm', False),
-            )
+            config_cls = DeepSeekOCRConfig
+            provider_defaults = {
+                "use_gpu": config.ocr.use_gpu,
+            }
         else:
-            return ProviderConfig()
+            config_cls = ProviderConfig
+            provider_defaults = {}
+
+        field_names = {f.name for f in dataclasses.fields(config_cls)}
+
+        ignored = cls._LEGACY_IGNORED_KWARGS & set(kwargs)
+        for name in sorted(ignored):
+            logger.warning(
+                f"Ignoring legacy kwarg '{name}' for {provider_type.value}: "
+                "all registered providers run locally and require no API key"
+            )
+
+        unknown = set(kwargs) - field_names - cls._LEGACY_IGNORED_KWARGS
+        if unknown:
+            raise ValueError(
+                f"Unknown option(s) for {provider_type.value} provider: "
+                f"{sorted(unknown)}. Valid options: {sorted(field_names)}"
+            )
+
+        merged = dict(provider_defaults)
+        merged.update({k: v for k, v in kwargs.items() if k in field_names})
+        return config_cls(**merged)
     
+    @classmethod
+    def valid_options(cls, provider_type: Union[str, OCRProviderType]) -> frozenset:
+        """
+        Return the set of config option names a provider type accepts.
+
+        Used by multi-provider callers (e.g. ensembles) to route per-provider
+        options; single-provider creation validates strictly in _create_config.
+        """
+        if isinstance(provider_type, str):
+            provider_type = OCRProviderType(provider_type.lower())
+        config_cls: Type[ProviderConfig] = {
+            OCRProviderType.PADDLEOCR: PaddleOCRConfig,
+            OCRProviderType.DEEPSEEK: DeepSeekOCRConfig,
+        }.get(provider_type, ProviderConfig)
+        return frozenset(f.name for f in dataclasses.fields(config_cls))
+
     @classmethod
     def list_available(cls) -> List[str]:
         """List all registered provider types."""
@@ -1658,7 +1721,7 @@ class EnsembleOCRProvider(OCRProvider):
     Usage:
         ensemble = EnsembleOCRProvider([
             OCRProviderFactory.create("paddleocr"),
-            OCRProviderFactory.create("deepseek", api_key="..."),
+            OCRProviderFactory.create("deepseek"),
         ], strategy='best')
         result = ensemble.recognize(image)
     """
@@ -1756,12 +1819,31 @@ class EnsembleOCRProvider(OCRProvider):
         return max(results, key=lambda r: r.confidence)
     
     def _vote_strategy(self, results: List[OCRResult]) -> OCRResult:
-        """Return most common result (majority voting)."""
+        """
+        Return most common result (majority voting).
+
+        Ties are broken by total confidence, not by insertion order:
+        Counter.most_common(1) alone returns the FIRST-inserted text on a
+        tie, so two disagreeing providers always "elected" provider[0] and
+        the vote never actually happened (logic-audit M3).
+        """
         from collections import Counter
         
         texts = [r.text for r in results]
         counter = Counter(texts)
-        most_common_text = counter.most_common(1)[0][0]
+        top_count = max(counter.values())
+        tied_texts = [t for t, c in counter.items() if c == top_count]
+        
+        tie_broken = len(tied_texts) > 1
+        if tie_broken:
+            most_common_text = max(
+                tied_texts,
+                key=lambda t: sum(
+                    float(r.confidence or 0.0) for r in results if r.text == t
+                ),
+            )
+        else:
+            most_common_text = tied_texts[0]
         
         # Return the result with the most common text and highest confidence
         matching = [r for r in results if r.text == most_common_text]
@@ -1770,6 +1852,7 @@ class EnsembleOCRProvider(OCRProvider):
         # Add voting metadata
         winner.metadata["votes"] = dict(counter)
         winner.metadata["strategy"] = "vote"
+        winner.metadata["tie_broken_by_confidence"] = tie_broken
         
         return winner
 
@@ -1953,7 +2036,7 @@ def recognize_vin(
         
     Example:
         result = recognize_vin("image.jpg")
-        result = recognize_vin("image.jpg", provider="deepseek", api_key="...")
+        result = recognize_vin("image.jpg", provider="deepseek")
     """
     if provider is None:
         ocr = get_default_provider()

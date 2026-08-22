@@ -175,6 +175,11 @@ INVALID_CHAR_FIXES: Dict[str, str] = {
 # RuleBasedCorrector. A local copy here is how the Y-eating `^[*#XYT]+` bug
 # survived its first fix - it was corrected in this file and left live in the
 # corrector. See the commentary next to the definitions in core/vin_utils.py.
+# ARTIFACT_CHARS is a deliberate RE-EXPORT, not an unused import: consumers
+# and tests/test_scoring_integrity_regressions.py pin
+# `vin_pipeline.ARTIFACT_CHARS is vin_utils.ARTIFACT_CHARS` so a local copy
+# can never silently diverge again (that is how the Y-eating bug survived
+# its first fix). Do not remove.
 from ..core.vin_utils import ARTIFACT_CHARS, NON_VIN_RUN as _NON_VIN_RUN
 # Optional MLflow tracing (no-op until tracking.tracing.enable_tracing()):
 # root recognition = CHAIN, engine call = TOOL, postprocess = PARSER, per
@@ -342,32 +347,6 @@ class VINImagePreprocessor:
 # POSTPROCESSOR
 # =============================================================================
 
-@dataclass
-class VINResult:
-    """Structured VIN recognition result."""
-    vin: str
-    raw_ocr: str
-    confidence: float
-    is_valid_length: bool
-    checksum_valid: bool
-    corrections: List[str] = field(default_factory=list)
-    processing_time_ms: float = 0.0
-    error: Optional[str] = None
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
-        return {
-            'vin': self.vin,
-            'raw_ocr': self.raw_ocr,
-            'confidence': self.confidence,
-            'is_valid_length': self.is_valid_length,
-            'checksum_valid': self.checksum_valid,
-            'corrections': self.corrections,
-            'processing_time_ms': self.processing_time_ms,
-            'error': self.error,
-        }
-
-
 class VINPostProcessor:
     """
     VIN validation and correction after OCR.
@@ -415,17 +394,41 @@ class VINPostProcessor:
         if text != original:
             corrections.append(f"Removed artifacts: '{original}' → '{text}'")
         
-        # Step 3: Fix invalid characters
+        # Step 3: Extract VIN window BEFORE fixing invalid characters.
+        # Fixing first let label noise gain VIN-validity ("MOTOR" -> "M0T0R")
+        # and bias window scoring against the true VIN whenever its check
+        # digit was misread (logic-audit L10). I/O/Q are therefore still
+        # present at scoring time and penalize noise windows honestly.
+        text_before = text
+        text = self._extract_vin_substring(text)
+        if text != text_before:
+            corrections.append(f"Extracted VIN: '{text_before}' → '{text}'")
+        
+        # Step 4: Fix invalid characters INSIDE the chosen window only.
         text_before = text
         text = self._fix_invalid_chars(text)
         if text != text_before:
             corrections.append(f"Fixed invalid chars: '{text_before}' → '{text}'")
         
-        # Step 4: Extract VIN substring if text is too long
-        text_before = text
-        text = self._extract_vin_substring(text)
-        if text != text_before:
-            corrections.append(f"Extracted VIN: '{text_before}' → '{text}'")
+        # Step 4b: A window chosen from the char-FIXED full text is accepted
+        # only if it proves itself with a valid check digit while the primary
+        # candidate fails its own. This recovers reads where I/O/Q misreads
+        # inside the true window suppressed its score, without reopening the
+        # noise-inflation path (noise passes a checksum with p ~= 1/11, and
+        # only competes at all when the primary already failed).
+        if len(text) != VIN_LENGTH or not self._validate_checksum(text):
+            alt_window = self._extract_vin_substring(
+                self._fix_invalid_chars(self._remove_artifacts(original))
+            )
+            if (
+                alt_window != text
+                and len(alt_window) == VIN_LENGTH
+                and self._validate_checksum(alt_window)
+            ):
+                corrections.append(
+                    f"Checksum-gated alternate window: '{text}' → '{alt_window}'"
+                )
+                text = alt_window
         
         # Step 5: Apply position-based corrections
         text_before = text
@@ -555,13 +558,41 @@ class VINPostProcessor:
 # MAIN PIPELINE
 # =============================================================================
 
+class _ElapsedMs:
+    """
+    Dict-like elapsed-time handle for _timer().
+
+    ['ms'] reads LIVE elapsed milliseconds until the context exits, then the
+    final value is frozen. The previous implementation was a plain dict whose
+    'ms' key was written only after the with-block finished - but both
+    pipelines copy elapsed['ms'] into their result dict INSIDE the block, so
+    every reported processing_time_ms was 0.0 (logic-audit M1).
+    """
+
+    def __init__(self) -> None:
+        self._start = time.perf_counter()
+        self._frozen: Optional[float] = None
+
+    def __getitem__(self, key: str) -> float:
+        if key != 'ms':
+            raise KeyError(key)
+        if self._frozen is not None:
+            return self._frozen
+        return (time.perf_counter() - self._start) * 1000
+
+    def freeze(self) -> None:
+        """Fix the final elapsed value at context exit."""
+        self._frozen = (time.perf_counter() - self._start) * 1000
+
+
 @contextmanager
 def _timer():
-    """Context manager for timing operations."""
-    start = time.perf_counter()
-    elapsed = {'ms': 0.0}
-    yield elapsed
-    elapsed['ms'] = (time.perf_counter() - start) * 1000
+    """Context manager for timing operations; yields a live _ElapsedMs."""
+    elapsed = _ElapsedMs()
+    try:
+        yield elapsed
+    finally:
+        elapsed.freeze()
 
 
 class VINOCRPipeline:
@@ -733,18 +764,19 @@ class VINOCRPipeline:
         else:
             path = Path(image_path)
             if not path.exists():
-                raise ImageLoadError(f"Image file not found: {path}")
+                raise ImageLoadError(str(path), reason="file not found")
             
             # Handle unicode paths
             try:
                 image = cv2.imread(str(path))
             except Exception as e:
-                raise ImageLoadError(f"Failed to read image: {e}") from e
+                raise ImageLoadError(str(path), reason=f"cv2.imread failed: {e}") from e
                 
             if image is None:
                 raise ImageLoadError(
-                    f"Could not decode image: {path}. "
-                    "Verify it's a valid image format (jpg, png, etc.)"
+                    str(path),
+                    reason="could not decode image; verify it's a valid image "
+                           "format (jpg, png, etc.)",
                 )
             source = str(path)
         
@@ -779,7 +811,9 @@ class VINOCRPipeline:
                 'raw_ocr': raw_text,
                 'confidence': confidence,
                 'is_valid_length': len(raw_text) == VIN_LENGTH,
-                'checksum_valid': False,
+                # None = "not checked" (postprocess disabled). False would
+                # conflate an unchecked VIN with a checksum failure (L9).
+                'checksum_valid': None,
                 'corrections': []
             }
         
@@ -1195,11 +1229,24 @@ class MultiProviderVINPipeline:
         if use_gpu is None:
             use_gpu = config.ocr.use_gpu
         
-        # Import and create OCR provider
-        if provider.lower() in {"paddleocr", "ensemble"}:
+        # Inject PaddleOCR-specific defaults only when a paddle member will
+        # actually exist. Two defects lived here:
+        #   - use_gpu was BOTH setdefault-ed into provider_kwargs and passed
+        #     explicitly to _create_provider below -> TypeError ("multiple
+        #     values for keyword 'use_gpu'") on the DEFAULT provider path.
+        #     use_gpu now travels only via the explicit parameter.
+        #   - paddle-only keys were injected for ANY ensemble, so a
+        #     deepseek-only ensemble carried options no member accepts and
+        #     failed the strict option routing in _create_provider.
+        provider_normalized = provider.lower()
+        ensemble_members = [p.lower() for p in (ensemble_providers or ["paddleocr"])]
+        has_paddle_member = (
+            provider_normalized == "paddleocr"
+            or (provider_normalized == "ensemble" and "paddleocr" in ensemble_members)
+        )
+        if has_paddle_member:
             provider_kwargs.setdefault("det_db_box_thresh", config.ocr.det_db_box_thresh)
             provider_kwargs.setdefault("rec_thresh", config.ocr.rec_thresh)
-            provider_kwargs.setdefault("use_gpu", use_gpu)
 
         self._create_provider(
             provider=provider,
@@ -1241,15 +1288,42 @@ class MultiProviderVINPipeline:
         # Ensure use_gpu is in kwargs for providers
         kwargs.setdefault("use_gpu", use_gpu)
         
+        # This pipeline runs its own preprocessing chain (CLAHE/morph/etc.)
+        # before handing the image to the provider. Providers must therefore
+        # NOT run their own chain again - every image was preprocessed TWICE
+        # before this default existed (logic-audit M2). Callers can still
+        # opt back in explicitly via provider_kwargs.
+        kwargs.setdefault("preprocess_enabled", False)
+        
+        if api_key:
+            # Legacy option: forwarded so the factory can emit its
+            # deprecation warning (DeepSeek-OCR is local, no API key).
+            kwargs.setdefault("api_key", api_key)
+        
         if provider == "ensemble":
             # Create ensemble provider
             if not ensemble_providers:
                 ensemble_providers = ["paddleocr"]  # Default to single provider
             
+            # Route options per member: each member receives only the options
+            # its config accepts. A key no member accepts is a typo and raises.
+            member_options = {
+                p: OCRProviderFactory.valid_options(p) for p in ensemble_providers
+            }
+            routable = set().union(*member_options.values()) | {"api_key"}
+            unknown = set(kwargs) - routable
+            if unknown:
+                raise ConfigurationError(
+                    f"Unknown provider option(s) for ensemble "
+                    f"{sorted(ensemble_providers)}: {sorted(unknown)}"
+                )
+            
             providers = []
             for p in ensemble_providers:
-                p_kwargs = {"api_key": api_key} if p == "deepseek" else {}
-                p_kwargs.update(kwargs)
+                p_kwargs = {
+                    k: v for k, v in kwargs.items()
+                    if k in member_options[p] or k == "api_key"
+                }
                 providers.append(
                     OCRProviderFactory.create(p, auto_initialize=True, **p_kwargs)
                 )
@@ -1259,11 +1333,9 @@ class MultiProviderVINPipeline:
                 strategy=ensemble_strategy
             )
         else:
-            # Create single provider
-            p_kwargs = {"api_key": api_key} if provider == "deepseek" else {}
-            p_kwargs.update(kwargs)
+            # Create single provider (factory validates kwargs strictly)
             self.ocr_provider = OCRProviderFactory.create(
-                provider, auto_initialize=True, **p_kwargs
+                provider, auto_initialize=True, **kwargs
             )
     
     def recognize(self, image_path: Union[str, Path, np.ndarray]) -> Dict[str, Any]:
@@ -1315,17 +1387,18 @@ class MultiProviderVINPipeline:
         else:
             path = Path(image_path)
             if not path.exists():
-                raise ImageLoadError(f"Image file not found: {path}")
+                raise ImageLoadError(str(path), reason="file not found")
             
             try:
                 image = cv2.imread(str(path))
             except Exception as e:
-                raise ImageLoadError(f"Failed to read image: {e}") from e
+                raise ImageLoadError(str(path), reason=f"cv2.imread failed: {e}") from e
                 
             if image is None:
                 raise ImageLoadError(
-                    f"Could not decode image: {path}. "
-                    "Verify it's a valid image format (jpg, png, etc.)"
+                    str(path),
+                    reason="could not decode image; verify it's a valid image "
+                           "format (jpg, png, etc.)",
                 )
             source = str(path)
         
@@ -1360,7 +1433,9 @@ class MultiProviderVINPipeline:
                 'raw_ocr': raw_text,
                 'confidence': confidence,
                 'is_valid_length': len(raw_text) == VIN_LENGTH,
-                'checksum_valid': False,
+                # None = "not checked" (postprocess disabled). False would
+                # conflate an unchecked VIN with a checksum failure (L9).
+                'checksum_valid': None,
                 'corrections': []
             }
         
@@ -1475,10 +1550,9 @@ Examples:
             print(f"  Sequential: {result['sequential']}")
         return 0
     
-    # Require image for OCR
+    # Require image for OCR. parser.error() raises SystemExit(2) itself.
     if not args.image:
         parser.error("Image path required (or use --validate/--decode/--list-providers)")
-        return 1
     
     # Check image exists
     image_path = Path(args.image)
@@ -1527,7 +1601,10 @@ Examples:
         print(f"VIN: {result['vin']}")
         print(f"Confidence: {result['confidence']:.2%}")
         print(f"Valid Length: {result.get('is_valid_length', 'N/A')}")
-        print(f"Checksum Valid: {result.get('checksum_valid', 'N/A')}")
+        checksum_state = result.get('checksum_valid', 'N/A')
+        if checksum_state is None:
+            checksum_state = 'NOT CHECKED (postprocess disabled)'
+        print(f"Checksum Valid: {checksum_state}")
         print(f"Processing Time: {result.get('processing_time_ms', 0):.0f}ms")
         if result.get('provider'):
             print(f"Provider: {result['provider']}")
